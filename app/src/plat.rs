@@ -1,0 +1,509 @@
+﻿// Кратко: свой «мост» между Slint и окнами Windows. Slint рисует картинку в память,
+// мы сами показываем её в окне с прозрачностью (чтобы было видно стекло) и передаём мышь/клавиши.
+//
+// Why: Slint winit+software path presents via softbuffer -> no per-pixel alpha -> glass hidden.
+// Here: SoftwareRenderer -> premultiplied BGRA DIB section -> BitBlt into a window whose DWM
+// frame is extended into the whole client area, so alpha is honored and the backdrop shows.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use slint::platform::software_renderer::{PremultipliedRgbaColor, RepaintBufferType, SoftwareRenderer, TargetPixel};
+use slint::platform::{
+    EventLoopProxy, Key, Platform, PointerEventButton, Renderer, WindowAdapter, WindowEvent, WindowProperties,
+};
+use slint::{EventLoopError, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, PlatformError};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+};
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+// ---------- pixel type = DIB layout (premultiplied BGRA) ----------
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Bgra {
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+}
+
+impl TargetPixel for Bgra {
+    fn blend(&mut self, c: PremultipliedRgbaColor) {
+        let inv = 255 - c.alpha as u16;
+        let mix = |src: u8, dst: u8| (src as u16 + (dst as u16 * inv + 127) / 255) as u8;
+        self.r = mix(c.red, self.r);
+        self.g = mix(c.green, self.g);
+        self.b = mix(c.blue, self.b);
+        self.a = mix(c.alpha, self.a);
+    }
+    fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        Bgra { b, g, r, a: 255 }
+    }
+    fn background() -> Self {
+        Bgra::default() // fully transparent: glass shows through
+    }
+}
+
+// ---------- window ----------
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Panel,
+    Tile,
+}
+
+struct Dib {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut Bgra,
+    w: u32,
+    h: u32,
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(self.bmp.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+pub struct GfWindow {
+    window: slint::Window,
+    renderer: SoftwareRenderer,
+    hwnd: Cell<HWND>,
+    size: Cell<PhysicalSize>,
+    scale: Cell<f32>,
+    kind: Cell<Kind>,
+    tracking: Cell<bool>,
+    dib: RefCell<Option<Dib>>,
+    on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
+}
+
+thread_local! {
+    static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
+    static ALL: RefCell<Vec<Weak<GfWindow>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn lookup(hwnd: HWND) -> Option<Rc<GfWindow>> {
+    WINDOWS.with(|m| m.borrow().get(&(hwnd.0 as isize)).and_then(|w| w.upgrade()))
+}
+
+/// Find our adapter for a Slint window.
+fn find(window: &slint::Window) -> Option<Rc<GfWindow>> {
+    ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).find(|g| std::ptr::eq(&g.window, window)))
+}
+
+pub fn hwnd_of(window: &slint::Window) -> Option<HWND> {
+    find(window).map(|g| g.hwnd.get())
+}
+
+/// Tile = never takes focus, stays at the bottom of z-order.
+pub fn set_kind(window: &slint::Window, kind: Kind) {
+    if let Some(g) = find(window) {
+        g.kind.set(kind);
+        let hwnd = g.hwnd.get();
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let n = if kind == Kind::Tile { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
+        }
+    }
+}
+
+pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
+    if let Some(g) = find(window) {
+        *g.on_deactivate.borrow_mut() = Some(Rc::new(f));
+    }
+}
+
+impl GfWindow {
+    fn new() -> Result<Rc<Self>, PlatformError> {
+        let hwnd = create_hwnd()?;
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let scale = dpi as f32 / 96.0;
+        let me = Rc::new_cyclic(|weak: &Weak<GfWindow>| GfWindow {
+            window: slint::Window::new(weak.clone() as Weak<dyn WindowAdapter>),
+            renderer: SoftwareRenderer::new_with_repaint_buffer_type(RepaintBufferType::NewBuffer),
+            hwnd: Cell::new(hwnd),
+            size: Cell::new(PhysicalSize::new(1, 1)),
+            scale: Cell::new(scale),
+            kind: Cell::new(Kind::Panel),
+            tracking: Cell::new(false),
+            dib: RefCell::new(None),
+            on_deactivate: RefCell::new(None),
+        });
+        WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
+        ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
+        // now wndproc knows us -> recompute frame (WM_NCCALCSIZE removes it)
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        me.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
+        Ok(me)
+    }
+
+    fn logical(&self, lp: LPARAM) -> LogicalPosition {
+        let x = (lp.0 & 0xffff) as i16 as f32;
+        let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
+        let s = self.scale.get();
+        LogicalPosition::new(x / s, y / s)
+    }
+
+    fn resize_physical(&self, w: u32, h: u32) {
+        if self.size.get() == PhysicalSize::new(w, h) {
+            return;
+        }
+        self.size.set(PhysicalSize::new(w, h));
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd.get(),
+                None,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        let s = self.scale.get();
+        self.window.dispatch_event(WindowEvent::Resized { size: LogicalSize::new(w as f32 / s, h as f32 / s) });
+        self.request_redraw();
+    }
+
+    /// Render Slint scene into the DIB (created/resized as needed). Returns false if no DIB.
+    unsafe fn draw(&self, ref_dc: HDC) -> bool {
+        let PhysicalSize { width: w, height: h } = self.size.get();
+        let mut dib = self.dib.borrow_mut();
+        if dib.as_ref().map(|d| (d.w, d.h)) != Some((w, h)) {
+            *dib = make_dib(ref_dc, w, h);
+        }
+        let Some(d) = dib.as_ref() else { return false };
+        let buf = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
+        buf.fill(Bgra::default());
+        self.renderer.render(buf, w as usize);
+        true
+    }
+
+    /// WM_PAINT + BitBlt. Panel: DWM reads alpha via the hidden extended frame.
+    /// Tile: content is opaque (own blurred wallpaper), DWM rounds the corners.
+    fn paint(&self) {
+        let hwnd = self.hwnd.get();
+        let PhysicalSize { width: w, height: h } = self.size.get();
+        let mut ps = PAINTSTRUCT::default();
+        unsafe {
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if self.draw(hdc) {
+                if let Some(d) = self.dib.borrow().as_ref() {
+                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), 0, 0, SRCCOPY);
+                }
+            }
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+}
+
+unsafe fn make_dib(hdc: HDC, w: u32, h: u32) -> Option<Dib> {
+    let bi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: -(h as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let bmp = CreateDIBSection(Some(hdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    let dc = CreateCompatibleDC(Some(hdc));
+    let old = SelectObject(dc, bmp.into());
+    Some(Dib { dc, bmp, old, bits: bits as *mut Bgra, w, h })
+}
+
+impl WindowAdapter for GfWindow {
+    fn window(&self) -> &slint::Window {
+        &self.window
+    }
+    fn size(&self) -> PhysicalSize {
+        self.size.get()
+    }
+    fn renderer(&self) -> &dyn Renderer {
+        &self.renderer
+    }
+    fn set_visible(&self, visible: bool) -> Result<(), PlatformError> {
+        let hwnd = self.hwnd.get();
+        unsafe {
+            if visible {
+                let tile = self.kind.get() == Kind::Tile;
+                let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
+                if tile {
+                    let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                } else {
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            } else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                // free pixel memory while hidden
+                self.dib.borrow_mut().take();
+            }
+        }
+        Ok(())
+    }
+    fn position(&self) -> Option<PhysicalPosition> {
+        let mut r = Default::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd.get(), &mut r);
+        }
+        Some(PhysicalPosition::new(r.left, r.top))
+    }
+    fn set_position(&self, position: slint::WindowPosition) {
+        let p = position.to_physical(self.scale.get());
+        unsafe {
+            let _ = SetWindowPos(self.hwnd.get(), None, p.x, p.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    fn set_size(&self, size: slint::WindowSize) {
+        let s = size.to_physical(self.scale.get());
+        self.resize_physical(s.width, s.height);
+    }
+    fn request_redraw(&self) {
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
+        }
+    }
+    fn update_window_properties(&self, properties: WindowProperties<'_>) {
+        // Our components have fixed width/height -> use preferred size.
+        let c = properties.layout_constraints();
+        let s = self.scale.get();
+        let w = (c.preferred.width * s).round().max(1.0) as u32;
+        let h = (c.preferred.height * s).round().max(1.0) as u32;
+        self.resize_physical(w, h);
+    }
+}
+
+// ---------- native window + message handling ----------
+
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const CLASS: PCWSTR = w!("GlassFoldersWnd");
+
+fn create_hwnd() -> Result<HWND, PlatformError> {
+    unsafe {
+        let inst = GetModuleHandleW(None).map_err(|e| PlatformError::Other(e.to_string()))?;
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(wndproc),
+            hInstance: inst.into(),
+            lpszClassName: CLASS,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        RegisterClassExW(&wc); // fails harmlessly after the first time
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            CLASS,
+            w!("Glass Folders"),
+            // Thick frame = DWM treats it as a framed window -> per-pixel alpha + backdrop work.
+            // The frame itself is removed in WM_NCCALCSIZE, so client = whole window.
+            WS_POPUP | WS_CAPTION | WS_THICKFRAME,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            Some(inst.into()),
+            None,
+        )
+        .map_err(|e| PlatformError::Other(e.to_string()))
+    }
+}
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let Some(g) = lookup(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
+    let btn = |m: u32| match m {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => PointerEventButton::Left,
+        WM_RBUTTONDOWN | WM_RBUTTONUP => PointerEventButton::Right,
+        _ => PointerEventButton::Middle,
+    };
+    match msg {
+        WM_PAINT => {
+            g.paint();
+            return LRESULT(0);
+        }
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_MOUSEMOVE => {
+            if !g.tracking.get() {
+                let mut t = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut t);
+                g.tracking.set(true);
+            }
+            g.window.dispatch_event(WindowEvent::PointerMoved { position: g.logical(lp) });
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            g.tracking.set(false);
+            g.window.dispatch_event(WindowEvent::PointerExited);
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            SetCapture(hwnd);
+            g.window.dispatch_event(WindowEvent::PointerPressed { position: g.logical(lp), button: btn(msg) });
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+            let _ = ReleaseCapture();
+            g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
+            return LRESULT(0);
+        }
+        WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
+            let t: slint::SharedString = Key::Escape.into();
+            g.window.dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
+            g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
+            return LRESULT(0);
+        }
+        WM_MOUSEACTIVATE if g.kind.get() == Kind::Tile => return LRESULT(MA_NOACTIVATE as isize),
+        WM_ACTIVATE => {
+            let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
+            g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));
+            if !active {
+                if let Some(f) = g.on_deactivate.borrow().clone() {
+                    slint::Timer::single_shot(Duration::ZERO, move || f());
+                }
+            }
+        }
+        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile => {
+            let pos = &mut *(lp.0 as *mut WINDOWPOS);
+            pos.hwndInsertAfter = HWND_BOTTOM;
+            pos.flags &= !SWP_NOZORDER;
+        }
+        WM_DPICHANGED => {
+            let scale = (wp.0 & 0xffff) as f32 / 96.0;
+            g.scale.set(scale);
+            g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
+        }
+        WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
+        WM_CLOSE => return LRESULT(0),
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+// ---------- platform + event loop ----------
+
+struct Proxy {
+    thread: u32,
+    queue: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
+    quit: Arc<AtomicBool>,
+}
+
+impl EventLoopProxy for Proxy {
+    fn quit_event_loop(&self) -> Result<(), EventLoopError> {
+        self.quit.store(true, Ordering::SeqCst);
+        unsafe {
+            let _ = PostThreadMessageW(self.thread, WM_NULL, WPARAM(0), LPARAM(0));
+        }
+        Ok(())
+    }
+    fn invoke_from_event_loop(&self, f: Box<dyn FnOnce() + Send>) -> Result<(), EventLoopError> {
+        self.queue.lock().unwrap().push(f);
+        unsafe {
+            let _ = PostThreadMessageW(self.thread, WM_NULL, WPARAM(0), LPARAM(0));
+        }
+        Ok(())
+    }
+}
+
+pub struct GfPlatform {
+    start: Instant,
+    thread: u32,
+    queue: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
+    quit: Arc<AtomicBool>,
+}
+
+impl GfPlatform {
+    pub fn new() -> Self {
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        GfPlatform {
+            start: Instant::now(),
+            thread: unsafe { GetCurrentThreadId() },
+            queue: Default::default(),
+            quit: Default::default(),
+        }
+    }
+}
+
+impl Platform for GfPlatform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        Ok(GfWindow::new()?)
+    }
+
+    fn duration_since_start(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
+        Some(Box::new(Proxy { thread: self.thread, queue: self.queue.clone(), quit: self.quit.clone() }))
+    }
+
+    fn run_event_loop(&self) -> Result<(), PlatformError> {
+        let mut msg = MSG::default();
+        loop {
+            slint::platform::update_timers_and_animations();
+            let jobs: Vec<_> = std::mem::take(&mut *self.queue.lock().unwrap());
+            for f in jobs {
+                f();
+            }
+            if self.quit.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // Animations running -> ~60 fps; else sleep until next timer or input (idle = 0 CPU).
+            let animating = ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).any(|g| g.window.has_active_animations()));
+            if animating {
+                ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).for_each(|g| g.request_redraw()));
+            }
+            let timeout = if animating {
+                16
+            } else {
+                slint::platform::duration_until_next_timer_update()
+                    .map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32)
+                    .unwrap_or(u32::MAX) // INFINITE
+            };
+            unsafe {
+                MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return Ok(());
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+    }
+}

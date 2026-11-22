@@ -1,0 +1,330 @@
+﻿// Кратко: интерфейс — окно открытой папки (Panel) и плитка папки на столе (Tile).
+// Geometry is computed in Rust (model.rs); this file only draws.
+
+
+export struct SlotData {
+    name: string,
+    icon: image,
+    id: int,
+    more: int,
+    x: length,
+    y: length,
+}
+
+export struct GroupData {
+    name: string,
+    tint: color,
+    idx: int,
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+    items: [SlotData],
+}
+
+component Dot inherits Rectangle {
+    in property <color> c;
+    in property <length> size: 14px;
+    callback clicked;
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: c;
+    border-width: ta.has-hover ? 2px : 1px;
+    border-color: ta.has-hover ? #ffffffd0 : #00000030;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component Slot inherits Rectangle {
+    in property <SlotData> d;
+    in property <bool> labels;
+    in property <bool> dark;
+    callback clicked;
+    width: 76px;
+    height: 76px;
+    border-radius: 6px;
+    background: ta.pressed ? (dark ? #ffffff24 : #00000018) : ta.has-hover ? (dark ? #ffffff14 : #0000000c) : transparent;
+
+    if d.more == 0: Image {
+        source: d.icon;
+        width: 48px;
+        height: 48px;
+        x: 14px;
+        y: labels ? 6px : 14px;
+    }
+    if d.more > 0: Rectangle {
+        width: 48px;
+        height: 48px;
+        x: 14px;
+        y: labels ? 6px : 14px;
+        border-radius: 10px;
+        background: dark ? #ffffff1a : #0000000f;
+        Text {
+            text: "+" + d.more;
+            font-size: 16px;
+            font-weight: 600;
+            color: dark ? #ffffff : #1b1b1b;
+        }
+    }
+    Text {
+        visible: labels;
+        text: d.more > 0 ? "ещё" : d.name;
+        x: 3px;
+        y: 57px;
+        width: parent.width - 6px;
+        height: 16px;
+        font-size: 11px;
+        color: dark ? #ffffffe0 : #1b1b1be0;
+        horizontal-alignment: center;
+        overflow: elide;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component Panel inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folders";
+
+    in property <string> folder-name;
+    in property <color> folder-tint: #0078d4;
+    in property <[GroupData]> groups;
+    in property <length> grid-w: 300px;
+    in property <length> grid-h: 200px;
+    in property <bool> labels: true;
+    in property <[color]> pal;
+    in property <bool> dark; // set from Rust (Windows app theme)
+
+    callback launch(int);
+    callback open-group(int);
+    callback pick-color(int, color);
+    callback close-panel();
+    callback toggle-labels();
+    callback quit();
+
+    property <length> pad: 16px;
+    property <length> top: 48px;
+    property <int> pick-target: -1;
+    property <length> pick-x;
+    property <length> pick-y;
+
+    width: grid-w + 2 * pad;
+    height: grid-h + top + pad;
+
+    public function focus-keys() {
+        fs.focus();
+    }
+
+    fs := FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close-panel();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    // matte layer over the system acrylic
+    Rectangle {
+        background: dark ? #20202040 : #f3f3f340;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: dark ? #ffffff18 : #00000014;
+    }
+
+    Dot {
+        x: pad + 2px;
+        y: 17px;
+        c: folder-tint;
+        clicked => {
+            pick-target = -1;
+            pick-x = pad;
+            pick-y = 36px;
+            cp.show();
+        }
+    }
+    Text {
+        x: pad + 26px;
+        y: 12px;
+        height: 24px;
+        width: parent.width - 2 * pad - 110px;
+        text: folder-name;
+        font-size: 16px;
+        font-weight: 600;
+        overflow: elide;
+        vertical-alignment: center;
+        color: dark ? #ffffff : #1b1b1b;
+    }
+    // labels on/off
+    Rectangle {
+        x: parent.width - pad - 32px;
+        y: 12px;
+        width: 32px;
+        height: 24px;
+        border-radius: 4px;
+        background: lt.has-hover ? (dark ? #ffffff18 : #0000000f) : transparent;
+        Text {
+            text: "Aa";
+            font-size: 13px;
+            color: labels ? (dark ? #ffffff : #1b1b1b) : (dark ? #ffffff60 : #1b1b1b60);
+        }
+        lt := TouchArea {
+            clicked => { root.toggle-labels(); }
+        }
+    }
+    // quit app (prototype: no tray yet)
+    Rectangle {
+        x: parent.width - pad - 76px;
+        y: 12px;
+        width: 40px;
+        height: 24px;
+        border-radius: 4px;
+        background: qt.has-hover ? #e8112340 : transparent;
+        Text {
+            text: "выход";
+            font-size: 11px;
+            color: dark ? #ffffff90 : #1b1b1b90;
+        }
+        qt := TouchArea {
+            clicked => { root.quit(); }
+        }
+    }
+
+    for g in groups: Rectangle {
+        x: pad + g.x;
+        y: top + g.y;
+        width: g.w;
+        height: g.h;
+        border-radius: 8px;
+        background: g.tint.with-alpha(dark ? 0.16 : 0.12);
+        border-width: 1px;
+        border-color: g.tint.with-alpha(0.28);
+
+        Dot {
+            x: 7px;
+            y: 6px;
+            c: g.tint;
+            clicked => {
+                pick-target = g.idx;
+                pick-x = pad + g.x + 4px;
+                pick-y = top + g.y + 24px;
+                cp.show();
+            }
+        }
+        Text {
+            x: 26px;
+            y: 3px;
+            height: 20px;
+            width: parent.width - 30px;
+            text: g.name;
+            font-size: 12px;
+            font-weight: 600;
+            overflow: elide;
+            vertical-alignment: center;
+            color: dark ? #ffffffe8 : #1b1b1be8;
+        }
+        for s in g.items: Slot {
+            x: s.x;
+            y: s.y;
+            d: s;
+            labels: root.labels;
+            dark: root.dark;
+            clicked => {
+                if (s.more > 0) {
+                    root.open-group(g.idx);
+                } else {
+                    root.launch(s.id);
+                }
+            }
+        }
+    }
+
+    cp := PopupWindow {
+        x: pick-x;
+        y: pick-y;
+        width: 156px;
+        height: 72px;
+        Rectangle {
+            background: dark ? #2c2c2c : #fbfbfb;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #80808040;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000050;
+            for c[i] in pal: Dot {
+                x: 8px + mod(i, 5) * 28px;
+                y: 8px + floor(i / 5) * 28px;
+                size: 22px;
+                c: c;
+                clicked => {
+                    root.pick-color(root.pick-target, c);
+                    cp.close();
+                }
+            }
+        }
+    }
+}
+
+export component Tile inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folder";
+
+    in property <string> name;
+    in property <color> tint: #0078d4;
+    in property <[image]> icons;
+    in property <bool> dark; // set from Rust (Windows app theme)
+    in property <image> backdrop; // frosted wallpaper under the tile (win::wallpaper_blur)
+    callback open();
+
+    width: 112px;
+    height: 112px;
+
+    Image {
+        source: backdrop;
+        width: parent.width;
+        height: parent.height;
+        image-fit: fill;
+    }
+    Rectangle {
+        background: ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: tint.with-alpha(0.55);
+    }
+    for ic[i] in icons: Image {
+        source: ic;
+        width: 36px;
+        height: 36px;
+        x: 14px + mod(i, 2) * 48px;
+        y: 8px + floor(i / 2) * 42px;
+    }
+    Rectangle {
+        x: 10px;
+        y: 95px;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: tint;
+    }
+    Text {
+        x: 22px;
+        y: 91px;
+        width: parent.width - 30px;
+        height: 16px;
+        text: name;
+        font-size: 11px;
+        font-weight: 600;
+        overflow: elide;
+        color: dark ? #ffffff : #1b1b1b;
+    }
+    ta := TouchArea {
+        clicked => { root.open(); }
+    }
+}

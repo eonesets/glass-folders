@@ -97,6 +97,10 @@ pub struct GfWindow {
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
     surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
+    /// Animation: window shows only part of its content. (home = where content's top-left is on screen,
+    /// shown rect). Slint keeps its full size; paint + mouse are offset.
+    view: Cell<Option<(POINT, RECT)>>,
+    glide: RefCell<Option<slint::Timer>>,
 }
 
 /// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
@@ -131,8 +135,11 @@ pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
     (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
 }
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
+const GLIDE_MS: f32 = 130.0; // tile settles onto the grid after release
 
 thread_local! {
+    /// Tiles land on the grid after a move (setting). Size always snaps to whole cells.
+    static SNAP: Cell<bool> = const { Cell::new(true) };
     static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
     static ALL: RefCell<Vec<Weak<GfWindow>>> = const { RefCell::new(Vec::new()) };
 }
@@ -181,6 +188,46 @@ pub fn start_move(window: &slint::Window) {
     g.drag.set(Some(d));
 }
 
+pub fn set_snap(on: bool) {
+    SNAP.with(|s| s.set(on));
+}
+
+/// Animation frame: window shows `shown` (screen rect) of its content, whose top-left sits at `home`.
+/// None = normal (window = content at home). Content size is untouched (no relayout per frame).
+pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
+    let Some(g) = find(window) else { return };
+    let was = g.view.replace(v);
+    let hwnd = g.hwnd.get();
+    let (x, y, w, h) = match (v, was) {
+        (Some((_, r)), _) => (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)),
+        (None, Some((home, _))) => {
+            let PhysicalSize { width, height } = g.size.get();
+            (home.x, home.y, width as i32, height as i32)
+        }
+        (None, None) => return,
+    };
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = UpdateWindow(hwnd); // paint now: no frame with stale content
+    }
+}
+
+/// Where the content's top-left is while an animation frame is shown.
+pub fn view_home(window: &slint::Window) -> Option<POINT> {
+    find(window)?.view.get().map(|(h, _)| h)
+}
+
+/// Screen rect of a window (physical px).
+pub fn rect_of(window: &slint::Window) -> Option<RECT> {
+    let g = find(window)?;
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(g.hwnd.get(), &mut r);
+    }
+    Some(r)
+}
+
 pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
     if let Some(g) = find(window) {
         *g.on_deactivate.borrow_mut() = Some(Rc::new(f));
@@ -205,6 +252,8 @@ impl GfWindow {
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
             surrogate: Cell::new(0),
+            view: Cell::new(None),
+            glide: RefCell::new(None),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -220,7 +269,52 @@ impl GfWindow {
         let x = (lp.0 & 0xffff) as i16 as f32;
         let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
         let s = self.scale.get();
-        LogicalPosition::new(x / s, y / s)
+        let (ox, oy) = self.offset();
+        LogicalPosition::new((x + ox as f32) / s, (y + oy as f32) / s)
+    }
+
+    /// Content px hidden left/above the shown part (animation), else 0.
+    fn offset(&self) -> (i32, i32) {
+        match self.view.get() {
+            Some((home, r)) => (r.left - home.x, r.top - home.y),
+            None => (0, 0),
+        }
+    }
+
+    /// Ease the window to rect `to` (screen px), then report the final rect (tile settles onto grid).
+    fn glide_to(self: &Rc<Self>, to: RECT) {
+        let mut from = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd.get(), &mut from);
+        }
+        let start = Instant::now();
+        let weak = Rc::downgrade(self);
+        let t = slint::Timer::default();
+        t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+            let Some(g) = weak.upgrade() else { return };
+            if g.glide.borrow().is_none() {
+                return; // finished
+            }
+            let k = (start.elapsed().as_secs_f32() * 1000.0 / GLIDE_MS).min(1.0);
+            let e = 1.0 - (1.0 - k).powi(3); // ease-out cubic
+            let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
+            let (x, y) = (mix(from.left, to.left), mix(from.top, to.top));
+            let (w, h) = (mix(from.right - from.left, to.right - to.left), mix(from.bottom - from.top, to.bottom - to.top));
+            unsafe {
+                let _ = SetWindowPos(g.hwnd.get(), None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            g.resize_physical(w as u32, h as u32);
+            if k >= 1.0 {
+                // stop: drop the timer later (we are inside its callback)
+                if let Some(t) = g.glide.borrow_mut().take() {
+                    slint::Timer::single_shot(Duration::ZERO, move || drop(t));
+                }
+                if let Some(f) = g.on_moved.borrow().clone() {
+                    f(to);
+                }
+            }
+        });
+        *self.glide.borrow_mut() = Some(t);
     }
 
     fn in_grip(&self, p: LogicalPosition) -> bool {
@@ -243,13 +337,14 @@ impl GfWindow {
         d.moved = true;
         self.drag.set(Some(d));
         if d.resize {
-            let (w, h) = snap_size(d.rect.right - d.rect.left + dx, d.rect.bottom - d.rect.top + dy, self.scale.get());
+            // follows the cursor smoothly; whole cells on release (glide). Not below 2x2 cells.
+            let (mw, mh) = snap_size(0, 0, self.scale.get());
+            let w = (d.rect.right - d.rect.left + dx).max(mw);
+            let h = (d.rect.bottom - d.rect.top + dy).max(mh);
             self.resize_physical(w as u32, h as u32);
         } else {
-            let (mut x, mut y) = (d.rect.left + dx, d.rect.top + dy);
-            if self.kind.get() == Kind::Tile {
-                (x, y) = snap_pos(x, y, self.scale.get());
-            }
+            // free move under the cursor; grid (if on) only on release
+            let (x, y) = (d.rect.left + dx, d.rect.top + dy);
             unsafe {
                 let _ = SetWindowPos(
                     self.hwnd.get(),
@@ -270,16 +365,10 @@ impl GfWindow {
             return;
         }
         self.size.set(PhysicalSize::new(w, h));
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd.get(),
-                None,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        if self.view.get().is_none() {
+            unsafe {
+                let _ = SetWindowPos(self.hwnd.get(), None, 0, 0, w as i32, h as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         let s = self.scale.get();
         self.window.dispatch_event(WindowEvent::Resized { size: LogicalSize::new(w as f32 / s, h as f32 / s) });
@@ -310,7 +399,8 @@ impl GfWindow {
             let hdc = BeginPaint(hwnd, &mut ps);
             if self.draw(hdc) {
                 if let Some(d) = self.dib.borrow().as_ref() {
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), 0, 0, SRCCOPY);
+                    let (ox, oy) = self.offset();
+                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
                 }
             }
             let _ = EndPaint(hwnd, &ps);
@@ -498,6 +588,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             SetCapture(hwnd);
             if msg == WM_LBUTTONDOWN && g.kind.get() == Kind::Tile {
+                g.glide.borrow_mut().take();
                 let mut d = Drag { resize: g.in_grip(g.logical(lp)), cursor: POINT::default(), rect: RECT::default(), moved: false };
                 let _ = GetCursorPos(&mut d.cursor);
                 let _ = GetWindowRect(hwnd, &mut d.rect);
@@ -520,7 +611,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         });
                         let mut r = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut r);
-                        if let Some(f) = g.on_moved.borrow().clone() {
+                        if g.kind.get() == Kind::Tile {
+                            // land: size on whole cells, place on grid (setting) -> short glide there
+                            let s = g.scale.get();
+                            let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
+                            let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
+                            g.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
+                        } else if let Some(f) = g.on_moved.borrow().clone() {
                             f(r);
                         }
                         return LRESULT(0);
@@ -588,9 +685,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile => {
+            // keep tiles at the bottom whenever z-order changes; plain moves (drag) stay cheap
             let pos = &mut *(lp.0 as *mut WINDOWPOS);
-            pos.hwndInsertAfter = HWND_BOTTOM;
-            pos.flags &= !SWP_NOZORDER;
+            if (pos.flags & SWP_NOZORDER).0 == 0 {
+                pos.hwndInsertAfter = HWND_BOTTOM;
+            }
         }
         WM_DPICHANGED => {
             let scale = (wp.0 & 0xffff) as f32 / 96.0;

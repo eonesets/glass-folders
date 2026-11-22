@@ -1,5 +1,5 @@
-﻿// Кратко: точка входа. При запуске прячет значки рабочего стола и ставит вместо папок плитки;
-// при выходе значки возвращаются. Одно окно открытой папки (прячется, не пересоздаётся).
+﻿// Кратко: точка входа. При запуске ставит вместо папок на столе плитки (папки скрываются, ярлыки
+// и выделение на столе остаются); при выходе значки папок возвращаются на места. Окно папки вырастает из плитки.
 
 #![windows_subsystem = "windows"]
 
@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use model::{GRect, GAP, GPAD, HEAD, PITCH, ROW};
 use slint::{ComponentHandle, Image, Model, ModelRc, PhysicalPosition, PhysicalSize, VecModel};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{POINT, RECT};
+
+const OPEN_MS: f32 = 230.0; // panel grows out of the tile
+const CLOSE_MS: f32 = 150.0; // ... and folds back into it
 
 // Icons are requested at exact on-screen pixel size: big sizes make the shell add a frame around low-res icons.
 fn px(logical: f32, scale: f32) -> i32 {
@@ -51,6 +54,23 @@ struct App {
     target: Target,
     grab: Option<(f32, f32)>, // group move: cursor offset from group corner
     groups: Option<Rc<VecModel<GroupData>>>,
+    // open / close animation of the panel
+    anim: Option<slint::Timer>,
+    closing: bool,
+}
+
+impl App {
+    /// Group header height in panel px. No title and no dot: slots centered in the plate.
+    fn head(&self) -> f32 {
+        if self.set.names || self.set.dots {
+            HEAD
+        } else {
+            (HEAD + GPAD) / 2.0
+        }
+    }
+    fn tile_rect(&self, dir: &Path) -> Option<RECT> {
+        self.tiles.iter().find(|(d, _)| d == dir).and_then(|(_, t)| plat::rect_of(t.window()))
+    }
 }
 
 type Shared = Rc<RefCell<App>>;
@@ -61,7 +81,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // any crash: give the user their desktop icons back
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |i| {
-        desk::restore_icons();
+        desk::restore_folders(&HashMap::new());
         hook(i);
     }));
     let desktop = win::desktop_dir();
@@ -84,7 +104,8 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     panel.set_dark(dark);
-    panel.set_glass(app.borrow().set.glass);
+    push_settings(&panel, &app.borrow().set);
+    plat::set_snap(app.borrow().set.snap);
     let pal: Vec<slint::Color> = model::PAL.iter().map(|h| model::color(h)).collect();
     panel.set_pal(ModelRc::new(VecModel::from(pal)));
 
@@ -138,18 +159,9 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     {
         let (a, p) = (app.clone(), panel.as_weak());
-        panel.on_set_glass(move |lvl| {
-            {
-                let mut st = a.borrow_mut();
-                st.set.glass = lvl;
-                model::save_settings(&st.set);
-            }
+        panel.on_set_opt(move |key, v| {
             if let Some(p) = p.upgrade() {
-                p.set_glass(lvl);
-            }
-            let st = a.borrow();
-            for (_, t) in &st.tiles {
-                reblur(t, st.dark, lvl);
+                set_opt(&p, &a, key.as_str(), v);
             }
         });
     }
@@ -158,20 +170,6 @@ fn main() -> Result<(), slint::PlatformError> {
         panel.on_close_panel(move || {
             if let Some(p) = p.upgrade() {
                 close(&p, &a);
-            }
-        });
-    }
-    {
-        let (a, p) = (app.clone(), panel.as_weak());
-        panel.on_toggle_labels(move || {
-            let on = {
-                let mut st = a.borrow_mut();
-                st.set.labels = !st.set.labels;
-                model::save_settings(&st.set);
-                st.set.labels
-            };
-            if let Some(p) = p.upgrade() {
-                p.set_labels(on);
             }
         });
     }
@@ -236,15 +234,30 @@ fn main() -> Result<(), slint::PlatformError> {
             });
         });
     }
-    panel.on_quit(|| {
-        desk::restore_icons();
-        let _ = slint::quit_event_loop();
-    });
+    {
+        let a = app.clone();
+        panel.on_quit(move || {
+            give_back_icons(&a);
+            let _ = slint::quit_event_loop();
+        });
+    }
 
-    make_tiles(&app, &panel, &desktop)?;
-    // tiles stand where the folders were -> now hide the native icons (dev: GF_KEEP_ICONS=1 keeps them)
-    if std::env::var("GF_KEEP_ICONS").is_err() {
-        desk::hide_icons();
+    // v0.4 left-over (whole icon layer hidden by a killed run) + folder icons parked by a killed run
+    desk::unhide_icon_layer();
+    let killed: HashMap<PathBuf, POINT> =
+        app.borrow().set.homes.iter().map(|(k, [x, y])| (PathBuf::from(k), POINT { x: *x, y: *y })).collect();
+    desk::restore_folders(&killed);
+
+    let homes = make_tiles(&app, &panel, &desktop, &killed)?;
+    // tiles stand where the folders were -> hide the folder icons (dev: GF_KEEP_ICONS=1 keeps them).
+    // Spots saved first: a killed run gets them back on next start.
+    if std::env::var("GF_KEEP_ICONS").is_err() && !homes.is_empty() {
+        {
+            let mut st = app.borrow_mut();
+            st.set.homes = homes.iter().map(|(k, p)| (k.to_string_lossy().into_owned(), [p.x, p.y])).collect();
+            model::save_settings(&st.set);
+        }
+        desk::hide_folders(homes);
     }
 
     // Dev helper: glass-folders.exe --open GAMES
@@ -259,16 +272,87 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     let r = slint::run_event_loop();
-    desk::restore_icons();
+    give_back_icons(&app);
     r
+}
+
+/// Folder icons back to their spots; nothing left to restore next start.
+fn give_back_icons(app: &Shared) {
+    desk::restore_folders(&HashMap::new());
+    let mut st = app.borrow_mut();
+    if !st.set.homes.is_empty() {
+        st.set.homes.clear();
+        model::save_settings(&st.set);
+    }
+}
+
+fn push_settings(panel: &Panel, set: &model::Settings) {
+    panel.set_labels(set.labels);
+    panel.set_names(set.names);
+    panel.set_dots(set.dots);
+    panel.set_glass(set.glass);
+    panel.set_gravity(set.gravity);
+    panel.set_snap(set.snap);
+}
+
+/// One setting changed in the settings page.
+fn set_opt(panel: &Panel, app: &Shared, key: &str, v: i32) {
+    let (relayout, snap_now) = {
+        let mut st = app.borrow_mut();
+        let on = v != 0;
+        let mut relayout = false;
+        let mut snap_now = false;
+        match key {
+            "labels" => st.set.labels = on,
+            "names" => (st.set.names, relayout) = (on, true),
+            "dots" => (st.set.dots, relayout) = (on, true),
+            "gravity" => (st.set.gravity, relayout) = (v.clamp(0, 2), true),
+            "glass" => st.set.glass = v.clamp(0, 2),
+            "snap" => (st.set.snap, snap_now) = (on, on),
+            _ => return,
+        }
+        model::save_settings(&st.set);
+        push_settings(panel, &st.set);
+        plat::set_snap(st.set.snap);
+        for (_, t) in &st.tiles {
+            reblur(t, st.dark, st.set.glass);
+        }
+        (relayout, snap_now)
+    };
+    if snap_now {
+        // grid switched on: every tile onto the grid now
+        let st = app.borrow();
+        for (d, t) in &st.tiles {
+            let Some(r) = plat::rect_of(t.window()) else { continue };
+            let (x, y) = plat::snap_pos(r.left, r.top, t.window().scale_factor());
+            t.window().set_position(PhysicalPosition::new(x, y));
+            let mut cfg = model::load_cfg(d);
+            cfg.tile = Some([x, y, r.right - r.left, r.bottom - r.top]);
+            let _ = model::save_cfg(d, &cfg);
+        }
+    }
+    if relayout && app.borrow().folder.is_some() {
+        render(panel, app);
+    }
 }
 
 /// Desktop tiles: one per folder on Desktop. Place: saved rect; else where the folder icon stands
 /// on the desktop (first run); else a column at the right edge. Never on top of another tile.
-fn make_tiles(app: &Shared, panel: &Panel, desktop: &Path) -> Result<(), slint::PlatformError> {
+/// Returns home spots of the folder icons (to park them away while tiles stand in).
+fn make_tiles(
+    app: &Shared,
+    panel: &Panel,
+    desktop: &Path,
+    killed: &HashMap<PathBuf, POINT>,
+) -> Result<HashMap<PathBuf, POINT>, slint::PlatformError> {
     let dark = app.borrow().dark;
     let glass = app.borrow().set.glass;
-    let native = desk::icon_positions();
+    let mut native = desk::icon_positions();
+    // killed run: its saved spots win (icon may not be back on the desktop yet)
+    for (k, p) in killed {
+        native.insert(k.clone(), *p);
+    }
+    let mut homes = HashMap::new();
     // dev: GF_DUMP_ICONS=file writes where Explorer has each desktop icon
     if let Ok(out) = std::env::var("GF_DUMP_ICONS") {
         let txt: String = native.iter().map(|(p, pt)| format!("{}\t{}\t{}\n", p.display(), pt.x, pt.y)).collect();
@@ -328,6 +412,9 @@ fn make_tiles(app: &Shared, panel: &Panel, desktop: &Path) -> Result<(), slint::
             (x, y, side_w, side_h)
         };
         taken.push(RECT { left: x, top: y, right: x + w, bottom: y + h });
+        if let Some(p) = native.get(&dir) {
+            homes.insert(dir.clone(), *p);
+        }
         t.window().set_size(PhysicalSize::new(w as u32, h as u32));
         t.window().set_position(PhysicalPosition::new(x, y));
         reblur(&t, dark, glass);
@@ -347,7 +434,7 @@ fn make_tiles(app: &Shared, panel: &Panel, desktop: &Path) -> Result<(), slint::
         t.show()?;
         app.borrow_mut().tiles.push((dir, t));
     }
-    Ok(())
+    Ok(homes)
 }
 
 /// Snapped spot near `start` (physical px) where a w x h tile hits no taken rect.
@@ -417,7 +504,7 @@ fn item_drag(st: &mut App, id: i32, x: f32, y: f32, inside: bool) {
         let [rx, ry, _, _] = r.px();
         let Some(f) = st.folder.as_ref() else { return };
         let col = ((x - rx) / PITCH).floor().clamp(0.0, (r.w - 1) as f32) as usize;
-        let row = ((y - ry - HEAD) / PITCH).floor().max(0.0) as usize;
+        let row = ((y - ry - st.head()) / PITCH).floor().max(0.0) as usize;
         let n = f.groups[i].items.len() - usize::from(i == src); // items besides the dragged one
         let cap = (r.w * r.rows()) as usize;
         let k = (row * r.w as usize + col).min(n).min(cap.saturating_sub(1));
@@ -426,7 +513,7 @@ fn item_drag(st: &mut App, id: i32, x: f32, y: f32, inside: bool) {
         return;
     }
     // empty space: 1x1 plate with its slot under the cursor, never over a group above it
-    let mut g = GRect::slots(1, 1, (x / PITCH).floor().max(0.0) as i32, ((y - HEAD - model::CELL / 2.0) / ROW).round().max(0.0) as i32);
+    let mut g = GRect::slots(1, 1, (x / PITCH).floor().max(0.0) as i32, ((y - st.head() - model::CELL / 2.0) / ROW).round().max(0.0) as i32);
     while let Some(b) = st.base.iter().filter(|r| r.hits(&g) && r.y < g.y).map(|r| r.y + r.h).max() {
         g.y = b;
     }
@@ -434,6 +521,7 @@ fn item_drag(st: &mut App, id: i32, x: f32, y: f32, inside: bool) {
     all.push(g);
     let last = all.len() - 1;
     model::resolve(&mut all, Some(last));
+    model::settle(&mut all, st.set.gravity);
     st.ghost = all.pop();
     st.prev = all;
     st.target = Target::New;
@@ -455,6 +543,7 @@ fn group_drag(st: &mut App, idx: usize, x: f32, y: f32, resize: bool) {
     let mut all = st.base.clone();
     all[idx] = r;
     model::resolve(&mut all, Some(idx));
+    model::settle(&mut all, st.set.gravity);
     st.prev = all;
 }
 
@@ -694,22 +783,107 @@ fn set_color(panel: &Panel, app: &Shared, idx: i32, hx: Option<String>) {
 }
 
 fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
+    // a fold-back still running (click on another tile closed the panel): finish it now
+    finish_close(panel, app);
     app.borrow_mut().folder = Some(model::scan(dir));
+    panel.set_page(0);
     render(panel, app);
-    // center on work area (size = same formula as Panel width/height in app.slint)
+    // size = same formula as Panel width/height in app.slint
     let s = panel.window().scale_factor();
-    let w = ((panel.get_grid_w() + 32.0) * s) as i32;
-    let h = ((panel.get_grid_h() + 64.0) * s) as i32;
+    let w = ((panel.get_grid_w() + 32.0).max(panel.get_min_w()) * s).round() as i32;
+    let h = ((panel.get_grid_h() + 64.0) * s).round() as i32;
+    panel.window().set_size(PhysicalSize::new(w as u32, h as u32));
+    // place: centered on the tile, kept inside the work area
     let wa = win::work_area();
-    let x = wa.left + (wa.right - wa.left - w) / 2;
-    let y = wa.top + (wa.bottom - wa.top - h) / 2;
-    panel.window().set_position(PhysicalPosition::new(x, y));
+    let m = (8.0 * s) as i32;
+    let from = app.borrow().tile_rect(dir).unwrap_or_else(|| {
+        let (cx, cy) = ((wa.left + wa.right) / 2, (wa.top + wa.bottom) / 2);
+        RECT { left: cx - 40, top: cy - 40, right: cx + 40, bottom: cy + 40 }
+    });
+    let (cx, cy) = ((from.left + from.right) / 2, (from.top + from.bottom) / 2);
+    let x = (cx - w / 2).clamp(wa.left + m, (wa.right - w - m).max(wa.left + m));
+    let y = (cy - h / 2).clamp(wa.top + m, (wa.bottom - h - m).max(wa.top + m));
+    let home = POINT { x, y };
+    let to = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    plat::set_view(panel.window(), Some((home, from)));
+    panel.set_reveal(0.0);
     let _ = panel.show();
     panel.invoke_focus_keys();
+    animate(panel, app, home, from, to, OPEN_MS, true);
 }
 
+/// Panel shows a growing / shrinking part of itself (from -> to), content fades with it.
+fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f32, opening: bool) {
+    let start = std::time::Instant::now();
+    let (a, p) = (app.clone(), panel.as_weak());
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+        let Some(p) = p.upgrade() else { return };
+        if a.borrow().anim.is_none() {
+            return; // stopped
+        }
+        let k = (start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
+        // open: ease-out (fast start, soft landing); close: ease-in
+        let e = if opening { 1.0 - (1.0 - k).powi(3) } else { k * k };
+        let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
+        let r = RECT { left: mix(from.left, to.left), top: mix(from.top, to.top), right: mix(from.right, to.right), bottom: mix(from.bottom, to.bottom) };
+        p.set_reveal(if opening { (k * 1.4).min(1.0) } else { 1.0 - k });
+        plat::set_view(p.window(), Some((home, r)));
+        if k >= 1.0 {
+            if let Some(t) = a.borrow_mut().anim.take() {
+                slint::Timer::single_shot(Duration::ZERO, move || drop(t));
+            }
+            if opening {
+                plat::set_view(p.window(), None);
+                p.set_reveal(1.0);
+            } else {
+                finish_close(&p, &a);
+            }
+        }
+    });
+    app.borrow_mut().anim = Some(t);
+}
+
+/// Start folding the panel back into its tile; hidden + cleared at the end.
 fn close(panel: &Panel, app: &Shared) {
+    let (home, from, to) = {
+        let mut st = app.borrow_mut();
+        if st.closing || st.folder.is_none() {
+            return;
+        }
+        st.closing = true;
+        let Some(cur) = plat::rect_of(panel.window()) else { return };
+        let dir = st.folder.as_ref().map(|f| f.dir.clone()).unwrap_or_default();
+        let to = st.tile_rect(&dir).unwrap_or_else(|| {
+            let (cx, cy) = ((cur.left + cur.right) / 2, (cur.top + cur.bottom) / 2);
+            RECT { left: cx - 40, top: cy - 40, right: cx + 40, bottom: cy + 40 }
+        });
+        st.anim.take(); // an unfinished open: fold from where it is now
+        (POINT { x: cur.left, y: cur.top }, cur, to)
+    };
+    // home = content corner: if open was cut short, content corner is not the window corner
+    let home = plat::view_home(panel.window()).unwrap_or(home);
+    animate(panel, app, home, from, to, CLOSE_MS, false);
+}
+
+/// Hide panel and free everything (end of fold-back, or cut short by a new open).
+fn finish_close(panel: &Panel, app: &Shared) {
+    {
+        let mut st = app.borrow_mut();
+        st.anim.take();
+        if !st.closing {
+            if st.folder.is_some() {
+                // open still running: just land it
+                drop(st);
+                plat::set_view(panel.window(), None);
+                panel.set_reveal(1.0);
+            }
+            return;
+        }
+        st.closing = false;
+    }
     let _ = panel.hide();
+    plat::set_view(panel.window(), None);
     panel.set_groups(ModelRc::default());
     panel.set_rename_idx(-1);
     panel.set_drop_target(-2);
@@ -730,7 +904,7 @@ fn render(panel: &Panel, app: &Shared) {
     let mut st = app.borrow_mut();
     let st = &mut *st;
     let Some(f) = st.folder.as_ref() else { return };
-    let rects = model::layout(f);
+    let rects = model::layout(f, st.set.gravity);
     let icon_px = px(48.0, panel.window().scale_factor());
     st.ids.clear();
     st.id_group.clear();
@@ -771,7 +945,6 @@ fn render(panel: &Panel, app: &Shared) {
     let (gw, gh) = model::grid_px(&st.base, 0, 0);
     panel.set_grid_w(gw);
     panel.set_grid_h(gh);
-    panel.set_labels(st.set.labels);
     panel.set_drop_target(-2);
     panel.set_ghost_on(false);
     let m = Rc::new(VecModel::from(groups));

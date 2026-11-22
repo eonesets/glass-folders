@@ -64,46 +64,127 @@ component CapButton inherits Rectangle {
     }
 }
 
-// Settings row: text button with hover, optional switch.
-component MenuRow inherits Rectangle {
-    in property <string> text;
-    in property <color> fg;
+// ---------- settings controls (Win11-like, quiet) ----------
+
+// On/off switch.
+component Switch inherits Rectangle {
+    in property <bool> on;
     in property <bool> dark;
-    in property <bool> checked;
-    in property <bool> check-box;
-    callback clicked;
-    height: 32px;
-    border-radius: 4px;
-    background: ta.has-hover ? (dark ? #ffffff12 : #0000000a) : transparent;
-    Text {
-        x: 10px;
-        text: root.text;
-        font-size: 12px;
-        color: fg;
-        vertical-alignment: center;
-        height: parent.height;
-    }
-    if check-box: Rectangle {
-        x: parent.width - 44px;
-        y: (parent.height - 18px) / 2;
-        width: 34px;
-        height: 18px;
-        border-radius: 9px;
-        background: checked ? #0078d4 : transparent;
-        border-width: checked ? 0px : 1px;
-        border-color: dark ? #ffffffa0 : #00000080;
-        Rectangle {
-            x: checked ? parent.width - 15px : 3px;
-            y: 3px;
-            width: 12px;
-            height: 12px;
-            border-radius: 6px;
-            background: checked ? #ffffff : (dark ? #ffffffc0 : #000000a0);
-        }
+    in property <color> accent;
+    callback toggled;
+    width: 40px;
+    height: 20px;
+    border-radius: 10px;
+    background: on ? (ta.pressed ? accent.darker(0.15) : accent) : (ta.has-hover ? (dark ? #ffffff10 : #00000008) : transparent);
+    border-width: on ? 0px : 1px;
+    border-color: dark ? #ffffff9c : #0000007a;
+    animate background { duration: 120ms; }
+    Rectangle {
+        property <length> d: ta.pressed ? 14px : (ta.has-hover ? 13px : 12px);
+        x: on ? parent.width - self.d - 4px : 4px;
+        y: (parent.height - self.d) / 2;
+        width: d;
+        height: d;
+        border-radius: d / 2;
+        background: on ? (dark ? #000000 : #ffffff) : (dark ? #ffffffcc : #000000a6);
+        animate x { duration: 160ms; easing: ease-out; }
+        animate width, height, y { duration: 100ms; }
     }
     ta := TouchArea {
-        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
     }
+}
+
+// Segmented choice: sliding thumb under the picked item.
+component Seg inherits Rectangle {
+    in property <[string]> items;
+    in property <int> sel;
+    in property <bool> dark;
+    in property <length> seg-w: 58px;
+    callback pick(int);
+    width: items.length * seg-w + 4px;
+    height: 28px;
+    border-radius: 6px;
+    background: dark ? #ffffff0c : #0000000a;
+    Rectangle {
+        x: 2px + sel * seg-w;
+        y: 2px;
+        width: seg-w;
+        height: parent.height - 4px;
+        border-radius: 4px;
+        background: dark ? #ffffff1f : #ffffff;
+        border-width: 1px;
+        border-color: dark ? #ffffff10 : #0000000f;
+        drop-shadow-blur: dark ? 0px : 3px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #0000001a;
+        animate x { duration: 180ms; easing: ease-out; }
+    }
+    for t[i] in items: Rectangle {
+        x: 2px + i * seg-w;
+        y: 2px;
+        width: seg-w;
+        height: parent.height - 4px;
+        Text {
+            text: t;
+            font-size: 12px;
+            font-weight: sel == i ? 600 : 400;
+            color: sel == i ? (dark ? #ffffff : #1b1b1b) : (st.has-hover ? (dark ? #ffffffd8 : #1b1b1bd8) : (dark ? #ffffff99 : #1b1b1b99));
+        }
+        st := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.pick(i); }
+        }
+    }
+}
+
+// Group of rows on a quiet card. Rows: 44px (or 52px with a hint), hairline between them.
+component Card inherits Rectangle {
+    in property <bool> dark;
+    border-radius: 8px;
+    background: dark ? #ffffff0b : #ffffff9e;
+    border-width: 1px;
+    border-color: dark ? #ffffff0f : #0000000d;
+}
+
+component RowText inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in property <bool> dark;
+    Text {
+        x: 14px;
+        y: hint == "" ? (parent.height - 18px) / 2 : 9px;
+        height: 18px;
+        text: label;
+        font-size: 13px;
+        color: dark ? #ffffff : #1b1b1b;
+        vertical-alignment: center;
+    }
+    if hint != "": Text {
+        x: 14px;
+        y: 27px;
+        height: 15px;
+        text: hint;
+        font-size: 11px;
+        color: dark ? #ffffff8a : #1b1b1b8a;
+        vertical-alignment: center;
+    }
+}
+
+component Hairline inherits Rectangle {
+    in property <bool> dark;
+    height: 1px;
+    background: dark ? #0000004d : #0000000d;
+}
+
+component SectionTitle inherits Text {
+    in property <bool> dark;
+    height: 20px;
+    font-size: 12px;
+    font-weight: 600;
+    color: dark ? #ffffffb8 : #1b1b1bb8;
+    vertical-alignment: center;
 }
 
 // Press + move > 5px = drag (pos in slot coords); else release = click. "+N" slot never drags.
@@ -196,18 +277,24 @@ export component Panel inherits Window {
     in property <[GroupData]> groups;
     in property <length> grid-w: 300px;
     in property <length> grid-h: 200px;
-    in property <bool> labels: true;
-    in property <int> glass: 1; // 0 dense .. 2 clear
     in property <[color]> pal;
     in property <bool> dark; // set from Rust (Windows app theme)
+    // settings (from Rust, saved in settings.json)
+    in property <bool> labels: true;
+    in property <bool> names: true;
+    in property <bool> dots: true;
+    in property <int> glass: 1; // 0 dense .. 2 clear
+    in property <int> gravity: 1; // 0 none, 1 top-left, 2 top-right
+    in property <bool> snap: true;
+    in property <float> reveal: 1; // open / close animation: content fade (Rust drives it)
+    in-out property <int> page: 0; // 0 = folder, 1 = settings
 
     callback launch(int);
     callback open-group(int);
     callback pick-color(int, color);
     callback clear-color(int);
     callback close-panel();
-    callback toggle-labels();
-    callback set-glass(int);
+    callback set-opt(string, int); // settings page: key, value (bool = 0/1)
     callback drag-start();
     callback quit();
     // drag of a shortcut: id, point in grid coords, inside panel body (else = cancel)
@@ -237,14 +324,21 @@ export component Panel inherits Window {
 
     property <length> pad: 16px;
     property <length> top: 48px;
+    // group header: title and/or dot -> 30px; none -> slots centered (21 + 21 around them; main.rs App::head)
+    property <length> head: names || dots ? 30px : 21px;
     property <int> pick-target: -1;
     property <length> pick-x;
     property <length> pick-y;
     // matte layer strength over system acrylic, by glass level
     property <float> matte: glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0;
+    property <color> fg: dark ? #ffffff : #1b1b1b;
+    property <color> accent: dark ? #60cdff : #005fb8;
+    // settings page needs room: panel grows while it is shown
+    out property <length> min-w: page == 1 ? 372px : 0px;
+    property <length> settings-h: 506px;
 
-    width: grid-w + 2 * pad;
-    height: grid-h + top + pad;
+    width: max(grid-w + 2 * pad, min-w);
+    height: page == 1 ? max(grid-h + top + pad, settings-h) : grid-h + top + pad;
 
     // below header, inside window
     pure function inside(x: length, y: length) -> bool {
@@ -255,10 +349,21 @@ export component Panel inherits Window {
         fs.focus();
     }
 
+    function pick-for(idx: int, x: length, y: length) {
+        pick-target = idx;
+        pick-x = x;
+        pick-y = y;
+        cp.show();
+    }
+
     fs := FocusScope {
         key-pressed(e) => {
             if (e.text == Key.Escape) {
-                root.close-panel();
+                if (page == 1) {
+                    page = 0;
+                } else {
+                    root.close-panel();
+                }
                 return accept;
             }
             return reject;
@@ -272,304 +377,507 @@ export component Panel inherits Window {
         border-color: dark ? #ffffff20 : #ffffff60;
     }
 
-    // header = drag handle (buttons below are on top of it)
-    TouchArea {
-        x: 0;
-        y: 0;
-        width: parent.width - 92px;
-        height: top - 6px;
-        pointer-event(e) => {
-            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
-                root.drag-start();
+    // everything fades with the open / close animation
+    body := Rectangle {
+        opacity: reveal;
+
+        // header = drag handle (buttons below are on top of it)
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: parent.width - 92px;
+            height: top - 6px;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    root.drag-start();
+                }
             }
         }
-    }
 
-    Dot {
-        x: pad + 2px;
-        y: 17px;
-        c: folder-tint;
-        empty: !folder-colored;
-        dark: root.dark;
-        clicked => {
-            pick-target = -1;
-            pick-x = pad;
-            pick-y = 36px;
-            cp.show();
-        }
-    }
-    Text {
-        x: pad + 26px;
-        y: 12px;
-        height: 24px;
-        width: parent.width - 2 * pad - 26px - 92px;
-        text: folder-name;
-        font-size: 16px;
-        font-weight: 600;
-        overflow: elide;
-        vertical-alignment: center;
-        color: dark ? #ffffff : #1b1b1b;
-    }
-    CapButton {
-        x: parent.width - 92px;
-        y: 0;
-        glyph: "\u{E713}"; // settings gear
-        glyph-size: 14px;
-        dark: root.dark;
-        clicked => { sp.show(); }
-    }
-    CapButton {
-        x: parent.width - 46px;
-        y: 0;
-        glyph: "\u{E8BB}"; // close X
-        danger: true;
-        dark: root.dark;
-        border-top-right-radius: 8px;
-        clicked => { root.close-panel(); }
-    }
-
-    // plate of the new group, appears under the dragged item over empty space
-    if ghost-on: Rectangle {
-        x: pad + ghost-x;
-        y: top + ghost-y;
-        width: ghost-w;
-        height: ghost-h;
-        border-radius: 8px;
-        background: #0078d4.with-alpha(0.18);
-        border-width: 2px;
-        border-color: #0078d4;
-        Text {
-            x: 10px;
-            y: 7px;
-            width: parent.width - 16px;
-            text: "Новая группа";
-            font-size: 11px;
-            font-weight: 600;
-            overflow: elide;
-            color: dark ? #ffffffc0 : #1b1b1bc0;
-        }
-    }
-
-    for g in groups: gr := Rectangle {
-        property <bool> hot: root.drop-target == g.idx; // dragged item will land here
-        property <bool> src: root.drag-id >= 0 && root.drag-group == g.idx; // dragged item comes from here
-        property <int> n-eff: g.n - (src && !hot ? 1 : 0) + (hot && !src ? 1 : 0);
-        property <int> cap: g.cols * g.rows;
-        property <bool> lifting: root.gdrag == g.idx;
-        x: pad + g.x;
-        y: top + g.y;
-        width: g.w;
-        height: g.h;
-        animate x, y, width, height { duration: 140ms; easing: ease-out; }
-        border-radius: 8px;
-        background: hot ? #0078d4.with-alpha(0.22) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
-        border-width: hot || lifting ? 2px : 1px;
-        border-color: hot || lifting ? #0078d4 : g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
-        drop-shadow-blur: lifting ? 14px : 0px;
-        drop-shadow-color: #00000040;
-
-        hov := TouchArea { } // hover only (shows resize grip)
-
-        Dot {
-            x: 7px;
-            y: 8px;
-            c: g.tint;
-            empty: !g.colored;
+        if page == 0: Dot {
+            x: pad + 2px;
+            y: 17px;
+            c: folder-tint;
+            empty: !folder-colored;
             dark: root.dark;
-            clicked => {
-                pick-target = g.idx;
-                pick-x = pad + g.x + 4px;
-                pick-y = top + g.y + 26px;
-                cp.show();
-            }
+            clicked => { root.pick-for(-1, pad, 36px); }
         }
-        if root.rename-idx != g.idx: Text {
-            x: 26px;
-            y: 5px;
-            height: 20px;
-            width: parent.width - 30px;
-            text: g.name;
-            font-size: 12px;
+        if page == 1: CapButton {
+            x: 0;
+            y: 0;
+            glyph: "\u{E72B}"; // back arrow
+            glyph-size: 12px;
+            dark: root.dark;
+            border-top-left-radius: 8px;
+            clicked => { page = 0; }
+        }
+        Text {
+            x: page == 0 ? pad + 26px : 50px;
+            y: 12px;
+            height: 24px;
+            width: parent.width - self.x - 96px;
+            text: page == 0 ? folder-name : "Настройки";
+            font-size: page == 0 ? 16px : 14px;
             font-weight: 600;
             overflow: elide;
             vertical-alignment: center;
-            color: dark ? #ffffffe8 : #1b1b1be8;
+            color: fg;
         }
-        // header: drag = move group, double-click title = rename
-        TouchArea {
-            x: 26px;
+        CapButton {
+            x: parent.width - 92px;
             y: 0;
-            width: parent.width - 30px;
-            height: 30px;
-            enabled: root.rename-idx != g.idx;
-            property <bool> moving;
-            double-clicked => {
-                if (!g.fixed) {
-                    root.rename-idx = g.idx;
-                }
-            }
-            moved => {
-                if (!moving && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
-                    moving = true;
-                    root.gdrag = g.idx;
-                }
-                if (moving) {
-                    root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, false);
-                }
-            }
-            pointer-event(e) => {
-                if (moving && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
-                    moving = false;
-                    root.gdrag = -1;
-                    root.group-drop(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, false);
-                } else if (moving && e.kind == PointerEventKind.cancel) {
-                    moving = false;
-                    root.gdrag = -1;
-                    root.drag-cancel();
-                }
-            }
-        }
-        // inline rename: Enter = rename folder, Esc / focus loss = keep name
-        if root.rename-idx == g.idx: Rectangle {
-            x: 22px;
-            y: 5px;
-            height: 20px;
-            width: parent.width - 26px;
-            border-radius: 4px;
-            background: dark ? #00000060 : #ffffffc0;
-            border-width: 1px;
-            border-color: #0078d4;
-            clip: true;
-            TextInput {
-                x: 4px;
-                width: parent.width - 8px;
-                height: parent.height;
-                text: g.name;
-                single-line: true;
-                font-size: 12px;
-                font-weight: 600;
-                vertical-alignment: center;
-                color: dark ? #ffffff : #1b1b1b;
-                selection-background-color: #0078d480;
-                init => {
-                    self.focus();
-                    self.select-all();
-                }
-                accepted => { root.rename-group(g.name, self.text); }
-                key-pressed(e) => {
-                    if (e.text == Key.Escape) {
-                        root.rename-idx = -1;
-                        fs.focus();
-                        return accept;
-                    }
-                    return reject;
-                }
-                changed has-focus => {
-                    if (!self.has-focus && root.rename-idx == g.idx) {
-                        root.rename-idx = -1;
-                    }
-                }
-            }
-        }
-        for s in g.items: Slot {
-            property <bool> me: root.drag-id == s.id;
-            // place after the dragged item left (same group: later ones step back) ...
-            property <int> e0: s.k - (src && s.k > root.drag-k ? 1 : 0);
-            // ... and made room for it at drop-index (target group)
-            property <int> e: me ? (hot ? root.drop-index : s.k) : e0 + (hot && e0 >= root.drop-index ? 1 : 0);
-            x: mod(e, g.cols) * 84px;
-            y: 30px + floor(e / g.cols) * 84px;
-            animate x, y { duration: 140ms; easing: ease-out; }
-            visible: e < cap;
-            more: !me && n-eff > cap && e == cap - 1 ? n-eff - cap + 1 : 0;
-            d: s;
-            labels: root.labels;
+            glyph: "\u{E713}"; // settings gear
+            glyph-size: 14px;
             dark: root.dark;
-            lifted: me ? (hot ? 0.3 : 0) : 1;
-            clicked => {
-                if (self.more > 0) {
-                    root.open-group(g.idx);
-                } else {
-                    root.launch(s.id);
-                }
-            }
-            drag-move(mx, my) => {
-                if (root.drag-id != s.id) {
-                    root.drag-group = g.idx;
-                    root.drag-k = s.k;
-                }
-                root.drag-id = s.id;
-                root.drag-icon = s.icon;
-                root.drag-x = gr.x + self.x + mx;
-                root.drag-y = gr.y + self.y + my;
-                root.item-drag(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
-            }
-            drag-end(mx, my) => {
-                root.drag-x = gr.x + self.x + mx;
-                root.drag-y = gr.y + self.y + my;
-                root.item-drop(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
-                root.drag-id = -1;
-                root.drag-group = -1;
-            }
-            drag-cancel => {
-                root.drag-id = -1;
-                root.drag-group = -1;
-                root.drag-cancel();
-            }
+            clicked => { page = page == 1 ? 0 : 1; }
         }
-        // resize grip (bottom-right): drag = change size in whole slots
-        TouchArea {
-            x: parent.width - 18px;
-            y: parent.height - 18px;
-            width: 18px;
-            height: 18px;
-            property <bool> sizing;
-            moved => {
-                if (self.pressed) {
-                    sizing = true;
-                    root.gdrag = g.idx;
-                    root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, true);
-                }
-            }
-            pointer-event(e) => {
-                if (sizing && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
-                    sizing = false;
-                    root.gdrag = -1;
-                    root.group-drop(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, true);
-                } else if (sizing && e.kind == PointerEventKind.cancel) {
-                    sizing = false;
-                    root.gdrag = -1;
-                    root.drag-cancel();
-                }
-            }
-            // corner mark, on hover
-            if hov.has-hover || self.has-hover || lifting: Path {
-                x: 5px;
-                y: 5px;
-                width: 8px;
-                height: 8px;
-                viewbox-width: 8;
-                viewbox-height: 8;
-                commands: "M 8 0 L 8 8 L 0 8";
-                stroke: dark ? #ffffff90 : #00000070;
-                stroke-width: 1.5px;
-            }
+        CapButton {
+            x: parent.width - 46px;
+            y: 0;
+            glyph: "\u{E8BB}"; // close X
+            danger: true;
+            dark: root.dark;
+            border-top-right-radius: 8px;
+            clicked => { root.close-panel(); }
         }
-    }
 
-    // ghost of dragged icon follows cursor
-    if drag-id >= 0: Image {
-        source: drag-icon;
-        x: drag-x - 24px;
-        y: drag-y - 24px;
-        width: 48px;
-        height: 48px;
-        opacity: 0.85;
+        // ---------- folder page ----------
+        Rectangle {
+            opacity: page == 0 ? 1 : 0;
+            visible: self.opacity > 0.01;
+            animate opacity { duration: 140ms; }
+
+            // plate of the new group, appears under the dragged item over empty space
+            if ghost-on: Rectangle {
+                x: pad + ghost-x;
+                y: top + ghost-y;
+                width: ghost-w;
+                height: ghost-h;
+                border-radius: 8px;
+                background: accent.with-alpha(0.16);
+                border-width: 2px;
+                border-color: accent;
+                animate x, y { duration: 140ms; easing: ease-out; }
+                Text {
+                    x: 10px;
+                    y: 7px;
+                    width: parent.width - 16px;
+                    text: "Новая группа";
+                    font-size: 11px;
+                    font-weight: 600;
+                    overflow: elide;
+                    color: dark ? #ffffffc0 : #1b1b1bc0;
+                }
+            }
+
+            for g in groups: gr := Rectangle {
+                property <bool> hot: root.drop-target == g.idx; // dragged item will land here
+                property <bool> src: root.drag-id >= 0 && root.drag-group == g.idx; // dragged item comes from here
+                property <int> n-eff: g.n - (src && !hot ? 1 : 0) + (hot && !src ? 1 : 0);
+                property <int> cap: g.cols * g.rows;
+                property <bool> lifting: root.gdrag == g.idx;
+                x: pad + g.x;
+                y: top + g.y;
+                width: g.w;
+                height: g.h;
+                animate x, y, width, height { duration: 160ms; easing: ease-out; }
+                border-radius: 8px;
+                background: hot ? accent.with-alpha(0.2) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
+                border-width: hot || lifting ? 2px : 1px;
+                border-color: hot || lifting ? accent : g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
+                drop-shadow-blur: lifting ? 14px : 0px;
+                drop-shadow-color: #00000040;
+
+                // hover (shows resize grip); right click anywhere on the plate = color
+                hov := TouchArea {
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                            root.pick-for(g.idx, pad + g.x + self.mouse-x, top + g.y + self.mouse-y);
+                        }
+                    }
+                }
+
+                Dot {
+                    visible: root.dots;
+                    x: 7px;
+                    y: 8px;
+                    c: g.tint;
+                    empty: !g.colored;
+                    dark: root.dark;
+                    clicked => { root.pick-for(g.idx, pad + g.x + 4px, top + g.y + 26px); }
+                }
+                Text {
+                    visible: root.names && root.rename-idx != g.idx;
+                    x: root.dots ? 26px : 10px;
+                    y: 5px;
+                    height: 20px;
+                    width: parent.width - self.x - 4px;
+                    text: g.name;
+                    font-size: 12px;
+                    font-weight: 600;
+                    overflow: elide;
+                    vertical-alignment: center;
+                    color: dark ? #ffffffe8 : #1b1b1be8;
+                }
+                // header: drag = move group, double-click title = rename, right click = color
+                TouchArea {
+                    x: root.dots ? 26px : 0px;
+                    y: 0;
+                    width: parent.width - self.x - 4px;
+                    height: root.head;
+                    enabled: root.rename-idx != g.idx;
+                    property <bool> moving;
+                    double-clicked => {
+                        if (!g.fixed && root.names) {
+                            root.rename-idx = g.idx;
+                        }
+                    }
+                    moved => {
+                        if (!moving && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
+                            moving = true;
+                            root.gdrag = g.idx;
+                        }
+                        if (moving) {
+                            root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, false);
+                        }
+                    }
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                            root.pick-for(g.idx, pad + g.x + self.x + self.mouse-x, top + g.y + self.mouse-y);
+                        } else if (moving && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                            moving = false;
+                            root.gdrag = -1;
+                            root.group-drop(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, false);
+                        } else if (moving && e.kind == PointerEventKind.cancel) {
+                            moving = false;
+                            root.gdrag = -1;
+                            root.drag-cancel();
+                        }
+                    }
+                }
+                // inline rename: Enter = rename folder, Esc / focus loss = keep name
+                if root.rename-idx == g.idx: Rectangle {
+                    x: root.dots ? 22px : 6px;
+                    y: 5px;
+                    height: 20px;
+                    width: parent.width - self.x - 4px;
+                    border-radius: 4px;
+                    background: dark ? #00000060 : #ffffffc0;
+                    border-width: 1px;
+                    border-color: accent;
+                    clip: true;
+                    TextInput {
+                        x: 4px;
+                        width: parent.width - 8px;
+                        height: parent.height;
+                        text: g.name;
+                        single-line: true;
+                        font-size: 12px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        color: fg;
+                        selection-background-color: #0078d480;
+                        init => {
+                            self.focus();
+                            self.select-all();
+                        }
+                        accepted => { root.rename-group(g.name, self.text); }
+                        key-pressed(e) => {
+                            if (e.text == Key.Escape) {
+                                root.rename-idx = -1;
+                                fs.focus();
+                                return accept;
+                            }
+                            return reject;
+                        }
+                        changed has-focus => {
+                            if (!self.has-focus && root.rename-idx == g.idx) {
+                                root.rename-idx = -1;
+                            }
+                        }
+                    }
+                }
+                for s in g.items: Slot {
+                    property <bool> me: root.drag-id == s.id;
+                    // place after the dragged item left (same group: later ones step back) ...
+                    property <int> e0: s.k - (src && s.k > root.drag-k ? 1 : 0);
+                    // ... and made room for it at drop-index (target group)
+                    property <int> e: me ? (hot ? root.drop-index : s.k) : e0 + (hot && e0 >= root.drop-index ? 1 : 0);
+                    x: mod(e, g.cols) * 84px;
+                    y: root.head + floor(e / g.cols) * 84px;
+                    animate x, y { duration: 160ms; easing: ease-out; }
+                    visible: e < cap;
+                    more: !me && n-eff > cap && e == cap - 1 ? n-eff - cap + 1 : 0;
+                    d: s;
+                    labels: root.labels;
+                    dark: root.dark;
+                    lifted: me ? (hot ? 0.3 : 0) : 1;
+                    clicked => {
+                        if (self.more > 0) {
+                            root.open-group(g.idx);
+                        } else {
+                            root.launch(s.id);
+                        }
+                    }
+                    drag-move(mx, my) => {
+                        if (root.drag-id != s.id) {
+                            root.drag-group = g.idx;
+                            root.drag-k = s.k;
+                        }
+                        root.drag-id = s.id;
+                        root.drag-icon = s.icon;
+                        root.drag-x = gr.x + self.x + mx;
+                        root.drag-y = gr.y + self.y + my;
+                        root.item-drag(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
+                    }
+                    drag-end(mx, my) => {
+                        root.drag-x = gr.x + self.x + mx;
+                        root.drag-y = gr.y + self.y + my;
+                        root.item-drop(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
+                        root.drag-id = -1;
+                        root.drag-group = -1;
+                    }
+                    drag-cancel => {
+                        root.drag-id = -1;
+                        root.drag-group = -1;
+                        root.drag-cancel();
+                    }
+                }
+                // resize grip (bottom-right): drag = change size in whole slots
+                TouchArea {
+                    x: parent.width - 18px;
+                    y: parent.height - 18px;
+                    width: 18px;
+                    height: 18px;
+                    property <bool> sizing;
+                    moved => {
+                        if (self.pressed) {
+                            sizing = true;
+                            root.gdrag = g.idx;
+                            root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, true);
+                        }
+                    }
+                    pointer-event(e) => {
+                        if (sizing && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                            sizing = false;
+                            root.gdrag = -1;
+                            root.group-drop(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, true);
+                        } else if (sizing && e.kind == PointerEventKind.cancel) {
+                            sizing = false;
+                            root.gdrag = -1;
+                            root.drag-cancel();
+                        }
+                    }
+                    // corner mark, on hover
+                    if hov.has-hover || self.has-hover || lifting: Path {
+                        x: 5px;
+                        y: 5px;
+                        width: 8px;
+                        height: 8px;
+                        viewbox-width: 8;
+                        viewbox-height: 8;
+                        commands: "M 8 0 L 8 8 L 0 8";
+                        stroke: dark ? #ffffff90 : #00000070;
+                        stroke-width: 1.5px;
+                    }
+                }
+            }
+
+            // ghost of dragged icon follows cursor
+            if drag-id >= 0: Image {
+                source: drag-icon;
+                x: drag-x - 24px;
+                y: drag-y - 24px;
+                width: 48px;
+                height: 48px;
+                opacity: 0.85;
+            }
+        }
+
+        // ---------- settings page ----------
+        if page == 1: Rectangle {
+            property <length> cw: parent.width - 2 * pad; // card width
+            opacity: 0;
+            init => { self.opacity = 1; }
+            animate opacity { duration: 160ms; }
+
+            SectionTitle {
+                x: pad + 2px;
+                y: top;
+                text: "Окно папки";
+                dark: root.dark;
+            }
+            Card {
+                x: pad;
+                y: top + 24px;
+                width: cw;
+                height: 3 * 44px + 52px;
+                dark: root.dark;
+                RowText {
+                    y: 0;
+                    height: 44px;
+                    label: "Подписи под ярлыками";
+                    dark: root.dark;
+                }
+                Switch {
+                    x: parent.width - 54px;
+                    y: 12px;
+                    on: root.labels;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("labels", root.labels ? 0 : 1); }
+                }
+                Hairline {
+                    y: 44px;
+                    x: 14px;
+                    width: parent.width - 28px;
+                    dark: root.dark;
+                }
+                RowText {
+                    y: 44px;
+                    height: 44px;
+                    label: "Названия групп";
+                    dark: root.dark;
+                }
+                Switch {
+                    x: parent.width - 54px;
+                    y: 44px + 12px;
+                    on: root.names;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("names", root.names ? 0 : 1); }
+                }
+                Hairline {
+                    y: 88px;
+                    x: 14px;
+                    width: parent.width - 28px;
+                    dark: root.dark;
+                }
+                RowText {
+                    y: 88px;
+                    height: 44px;
+                    label: "Цветные метки групп";
+                    dark: root.dark;
+                }
+                Switch {
+                    x: parent.width - 54px;
+                    y: 88px + 12px;
+                    on: root.dots;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("dots", root.dots ? 0 : 1); }
+                }
+                Hairline {
+                    y: 132px;
+                    x: 14px;
+                    width: parent.width - 28px;
+                    dark: root.dark;
+                }
+                RowText {
+                    y: 132px;
+                    height: 52px;
+                    label: "Притяжение";
+                    hint: "Группы стягиваются в угол";
+                    dark: root.dark;
+                }
+                Seg {
+                    x: parent.width - self.width - 12px;
+                    y: 132px + 12px;
+                    items: ["Нет", "Влево", "Вправо"];
+                    sel: root.gravity;
+                    dark: root.dark;
+                    pick(i) => { root.set-opt("gravity", i); }
+                }
+            }
+
+            SectionTitle {
+                x: pad + 2px;
+                y: top + 224px;
+                text: "Стекло";
+                dark: root.dark;
+            }
+            Card {
+                x: pad;
+                y: top + 248px;
+                width: cw;
+                height: 52px;
+                dark: root.dark;
+                Seg {
+                    x: 12px;
+                    y: 12px;
+                    seg-w: (parent.width - 28px) / 3;
+                    items: ["Плотное", "Среднее", "Прозрачное"];
+                    sel: root.glass;
+                    dark: root.dark;
+                    pick(i) => { root.set-opt("glass", i); }
+                }
+            }
+
+            SectionTitle {
+                x: pad + 2px;
+                y: top + 316px;
+                text: "Рабочий стол";
+                dark: root.dark;
+            }
+            Card {
+                x: pad;
+                y: top + 340px;
+                width: cw;
+                height: 52px;
+                dark: root.dark;
+                RowText {
+                    y: 0;
+                    height: 52px;
+                    label: "Плитки по сетке";
+                    hint: snap ? "Встают ровно по клеткам" : "Стоят там, где отпустили";
+                    dark: root.dark;
+                }
+                Switch {
+                    x: parent.width - 54px;
+                    y: 16px;
+                    on: root.snap;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("snap", root.snap ? 0 : 1); }
+                }
+            }
+
+            // quit: quiet text button, red only on hover
+            qb := Rectangle {
+                x: pad;
+                y: top + 408px;
+                width: 180px;
+                height: 34px;
+                border-radius: 6px;
+                background: qt.has-hover ? #c42b1c1f : transparent;
+                Text {
+                    x: 12px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: "\u{E7E8}";
+                    font-family: "Segoe Fluent Icons";
+                    font-size: 13px;
+                    color: qt.has-hover ? (dark ? #ff99a4 : #c42b1c) : (dark ? #ffffffb0 : #1b1b1bb0);
+                }
+                Text {
+                    x: 36px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: "Закрыть программу";
+                    font-size: 13px;
+                    color: qt.has-hover ? (dark ? #ff99a4 : #c42b1c) : (dark ? #ffffffb0 : #1b1b1bb0);
+                }
+                qt := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.quit(); }
+                }
+            }
+        }
     }
 
     // color picker: first = no color, then palette
     cp := PopupWindow {
-        x: pick-x;
+        x: min(pick-x, root.width - 184px);
         y: pick-y;
         width: 176px;
         height: 64px;
@@ -611,73 +919,6 @@ export component Panel inherits Window {
             }
         }
     }
-
-    // settings menu under the gear
-    sp := PopupWindow {
-        x: parent.width - 240px;
-        y: 38px;
-        width: 232px;
-        height: 152px;
-        close-policy: close-on-click-outside;
-        Rectangle {
-            background: dark ? #2c2c2c : #fbfbfb;
-            border-radius: 8px;
-            border-width: 1px;
-            border-color: #80808040;
-            drop-shadow-blur: 16px;
-            drop-shadow-color: #00000050;
-            MenuRow {
-                x: 4px;
-                y: 4px;
-                width: parent.width - 8px;
-                text: "Подписи под иконками";
-                fg: dark ? #ffffff : #1b1b1b;
-                dark: root.dark;
-                check-box: true;
-                checked: root.labels;
-                clicked => { root.toggle-labels(); }
-            }
-            Text {
-                x: 14px;
-                y: 42px;
-                text: "Стекло";
-                font-size: 12px;
-                color: dark ? #ffffffb0 : #1b1b1bb0;
-            }
-            for name[i] in ["Плотное", "Среднее", "Прозрачное"]: Rectangle {
-                x: 10px + i * 72px;
-                y: 62px;
-                width: 68px;
-                height: 28px;
-                border-radius: 4px;
-                background: glass == i ? #0078d4 : gt.has-hover ? (dark ? #ffffff18 : #0000000f) : (dark ? #ffffff0a : #00000006);
-                Text {
-                    text: name;
-                    font-size: 11px;
-                    color: glass == i ? #ffffff : (dark ? #ffffff : #1b1b1b);
-                }
-                gt := TouchArea {
-                    clicked => { root.set-glass(i); }
-                }
-            }
-            Rectangle {
-                x: 8px;
-                y: 102px;
-                width: parent.width - 16px;
-                height: 1px;
-                background: #80808040;
-            }
-            MenuRow {
-                x: 4px;
-                y: 110px;
-                width: parent.width - 8px;
-                text: "Закрыть программу";
-                fg: #e81123;
-                dark: root.dark;
-                clicked => { root.quit(); }
-            }
-        }
-    }
 }
 
 export component Tile inherits Window {
@@ -695,8 +936,9 @@ export component Tile inherits Window {
     callback open();
 
     // size comes from Rust, snapped to whole cells (plat.rs: w = cols*48+12, h = rows*42+30); icon grid fills it
-    property <int> cols: max(2, round((root.width - 12px) / 48px));
-    property <int> rows: max(2, round((root.height - 30px) / 42px));
+    // floor: while a resize is dragged the size is free -> only whole cells that fit are shown
+    property <int> cols: max(2, floor((root.width - 12px + 1px) / 48px));
+    property <int> rows: max(2, floor((root.height - 30px + 1px) / 42px));
     property <length> grid-x: (root.width - cols * 48px + 12px) / 2;
 
     Image {

@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.4: при запуске значки Windows прячутся и вместо папок стоят плитки (впервые — на месте папок), при выходе значки возвращаются. В окне папки группы свободно двигаются и растягиваются, ярлыки переставляются, вынос ярлыка в пустое место сразу создаёт плашку новой группы.
+Кратко: приложение «стеклянные папки» для рабочего стола. v0.5: красивая страница настроек (подписи, названия групп, цветные метки, притяжение групп, стекло, плитки по сетке), окно папки вырастает из плитки, плитки двигаются плавно, на столе снова работают выделение и обычные ярлыки (прячутся только папки с плитками).
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-22 (v0.4)
-Progress: 55%
+Updated: 2026-11-22 (v0.5)
+Progress: 65%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -43,10 +43,23 @@ Progress: 55%
   - "+N" overflow computed in Slint (all items in model) -> resize shows more/less at once.
   - Verified on Desktop\GF_TEST with synthetic mouse (reorder, new group at spot, move, resize, cross-group, quit restores icons).
 
+- v0.5 (2026-11-22):
+  - Desktop: native icon layer stays visible (rubber-band select, loose shortcuts, menus work). Only tiled folders hidden:
+    FILE_ATTRIBUTE_HIDDEN while running (off-screen icon moves tried: Explorer clamps them to the screen edge).
+    Home spots saved in settings.json "homes"; quit / panic / next start after a kill -> unhide + icons back to exact spots.
+  - Settings page in panel (gear): labels, group names, group color dots, gravity (none / top-left / top-right),
+    glass level, tiles snap to grid, quit. Win11-like switches + sliding segmented controls. Panel grows while shown.
+  - Names off -> dot only; dots off too -> plain plates, slots centered. Group color also by right click on plate.
+  - Gravity: model::settle (up, then sideways, until stable) in layout + live drag previews. Unit tests in model.rs.
+  - Panel opens out of its tile (window rect grows tile -> panel, content fades in, 230 ms) and folds back on close;
+    placed centered on the tile. plat::set_view = show part of content without relayout.
+  - Tiles: free move/resize under cursor, on release short glide to whole cells (+ grid if "по сетке" on).
+    Tile z-order forced only on real z changes (cheaper drag).
+
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
-- Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them). Re-hide icons after Explorer restart.
-- Loose files on Desktop (not folders) are hidden with the icon layer: give them tiles if any appear.
+- Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them).
+- New folder on Desktop while running: no tile until restart. "Show hidden files" on -> tiled folders show dimmed.
 - Big tiles: launch icons directly (now any click opens panel). Snap tiles to grid.
 - Panel: remember moved position (now re-centers each open).
 - Watch Desktop for changes (now: rescan on open).
@@ -59,5 +72,5 @@ Progress: 55%
 GitHub (private): https://github.com/eonesets/glass-folders, branch main.
 
 ## Run
-`app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide desktop icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
+`app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
 Build: `cargo build --release` in app/.

@@ -277,14 +277,26 @@ pub fn clean_name(s: &str) -> String {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
+    /// shortcut names under icons (panel)
     pub labels: bool,
+    /// group titles (panel). Off: only the color dot stays.
+    pub names: bool,
+    /// group color dots (panel). Off with names off: plain plates.
+    pub dots: bool,
     /// 0 dense .. 2 clear
     pub glass: i32,
+    /// groups pulled to: 0 nowhere (free), 1 top-left, 2 top-right
+    pub gravity: i32,
+    /// desktop tiles land on the icon grid (else free place)
+    pub snap: bool,
+    /// folder icons parked away by a running app: path -> home spot [x, y] (screen px).
+    /// Non-empty at start = last run was killed -> put them back.
+    pub homes: BTreeMap<String, [i32; 2]>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { labels: true, glass: 1 }
+        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, homes: BTreeMap::new() }
     }
 }
 
@@ -385,7 +397,7 @@ pub fn auto_size(n: usize, maxw: u32) -> (u32, u32) {
 }
 
 /// Rects of all groups: saved place/size, else auto size + first free spot.
-pub fn layout(f: &Folder) -> Vec<GRect> {
+pub fn layout(f: &Folder, gravity: i32) -> Vec<GRect> {
     let total: usize = f.groups.iter().map(|g| g.items.len().max(1)).sum();
     let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, 8)) as i32;
     let mut rects = Vec::new();
@@ -433,7 +445,41 @@ pub fn layout(f: &Folder) -> Vec<GRect> {
         fixed.push(r);
         placed.push(i);
     }
+    settle(&mut rects, gravity);
     rects
+}
+
+/// Gravity: 0 none, 1 top-left, 2 top-right. Each group slides up as far as it can, then sideways;
+/// repeat until nothing moves. Right edge for top-right = current extent. Never creates overlaps.
+pub fn settle(r: &mut [GRect], gravity: i32) {
+    if gravity == 0 {
+        return;
+    }
+    let right = extent(r).0;
+    let dx = if gravity == 2 { 1 } else { -1 };
+    let free = |r: &[GRect], i: usize, g: GRect| {
+        g.x >= 0 && g.y >= 0 && g.x + g.w <= right && !r.iter().enumerate().any(|(j, o)| j != i && o.hits(&g))
+    };
+    for _ in 0..64 {
+        let mut moved = false;
+        let mut order: Vec<usize> = (0..r.len()).collect();
+        order.sort_by_key(|&i| (r[i].y, r[i].x * -dx));
+        for i in order {
+            for step in [(0, -1), (dx, 0)] {
+                loop {
+                    let g = GRect { x: r[i].x + step.0, y: r[i].y + step.1, ..r[i] };
+                    if !free(r, i, g) {
+                        break;
+                    }
+                    r[i] = g;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
 }
 
 /// Panel grid size in px for rects (+ extra free cols / half-rows), min 3 columns wide.
@@ -442,4 +488,48 @@ pub fn grid_px(r: &[GRect], extra_c: i32, extra_r: i32) -> (f32, f32) {
     let c = (c + extra_c).max(3);
     let h = (h + extra_r).max(3);
     (c as f32 * PITCH - GAP, h as f32 * ROW - GAP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(x: i32, y: i32, w: i32, h: i32) -> GRect {
+        GRect { x, y, w, h }
+    }
+
+    #[test]
+    fn settle_top_left() {
+        let mut v = vec![r(0, 0, 2, 3), r(4, 6, 1, 3), r(1, 9, 1, 3)];
+        settle(&mut v, 1);
+        // up first (third one stops under the first), then left
+        assert_eq!(v, vec![r(0, 0, 2, 3), r(2, 0, 1, 3), r(0, 3, 1, 3)]);
+    }
+
+    #[test]
+    fn settle_top_right() {
+        // right edge = extent (5 cols)
+        let mut v = vec![r(0, 0, 2, 3), r(4, 6, 1, 3)];
+        settle(&mut v, 2);
+        // mirror of top-left: first slides to the right edge, second stops under it
+        assert_eq!(v, vec![r(3, 0, 2, 3), r(4, 3, 1, 3)]);
+    }
+
+    #[test]
+    fn settle_none_keeps() {
+        let mut v = vec![r(3, 5, 2, 3)];
+        settle(&mut v, 0);
+        assert_eq!(v, vec![r(3, 5, 2, 3)]);
+    }
+
+    #[test]
+    fn settle_no_overlap() {
+        let mut v = vec![r(0, 0, 3, 5), r(0, 5, 1, 3), r(2, 9, 2, 3), r(5, 2, 1, 7)];
+        settle(&mut v, 1);
+        for i in 0..v.len() {
+            for j in 0..i {
+                assert!(!v[i].hits(&v[j]), "{:?} hits {:?}", v[i], v[j]);
+            }
+        }
+    }
 }

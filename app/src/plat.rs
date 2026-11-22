@@ -18,7 +18,7 @@ use slint::platform::{
 };
 use slint::{EventLoopError, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, PlatformError};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -93,7 +93,23 @@ pub struct GfWindow {
     tracking: Cell<bool>,
     dib: RefCell<Option<Dib>>,
     on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
+    drag: Cell<Option<Drag>>,
+    on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
 }
+
+/// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
+#[derive(Clone, Copy)]
+struct Drag {
+    resize: bool,
+    cursor: POINT,
+    rect: RECT,
+    moved: bool,
+}
+
+/// Bottom-right square of a tile that resizes instead of moving (logical px).
+pub const GRIP: f32 = 16.0;
+const TILE_MIN: f32 = 96.0; // logical
+const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
 
 thread_local! {
     static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
@@ -126,6 +142,24 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
     }
 }
 
+/// Called after a tile was moved/resized by the user, with its new screen rect.
+pub fn set_on_moved(window: &slint::Window, f: impl Fn(RECT) + 'static) {
+    if let Some(g) = find(window) {
+        *g.on_moved.borrow_mut() = Some(Rc::new(f));
+    }
+}
+
+/// Panel: header was pressed -> following mouse moves drag the window (same code as tile move).
+pub fn start_move(window: &slint::Window) {
+    let Some(g) = find(window) else { return };
+    let mut d = Drag { resize: false, cursor: POINT::default(), rect: RECT::default(), moved: false };
+    unsafe {
+        let _ = GetCursorPos(&mut d.cursor);
+        let _ = GetWindowRect(g.hwnd.get(), &mut d.rect);
+    }
+    g.drag.set(Some(d));
+}
+
 pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
     if let Some(g) = find(window) {
         *g.on_deactivate.borrow_mut() = Some(Rc::new(f));
@@ -147,6 +181,8 @@ impl GfWindow {
             tracking: Cell::new(false),
             dib: RefCell::new(None),
             on_deactivate: RefCell::new(None),
+            drag: Cell::new(None),
+            on_moved: RefCell::new(None),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -163,6 +199,46 @@ impl GfWindow {
         let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
         let s = self.scale.get();
         LogicalPosition::new(x / s, y / s)
+    }
+
+    fn in_grip(&self, p: LogicalPosition) -> bool {
+        let s = self.scale.get();
+        let PhysicalSize { width: w, height: h } = self.size.get();
+        p.x > w as f32 / s - GRIP && p.y > h as f32 / s - GRIP
+    }
+
+    /// Tile drag step. Returns true while a real drag (not a click) is going on.
+    fn drag_to(&self) -> bool {
+        let Some(mut d) = self.drag.get() else { return false };
+        let mut c = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut c);
+        }
+        let (dx, dy) = (c.x - d.cursor.x, c.y - d.cursor.y);
+        if !d.moved && dx.abs() <= DRAG_START && dy.abs() <= DRAG_START {
+            return false;
+        }
+        d.moved = true;
+        self.drag.set(Some(d));
+        if d.resize {
+            let min = (TILE_MIN * self.scale.get()) as i32;
+            let w = (d.rect.right - d.rect.left + dx).max(min);
+            let h = (d.rect.bottom - d.rect.top + dy).max(min);
+            self.resize_physical(w as u32, h as u32);
+        } else {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd.get(),
+                    None,
+                    d.rect.left + dx,
+                    d.rect.top + dy,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        true
     }
 
     fn resize_physical(&self, w: u32, h: u32) {
@@ -256,6 +332,7 @@ impl WindowAdapter for GfWindow {
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
                     let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0))); // never activated -> set NC-active once
                 } else {
                     let _ = SetForegroundWindow(hwnd);
                 }
@@ -290,6 +367,9 @@ impl WindowAdapter for GfWindow {
         }
     }
     fn update_window_properties(&self, properties: WindowProperties<'_>) {
+        if self.kind.get() == Kind::Tile {
+            return; // tile size is set from Rust (saved per folder, user can resize)
+        }
         // Our components have fixed width/height -> use preferred size.
         let c = properties.layout_constraints();
         let s = self.scale.get();
@@ -360,6 +440,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = TrackMouseEvent(&mut t);
                 g.tracking.set(true);
             }
+            if g.drag_to() {
+                return LRESULT(0);
+            }
             g.window.dispatch_event(WindowEvent::PointerMoved { position: g.logical(lp) });
             return LRESULT(0);
         }
@@ -370,11 +453,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             SetCapture(hwnd);
+            if msg == WM_LBUTTONDOWN && g.kind.get() == Kind::Tile {
+                let mut d = Drag { resize: g.in_grip(g.logical(lp)), cursor: POINT::default(), rect: RECT::default(), moved: false };
+                let _ = GetCursorPos(&mut d.cursor);
+                let _ = GetWindowRect(hwnd, &mut d.rect);
+                g.drag.set(Some(d));
+            }
             g.window.dispatch_event(WindowEvent::PointerPressed { position: g.logical(lp), button: btn(msg) });
             return LRESULT(0);
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+            // take drag first: ReleaseCapture sends WM_CAPTURECHANGED, which clears it
+            let drag = if msg == WM_LBUTTONUP { g.drag.take() } else { None };
             let _ = ReleaseCapture();
+            {
+                if let Some(d) = drag {
+                    if d.moved {
+                        // drag ended: release outside -> TouchArea gives no click
+                        g.window.dispatch_event(WindowEvent::PointerReleased {
+                            position: LogicalPosition::new(-1.0, -1.0),
+                            button: PointerEventButton::Left,
+                        });
+                        let mut r = RECT::default();
+                        let _ = GetWindowRect(hwnd, &mut r);
+                        if let Some(f) = g.on_moved.borrow().clone() {
+                            f(r);
+                        }
+                        return LRESULT(0);
+                    }
+                }
+            }
             g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
             return LRESULT(0);
         }
@@ -384,7 +492,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
             return LRESULT(0);
         }
+        WM_CAPTURECHANGED => g.drag.set(None),
+        WM_SETCURSOR if g.kind.get() == Kind::Tile && (lp.0 & 0xffff) as u32 == HTCLIENT => {
+            let mut c = POINT::default();
+            let _ = GetCursorPos(&mut c);
+            let _ = ScreenToClient(hwnd, &mut c);
+            let s = g.scale.get();
+            if g.in_grip(LogicalPosition::new(c.x as f32 / s, c.y as f32 / s)) {
+                SetCursor(LoadCursorW(None, IDC_SIZENWSE).ok());
+                return LRESULT(1);
+            }
+        }
         WM_MOUSEACTIVATE if g.kind.get() == Kind::Tile => return LRESULT(MA_NOACTIVATE as isize),
+        // Tile: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
+        // lParam -1: DefWindowProc skips NC repaint. Focus/foreground untouched.
+        WM_NCACTIVATE if g.kind.get() == Kind::Tile => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));

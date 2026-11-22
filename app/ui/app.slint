@@ -14,6 +14,7 @@ export struct SlotData {
 export struct GroupData {
     name: string,
     tint: color,
+    colored: bool,
     idx: int,
     x: length,
     y: length,
@@ -24,16 +25,81 @@ export struct GroupData {
 
 component Dot inherits Rectangle {
     in property <color> c;
+    in property <bool> empty; // no color: hollow ring
+    in property <bool> dark;
     in property <length> size: 14px;
     callback clicked;
     width: size;
     height: size;
     border-radius: size / 2;
-    background: c;
-    border-width: ta.has-hover ? 2px : 1px;
-    border-color: ta.has-hover ? #ffffffd0 : #00000030;
+    background: empty ? transparent : c;
+    border-width: ta.has-hover ? 2px : (empty ? 1.5px : 1px);
+    border-color: ta.has-hover ? (dark ? #ffffffd0 : #000000a0) : empty ? (dark ? #ffffff80 : #00000060) : #00000030;
     ta := TouchArea {
         mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Caption button (Windows style): icon glyph from Segoe Fluent Icons.
+component CapButton inherits Rectangle {
+    in property <string> glyph;
+    in property <length> glyph-size: 10px;
+    in property <bool> danger; // red hover = close
+    in property <bool> dark;
+    callback clicked;
+    width: 46px;
+    height: 36px;
+    background: ta.pressed ? (danger ? #c42b1ce0 : (dark ? #ffffff10 : #0000000a)) : ta.has-hover ? (danger ? #c42b1c : (dark ? #ffffff18 : #0000000f)) : transparent;
+    Text {
+        text: glyph;
+        font-family: "Segoe Fluent Icons";
+        font-size: glyph-size;
+        color: (danger && ta.has-hover) ? #ffffff : (dark ? #ffffff : #1b1b1b);
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// Settings row: text button with hover, optional switch.
+component MenuRow inherits Rectangle {
+    in property <string> text;
+    in property <color> fg;
+    in property <bool> dark;
+    in property <bool> checked;
+    in property <bool> check-box;
+    callback clicked;
+    height: 32px;
+    border-radius: 4px;
+    background: ta.has-hover ? (dark ? #ffffff12 : #0000000a) : transparent;
+    Text {
+        x: 10px;
+        text: root.text;
+        font-size: 12px;
+        color: fg;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+    if check-box: Rectangle {
+        x: parent.width - 44px;
+        y: (parent.height - 18px) / 2;
+        width: 34px;
+        height: 18px;
+        border-radius: 9px;
+        background: checked ? #0078d4 : transparent;
+        border-width: checked ? 0px : 1px;
+        border-color: dark ? #ffffffa0 : #00000080;
+        Rectangle {
+            x: checked ? parent.width - 15px : 3px;
+            y: 3px;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            background: checked ? #ffffff : (dark ? #ffffffc0 : #000000a0);
+        }
+    }
+    ta := TouchArea {
         clicked => { root.clicked(); }
     }
 }
@@ -92,19 +158,24 @@ export component Panel inherits Window {
     title: "Glass Folders";
 
     in property <string> folder-name;
-    in property <color> folder-tint: #0078d4;
+    in property <color> folder-tint;
+    in property <bool> folder-colored;
     in property <[GroupData]> groups;
     in property <length> grid-w: 300px;
     in property <length> grid-h: 200px;
     in property <bool> labels: true;
+    in property <int> glass: 1; // 0 dense .. 2 clear
     in property <[color]> pal;
     in property <bool> dark; // set from Rust (Windows app theme)
 
     callback launch(int);
     callback open-group(int);
     callback pick-color(int, color);
+    callback clear-color(int);
     callback close-panel();
     callback toggle-labels();
+    callback set-glass(int);
+    callback drag-start();
     callback quit();
 
     property <length> pad: 16px;
@@ -112,6 +183,8 @@ export component Panel inherits Window {
     property <int> pick-target: -1;
     property <length> pick-x;
     property <length> pick-y;
+    // matte layer strength over system acrylic, by glass level
+    property <float> matte: glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0;
 
     width: grid-w + 2 * pad;
     height: grid-h + top + pad;
@@ -130,18 +203,32 @@ export component Panel inherits Window {
         }
     }
 
-    // matte layer over the system acrylic
     Rectangle {
-        background: dark ? #20202040 : #f3f3f340;
+        background: (dark ? #202020 : #f3f3f3).with-alpha(matte);
         border-radius: 8px;
         border-width: 1px;
-        border-color: dark ? #ffffff18 : #00000014;
+        border-color: dark ? #ffffff20 : #ffffff60;
+    }
+
+    // header = drag handle (buttons below are on top of it)
+    TouchArea {
+        x: 0;
+        y: 0;
+        width: parent.width - 92px;
+        height: top - 6px;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.drag-start();
+            }
+        }
     }
 
     Dot {
         x: pad + 2px;
         y: 17px;
         c: folder-tint;
+        empty: !folder-colored;
+        dark: root.dark;
         clicked => {
             pick-target = -1;
             pick-x = pad;
@@ -153,7 +240,7 @@ export component Panel inherits Window {
         x: pad + 26px;
         y: 12px;
         height: 24px;
-        width: parent.width - 2 * pad - 110px;
+        width: parent.width - 2 * pad - 26px - 92px;
         text: folder-name;
         font-size: 16px;
         font-weight: 600;
@@ -161,39 +248,22 @@ export component Panel inherits Window {
         vertical-alignment: center;
         color: dark ? #ffffff : #1b1b1b;
     }
-    // labels on/off
-    Rectangle {
-        x: parent.width - pad - 32px;
-        y: 12px;
-        width: 32px;
-        height: 24px;
-        border-radius: 4px;
-        background: lt.has-hover ? (dark ? #ffffff18 : #0000000f) : transparent;
-        Text {
-            text: "Aa";
-            font-size: 13px;
-            color: labels ? (dark ? #ffffff : #1b1b1b) : (dark ? #ffffff60 : #1b1b1b60);
-        }
-        lt := TouchArea {
-            clicked => { root.toggle-labels(); }
-        }
+    CapButton {
+        x: parent.width - 92px;
+        y: 0;
+        glyph: "\u{E713}"; // settings gear
+        glyph-size: 14px;
+        dark: root.dark;
+        clicked => { sp.show(); }
     }
-    // quit app (prototype: no tray yet)
-    Rectangle {
-        x: parent.width - pad - 76px;
-        y: 12px;
-        width: 40px;
-        height: 24px;
-        border-radius: 4px;
-        background: qt.has-hover ? #e8112340 : transparent;
-        Text {
-            text: "выход";
-            font-size: 11px;
-            color: dark ? #ffffff90 : #1b1b1b90;
-        }
-        qt := TouchArea {
-            clicked => { root.quit(); }
-        }
+    CapButton {
+        x: parent.width - 46px;
+        y: 0;
+        glyph: "\u{E8BB}"; // close X
+        danger: true;
+        dark: root.dark;
+        border-top-right-radius: 8px;
+        clicked => { root.close-panel(); }
     }
 
     for g in groups: Rectangle {
@@ -202,14 +272,16 @@ export component Panel inherits Window {
         width: g.w;
         height: g.h;
         border-radius: 8px;
-        background: g.tint.with-alpha(dark ? 0.16 : 0.12);
+        background: g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
         border-width: 1px;
-        border-color: g.tint.with-alpha(0.28);
+        border-color: g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
 
         Dot {
             x: 7px;
             y: 6px;
             c: g.tint;
+            empty: !g.colored;
+            dark: root.dark;
             clicked => {
                 pick-target = g.idx;
                 pick-x = pad + g.x + 4px;
@@ -245,11 +317,12 @@ export component Panel inherits Window {
         }
     }
 
+    // color picker: first = no color, then palette
     cp := PopupWindow {
         x: pick-x;
         y: pick-y;
-        width: 156px;
-        height: 72px;
+        width: 176px;
+        height: 64px;
         Rectangle {
             background: dark ? #2c2c2c : #fbfbfb;
             border-radius: 8px;
@@ -257,15 +330,101 @@ export component Panel inherits Window {
             border-color: #80808040;
             drop-shadow-blur: 16px;
             drop-shadow-color: #00000050;
+            Dot {
+                x: 8px;
+                y: 8px;
+                size: 22px;
+                empty: true;
+                dark: root.dark;
+                Rectangle { // slash = "no color"
+                    x: 10px;
+                    y: 3px;
+                    width: 2px;
+                    height: 16px;
+                    background: dark ? #ffffffa0 : #000000a0;
+                }
+                clicked => {
+                    root.clear-color(root.pick-target);
+                    cp.close();
+                }
+            }
             for c[i] in pal: Dot {
-                x: 8px + mod(i, 5) * 28px;
-                y: 8px + floor(i / 5) * 28px;
+                x: 8px + mod(i + 1, 6) * 28px;
+                y: 8px + floor((i + 1) / 6) * 28px;
                 size: 22px;
                 c: c;
+                dark: root.dark;
                 clicked => {
                     root.pick-color(root.pick-target, c);
                     cp.close();
                 }
+            }
+        }
+    }
+
+    // settings menu under the gear
+    sp := PopupWindow {
+        x: parent.width - 240px;
+        y: 38px;
+        width: 232px;
+        height: 152px;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: dark ? #2c2c2c : #fbfbfb;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #80808040;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000050;
+            MenuRow {
+                x: 4px;
+                y: 4px;
+                width: parent.width - 8px;
+                text: "Подписи под иконками";
+                fg: dark ? #ffffff : #1b1b1b;
+                dark: root.dark;
+                check-box: true;
+                checked: root.labels;
+                clicked => { root.toggle-labels(); }
+            }
+            Text {
+                x: 14px;
+                y: 42px;
+                text: "Стекло";
+                font-size: 12px;
+                color: dark ? #ffffffb0 : #1b1b1bb0;
+            }
+            for name[i] in ["Плотное", "Среднее", "Прозрачное"]: Rectangle {
+                x: 10px + i * 72px;
+                y: 62px;
+                width: 68px;
+                height: 28px;
+                border-radius: 4px;
+                background: glass == i ? #0078d4 : gt.has-hover ? (dark ? #ffffff18 : #0000000f) : (dark ? #ffffff0a : #00000006);
+                Text {
+                    text: name;
+                    font-size: 11px;
+                    color: glass == i ? #ffffff : (dark ? #ffffff : #1b1b1b);
+                }
+                gt := TouchArea {
+                    clicked => { root.set-glass(i); }
+                }
+            }
+            Rectangle {
+                x: 8px;
+                y: 102px;
+                width: parent.width - 16px;
+                height: 1px;
+                background: #80808040;
+            }
+            MenuRow {
+                x: 4px;
+                y: 110px;
+                width: parent.width - 8px;
+                text: "Закрыть программу";
+                fg: #e81123;
+                dark: root.dark;
+                clicked => { root.quit(); }
             }
         }
     }
@@ -277,14 +436,18 @@ export component Tile inherits Window {
     title: "Glass Folder";
 
     in property <string> name;
-    in property <color> tint: #0078d4;
+    in property <color> tint;
+    in property <bool> colored;
     in property <[image]> icons;
     in property <bool> dark; // set from Rust (Windows app theme)
-    in property <image> backdrop; // frosted wallpaper under the tile (win::wallpaper_blur)
+    in property <image> backdrop; // fallback only (GF_FAKE_GLASS): frosted wallpaper copy
+    in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
     callback open();
 
-    width: 112px;
-    height: 112px;
+    // size comes from Rust (user resizes the window); icon grid adapts
+    property <int> cols: max(2, floor((root.width - 16px) / 48px));
+    property <int> rows: max(1, floor((root.height - 26px) / 42px));
+    property <length> grid-x: (root.width - cols * 48px + 12px) / 2;
 
     Image {
         source: backdrop;
@@ -292,39 +455,47 @@ export component Tile inherits Window {
         height: parent.height;
         image-fit: fill;
     }
+    // matte layer over system acrylic (as Panel)
     Rectangle {
-        background: ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent;
+        border-radius: 8px;
+        background: (dark ? #202020 : #f3f3f3).with-alpha(glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0);
+    }
+    Rectangle {
+        background: colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
         border-radius: 8px;
         border-width: 1px;
-        border-color: tint.with-alpha(0.55);
+        border-color: colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
     }
     for ic[i] in icons: Image {
+        visible: i < cols * rows;
         source: ic;
         width: 36px;
         height: 36px;
-        x: 14px + mod(i, 2) * 48px;
-        y: 8px + floor(i / 2) * 42px;
-    }
-    Rectangle {
-        x: 10px;
-        y: 95px;
-        width: 8px;
-        height: 8px;
-        border-radius: 4px;
-        background: tint;
+        x: grid-x + mod(i, cols) * 48px;
+        y: 8px + floor(i / cols) * 42px;
     }
     Text {
-        x: 22px;
-        y: 91px;
-        width: parent.width - 30px;
+        x: 8px;
+        y: parent.height - 21px;
+        width: parent.width - 16px;
         height: 16px;
         text: name;
         font-size: 11px;
         font-weight: 600;
         overflow: elide;
+        horizontal-alignment: center;
         color: dark ? #ffffff : #1b1b1b;
     }
     ta := TouchArea {
         clicked => { root.open(); }
+    }
+    // resize grip hint (bottom-right, see plat::GRIP)
+    if ta.has-hover: Rectangle {
+        x: parent.width - 10px;
+        y: parent.height - 10px;
+        width: 5px;
+        height: 5px;
+        border-radius: 1px;
+        background: dark ? #ffffff70 : #00000050;
     }
 }

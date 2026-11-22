@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use slint::{ComponentHandle, Image, ModelRc, PhysicalPosition, VecModel};
+use slint::{ComponentHandle, Image, ModelRc, PhysicalPosition, PhysicalSize, VecModel};
 
 // Icons are requested at exact on-screen pixel size: big sizes make the shell add a frame around low-res icons.
 fn px(logical: f32, scale: f32) -> i32 {
@@ -25,7 +25,7 @@ struct App {
     folder: Option<model::Folder>,
     ids: Vec<PathBuf>, // slot id -> file
     icons: HashMap<PathBuf, Image>,
-    labels: bool,
+    set: model::Settings,
     dark: bool,
     tiles: Vec<(PathBuf, Tile)>,
 }
@@ -36,7 +36,7 @@ fn main() -> Result<(), slint::PlatformError> {
     slint::platform::set_platform(Box::new(plat::GfPlatform::new())).expect("platform");
     win::com_init();
     let desktop = win::desktop_dir();
-    let app: Shared = Rc::new(RefCell::new(App { labels: true, dark: win::system_dark(), ..Default::default() }));
+    let app: Shared = Rc::new(RefCell::new(App { set: model::load_settings(), dark: win::system_dark(), ..Default::default() }));
     let dark = app.borrow().dark;
     let panel = Panel::new()?;
     if let Some(h) = plat::hwnd_of(panel.window()) {
@@ -55,6 +55,7 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     panel.set_dark(dark);
+    panel.set_glass(app.borrow().set.glass);
     let pal: Vec<slint::Color> = model::PAL.iter().map(|h| model::color(h)).collect();
     panel.set_pal(ModelRc::new(VecModel::from(pal)));
 
@@ -85,26 +86,41 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_pick_color(move |idx, c| {
-            let hx = model::hex(c);
+            if let Some(p) = p.upgrade() {
+                set_color(&p, &a, idx, Some(model::hex(c)));
+            }
+        });
+    }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_clear_color(move |idx| {
+            if let Some(p) = p.upgrade() {
+                set_color(&p, &a, idx, None);
+            }
+        });
+    }
+    {
+        let p = panel.as_weak();
+        panel.on_drag_start(move || {
+            if let Some(p) = p.upgrade() {
+                plat::start_move(p.window());
+            }
+        });
+    }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_set_glass(move |lvl| {
             {
                 let mut st = a.borrow_mut();
-                let Some(f) = st.folder.as_mut() else { return };
-                if idx < 0 {
-                    f.cfg.color = Some(hx);
-                } else if let Some(g) = f.groups.get(idx as usize) {
-                    let name = g.name.clone();
-                    f.cfg.groups.entry(name).or_default().color = Some(hx);
-                }
-                let _ = model::save_cfg(&f.dir, &f.cfg);
-                let (dir, tint) = (f.dir.clone(), f.tint());
-                for (d, t) in &st.tiles {
-                    if *d == dir {
-                        t.set_tint(model::color(&tint));
-                    }
-                }
+                st.set.glass = lvl;
+                model::save_settings(&st.set);
             }
             if let Some(p) = p.upgrade() {
-                render(&p, &a);
+                p.set_glass(lvl);
+            }
+            let st = a.borrow();
+            for (_, t) in &st.tiles {
+                reblur(t, st.dark, lvl);
             }
         });
     }
@@ -121,8 +137,9 @@ fn main() -> Result<(), slint::PlatformError> {
         panel.on_toggle_labels(move || {
             let on = {
                 let mut st = a.borrow_mut();
-                st.labels = !st.labels;
-                st.labels
+                st.set.labels = !st.set.labels;
+                model::save_settings(&st.set);
+                st.set.labels
             };
             if let Some(p) = p.upgrade() {
                 p.set_labels(on);
@@ -134,13 +151,17 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     // Desktop tiles: one per folder on Desktop.
+    let glass = app.borrow().set.glass;
     for (i, dir) in model::list_folders(&desktop).into_iter().enumerate() {
         let t = Tile::new()?;
         let f = model::scan(&dir);
         t.set_dark(dark);
         t.set_name(f.name.clone().into());
-        t.set_tint(model::color(&f.tint()));
-        let icons: Vec<Image> = f.first_items(4).iter().filter_map(|p| win::icon(p, px(36.0, t.window().scale_factor()))).collect();
+        let (c, on) = model::tint(&f.tint());
+        t.set_tint(c);
+        t.set_colored(on);
+        // enough icons for a big tile; Slint shows only what fits
+        let icons: Vec<Image> = f.first_items(24).iter().filter_map(|p| win::icon(p, px(36.0, t.window().scale_factor()))).collect();
         t.set_icons(ModelRc::new(VecModel::from(icons)));
         {
             let (a, p, d) = (app.clone(), panel.as_weak(), dir.clone());
@@ -157,17 +178,30 @@ fn main() -> Result<(), slint::PlatformError> {
         let s = t.window().scale_factor();
         let side = (112.0 * s) as i32;
         let wa = win::work_area();
-        let mut x = wa.right - ((24.0 + 112.0) * s) as i32;
-        let mut y = wa.top + ((24.0 + i as f32 * 128.0) * s) as i32;
+        let (mut x, mut y, mut w, mut h) =
+            (wa.right - ((24.0 + 112.0) * s) as i32, wa.top + ((24.0 + i as f32 * 128.0) * s) as i32, side, side);
+        if let Some([sx, sy, sw, sh]) = f.cfg.tile {
+            (x, y, w, h) = (sx, sy, sw, sh);
+        }
         // dev: GF_TILE_AT=x,y puts tiles in a row from that point (to inspect the frosted look)
         if let Some((ax, ay)) = std::env::var("GF_TILE_AT").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<i32>().unwrap_or(0), b.parse::<i32>().unwrap_or(0)))) {
-            x = ax + i as i32 * (side + 16);
-            y = ay;
+            (x, y, w, h) = (ax + i as i32 * (side + 16), ay, side, side);
         }
+        t.window().set_size(PhysicalSize::new(w as u32, h as u32));
         t.window().set_position(PhysicalPosition::new(x, y));
-        let under = windows::Win32::Foundation::RECT { left: x, top: y, right: x + side, bottom: y + side };
-        if let Some(img) = win::wallpaper_blur(under, dark) {
-            t.set_backdrop(img);
+        reblur(&t, dark, glass);
+        {
+            // user moved/resized the tile: remember it, re-blur what is under it now
+            let (a, tw, d) = (app.clone(), t.as_weak(), dir.clone());
+            plat::set_on_moved(t.window(), move |r| {
+                let mut cfg = model::scan(&d).cfg;
+                cfg.tile = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+                let _ = model::save_cfg(&d, &cfg);
+                let st = a.borrow();
+                if let Some(t) = tw.upgrade() {
+                    reblur(&t, st.dark, st.set.glass);
+                }
+            });
         }
         t.show()?;
         app.borrow_mut().tiles.push((dir, t));
@@ -185,6 +219,45 @@ fn main() -> Result<(), slint::PlatformError> {
     }
 
     slint::run_event_loop()
+}
+
+/// Tile glass look. Default: real live acrylic (win::glass + NC-active trick), only a matte layer
+/// by glass level. Env GF_FAKE_GLASS=1: old fallback, frosted copy of wallpaper under the tile.
+fn reblur(t: &Tile, dark: bool, glass: i32) {
+    t.set_glass(glass);
+    if std::env::var("GF_FAKE_GLASS").is_err() {
+        return;
+    }
+    let p = t.window().position();
+    let sz = t.window().size();
+    let r = windows::Win32::Foundation::RECT { left: p.x, top: p.y, right: p.x + sz.width as i32, bottom: p.y + sz.height as i32 };
+    if let Some(img) = win::wallpaper_blur(r, dark, glass) {
+        t.set_backdrop(img);
+    }
+}
+
+/// Folder (idx < 0) or group color. None = colorless.
+fn set_color(panel: &Panel, app: &Shared, idx: i32, hx: Option<String>) {
+    {
+        let mut st = app.borrow_mut();
+        let st = &mut *st;
+        let Some(f) = st.folder.as_mut() else { return };
+        if idx < 0 {
+            f.cfg.color = hx;
+        } else if let Some(g) = f.groups.get(idx as usize) {
+            let name = g.name.clone();
+            f.cfg.groups.entry(name).or_default().color = hx;
+        }
+        let _ = model::save_cfg(&f.dir, &f.cfg);
+        let (dir, (c, on)) = (f.dir.clone(), model::tint(&f.tint()));
+        for (d, t) in &st.tiles {
+            if *d == dir {
+                t.set_tint(c);
+                t.set_colored(on);
+            }
+        }
+    }
+    render(panel, app);
 }
 
 fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
@@ -243,9 +316,11 @@ fn render(panel: &Panel, app: &Shared) {
             }
             slots.push(d);
         }
+        let (tint, colored) = model::tint(&f.group_tint(gi));
         groups.push(GroupData {
             name: g.name.clone().into(),
-            tint: model::color(&f.group_tint(gi)),
+            tint,
+            colored,
             idx: gi as i32,
             x: geo.x,
             y: geo.y,
@@ -255,9 +330,11 @@ fn render(panel: &Panel, app: &Shared) {
         });
     }
     panel.set_folder_name(f.name.clone().into());
-    panel.set_folder_tint(model::color(&f.tint()));
+    let (c, on) = model::tint(&f.tint());
+    panel.set_folder_tint(c);
+    panel.set_folder_colored(on);
     panel.set_grid_w(lay.w);
     panel.set_grid_h(lay.h);
-    panel.set_labels(st.labels);
+    panel.set_labels(st.set.labels);
     panel.set_groups(ModelRc::new(VecModel::from(groups)));
 }

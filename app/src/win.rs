@@ -53,26 +53,31 @@ pub fn system_dark() -> bool {
 /// Panel (always_on=false): real Win11 acrylic. Hidden DWM frame extended over the client area
 ///   (DWM then reads our per-pixel alpha) + system backdrop. DWM makes it solid when inactive;
 ///   fine, the panel closes on focus loss.
-/// Tile (always_on=true): no system glass. Win11 turns every backdrop (DWMSBT acrylic/mica, SWCA
-///   accent with content) solid on inactive windows, and tiles are never active (tested 2026-11-22).
-///   Tiles draw their own frosted wallpaper instead (wallpaper_blur). Only dark mode + round corners here.
+/// Tile (always_on=true): same acrylic. Win11 makes backdrops solid when the window's NC state is
+///   inactive; tiles never activate, so plat.rs answers WM_NCACTIVATE as always-active -> backdrop
+///   stays live without taking focus (spike 2026-11-22, examples/spike.rs). wallpaper_blur = fallback.
 pub fn glass(hwnd: HWND, dark: bool, always_on: bool) {
     unsafe {
         let d: i32 = dark as i32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as _, 4);
         let c = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &c as *const _ as _, 4);
-        if !always_on {
-            let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
-            let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
-            let b = DWMSBT_TRANSIENTWINDOW;
-            let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const _ as _, 4);
+        let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        let b = DWMSBT_TRANSIENTWINDOW;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const _ as _, 4);
+        if always_on {
+            // Tile fakes NC-active (plat.rs WM_NCACTIVATE) -> DWM keeps the backdrop live, but then
+            // draws the active caption band over the top. No caption color = no band.
+            let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+            let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &none as *const _ as _, 4);
         }
     }
 }
 
 /// Frosted copy of the desktop wallpaper under screen rect `r` (primary monitor), acrylic-like tint.
-pub fn wallpaper_blur(r: RECT, dark: bool) -> Option<Image> {
+/// glass: 0 dense .. 2 clear (how much of the wallpaper shows through the tint).
+pub fn wallpaper_blur(r: RECT, dark: bool, glass: i32) -> Option<Image> {
     const DOWN: f64 = 4.0; // work at 1/4 size: cheap, and blur hides it
     const MARGIN: i32 = 6; // extra pixels so blur near edges uses real neighbours
     unsafe {
@@ -132,7 +137,8 @@ pub fn wallpaper_blur(r: RECT, dark: bool) -> Option<Image> {
         let cy = (ty0 - y0).clamp(0, h as i32 - 1) as usize;
         let cw = ((tx1 - tx0) as usize).min(w - cx).max(1);
         let ch = ((ty1 - ty0) as usize).min(h - cy).max(1);
-        let (tint, k) = if dark { (32.0, 0.55) } else { (243.0, 0.55) };
+        let k = [0.55, 0.32, 0.12][glass.clamp(0, 2) as usize];
+        let tint = if dark { 32.0 } else { 243.0 };
         let mut pb = SharedPixelBuffer::<Rgba8Pixel>::new(cw as u32, ch as u32);
         for (i, px) in pb.make_mut_slice().iter_mut().enumerate() {
             let (x, y) = (cx + i % cw, cy + i / cw);

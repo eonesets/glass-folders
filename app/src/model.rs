@@ -31,6 +31,8 @@ pub struct Config {
     pub cols: Option<u32>,
     pub order: Vec<String>,
     pub groups: BTreeMap<String, GroupCfg>,
+    /// Tile on desktop: [x, y, w, h] physical px. None = auto place, default size.
+    pub tile: Option<[i32; 4]>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -55,16 +57,13 @@ pub struct Folder {
 }
 
 impl Folder {
-    pub fn tint(&self) -> String {
-        self.cfg.color.clone().unwrap_or_else(|| PAL[0].into())
+    /// None = colorless (default). Color only when user picks one.
+    pub fn tint(&self) -> Option<String> {
+        self.cfg.color.clone()
     }
-    pub fn group_tint(&self, i: usize) -> String {
+    pub fn group_tint(&self, i: usize) -> Option<String> {
         let g = &self.groups[i];
-        self.cfg
-            .groups
-            .get(&g.name)
-            .and_then(|c| c.color.clone())
-            .unwrap_or_else(|| PAL[(i + 1) % PAL.len()].into())
+        self.cfg.groups.get(&g.name).and_then(|c| c.color.clone())
     }
     /// First n items across groups, for tile preview.
     pub fn first_items(&self, n: usize) -> Vec<PathBuf> {
@@ -152,6 +151,47 @@ pub fn save_cfg(dir: &Path, cfg: &Config) -> std::io::Result<()> {
             .open(&path)?
     };
     f.write_all(json.as_bytes())
+}
+
+/// App-wide settings (not per folder): %APPDATA%/glass-folders/settings.json
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct Settings {
+    pub labels: bool,
+    /// 0 dense .. 2 clear
+    pub glass: i32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { labels: true, glass: 1 }
+    }
+}
+
+fn settings_path() -> PathBuf {
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("glass-folders").join("settings.json")
+}
+
+pub fn load_settings() -> Settings {
+    fs::read_to_string(settings_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_settings(s: &Settings) {
+    let p = settings_path();
+    if let Some(d) = p.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    if let Ok(j) = serde_json::to_string_pretty(s) {
+        let _ = fs::write(p, j);
+    }
+}
+
+/// Optional hex -> (color, has_color). No color = transparent.
+pub fn tint(hex: &Option<String>) -> (slint::Color, bool) {
+    match hex {
+        Some(h) => (color(h), true),
+        None => (slint::Color::from_argb_u8(0, 0, 0, 0), false),
+    }
 }
 
 pub fn color(hex: &str) -> slint::Color {

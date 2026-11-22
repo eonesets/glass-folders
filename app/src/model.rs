@@ -129,7 +129,7 @@ pub fn scan(dir: &Path) -> Folder {
     Folder { name: name_of(dir), dir: dir.to_path_buf(), cfg, groups }
 }
 
-fn load_cfg(dir: &Path) -> Config {
+pub fn load_cfg(dir: &Path) -> Config {
     fs::read_to_string(dir.join(CFG))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -151,6 +151,111 @@ pub fn save_cfg(dir: &Path, cfg: &Config) -> std::io::Result<()> {
             .open(&path)?
     };
     f.write_all(json.as_bytes())
+}
+
+impl Config {
+    /// Group folder renamed on disk: keep its color/size and place in order.
+    pub fn rename_group(&mut self, old: &str, new: &str) {
+        if let Some(c) = self.groups.remove(old) {
+            self.groups.insert(new.to_string(), c);
+        }
+        for n in self.order.iter_mut().filter(|n| *n == old) {
+            *n = new.to_string();
+        }
+    }
+    /// Group folder gone: drop its settings (a later folder with same name starts clean).
+    pub fn forget_group(&mut self, name: &str) {
+        self.groups.remove(name);
+        self.order.retain(|n| n != name);
+    }
+}
+
+// ---------- file ops (drag in panel) ----------
+
+pub const NEW_GROUP: &str = "Новая группа";
+
+/// "name" for n = 1, else "name (n)" + optional extension.
+fn numbered(stem: &str, ext: Option<&str>, n: u32) -> String {
+    let base = if n == 1 { stem.to_string() } else { format!("{stem} ({n})") };
+    match ext {
+        Some(e) => format!("{base}.{e}"),
+        None => base,
+    }
+}
+
+/// Rename/move without ever replacing an existing target (std::fs::rename replaces files on Windows).
+fn move_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    unsafe { MoveFileExW(&HSTRING::from(src.as_os_str()), &HSTRING::from(dst.as_os_str()), MOVE_FILE_FLAGS(0)) }
+        .map_err(|e| std::io::Error::from_raw_os_error((e.code().0 & 0xffff) as i32))
+}
+
+/// Move `src` (file or dir) into `dst_dir`. Name taken -> " (2)", " (3)"... Returns new path.
+pub fn move_into(src: &Path, dst_dir: &Path) -> std::io::Result<PathBuf> {
+    if src.parent() == Some(dst_dir) {
+        return Ok(src.to_path_buf());
+    }
+    let (stem, ext) = if src.is_dir() {
+        (src.file_name(), None)
+    } else {
+        (src.file_stem(), src.extension().map(|e| e.to_string_lossy().into_owned()))
+    };
+    let stem = stem.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    move_unique(src, dst_dir, &stem, ext.as_deref(), |_| true)
+}
+
+/// Try target names stem, "stem (2)"... in dir until one is free. `ok` filters names we must not use.
+fn move_unique(src: &Path, dir: &Path, stem: &str, ext: Option<&str>, ok: impl Fn(&str) -> bool) -> std::io::Result<PathBuf> {
+    for n in 1..1000 {
+        let name = numbered(stem, ext, n);
+        if !ok(&name) {
+            continue;
+        }
+        let dst = dir.join(&name);
+        match move_no_replace(src, &dst) {
+            Ok(()) => return Ok(dst),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free name"))
+}
+
+/// Create empty subfolder "Новая группа" (or " (2)"...) in `root`. Returns its name.
+pub fn create_group(root: &Path) -> std::io::Result<String> {
+    for n in 1..1000 {
+        let name = numbered(NEW_GROUP, None, n);
+        if name == LOOSE {
+            continue;
+        }
+        match fs::create_dir(root.join(&name)) {
+            Ok(()) => return Ok(name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free name"))
+}
+
+/// Rename group folder `old` in `root`. Name taken -> " (2)"... Returns final name.
+/// "Разное" is reserved (= root files), never used as folder name.
+pub fn rename_group(root: &Path, old: &str, new: &str) -> std::io::Result<String> {
+    let dst = move_unique(&root.join(old), root, new, None, |n| n != LOOSE)?;
+    Ok(name_of(&dst))
+}
+
+/// Remove `dir` only if it holds nothing at all (hidden files included). Returns true if removed.
+pub fn remove_if_empty(dir: &Path) -> bool {
+    let empty = fs::read_dir(dir).map(|mut rd| rd.next().is_none()).unwrap_or(false);
+    // remove_dir (RemoveDirectoryW) also refuses non-empty dirs: second safety net
+    empty && fs::remove_dir(dir).is_ok()
+}
+
+/// User-typed folder name -> valid Windows name. Empty = invalid.
+pub fn clean_name(s: &str) -> String {
+    let s: String = s.chars().filter(|c| !c.is_control() && !"<>:\"/\\|?*".contains(*c)).collect();
+    s.trim().trim_end_matches(['.', ' ']).to_string()
 }
 
 /// App-wide settings (not per folder): %APPDATA%/glass-folders/settings.json

@@ -23,7 +23,9 @@ fn px(logical: f32, scale: f32) -> i32 {
 #[derive(Default)]
 struct App {
     folder: Option<model::Folder>,
-    ids: Vec<PathBuf>, // slot id -> file
+    ids: Vec<PathBuf>,     // slot id -> file
+    id_group: Vec<usize>,  // slot id -> group index
+    geo: Vec<[f32; 4]>,    // group rects (x, y, w, h), grid coords, for drop hit-test
     icons: HashMap<PathBuf, Image>,
     set: model::Settings,
     dark: bool,
@@ -146,6 +148,38 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_item_drag(move |id, x, y, inside| {
+            if let Some(p) = p.upgrade() {
+                p.set_drop_target(drop_target(&a.borrow(), id, x, y, inside));
+            }
+        });
+    }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_item_drop(move |id, x, y, inside| {
+            let t = drop_target(&a.borrow(), id, x, y, inside);
+            // defer: rebuilding the groups model inside the slot's own event handler is unsafe
+            let (a, p) = (a.clone(), p.clone());
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                if let Some(p) = p.upgrade() {
+                    drop_item(&p, &a, id, t);
+                }
+            });
+        });
+    }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_rename_group(move |old, new| {
+            let (a, p) = (a.clone(), p.clone());
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                if let Some(p) = p.upgrade() {
+                    rename_group(&p, &a, &old, &new);
+                }
+            });
+        });
+    }
     panel.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
@@ -160,9 +194,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let (c, on) = model::tint(&f.tint());
         t.set_tint(c);
         t.set_colored(on);
-        // enough icons for a big tile; Slint shows only what fits
-        let icons: Vec<Image> = f.first_items(24).iter().filter_map(|p| win::icon(p, px(36.0, t.window().scale_factor()))).collect();
-        t.set_icons(ModelRc::new(VecModel::from(icons)));
+        tile_icons(&t, &f);
         {
             let (a, p, d) = (app.clone(), panel.as_weak(), dir.clone());
             t.on_open(move || {
@@ -226,6 +258,115 @@ fn main() -> Result<(), slint::PlatformError> {
     slint::run_event_loop()
 }
 
+/// Tile preview icons. Enough for a big tile; Slint shows only what fits.
+fn tile_icons(t: &Tile, f: &model::Folder) {
+    let icons: Vec<Image> = f.first_items(24).iter().filter_map(|p| win::icon(p, px(36.0, t.window().scale_factor()))).collect();
+    t.set_icons(ModelRc::new(VecModel::from(icons)));
+}
+
+/// Dragged slot over point (grid coords): group idx, -1 = empty space (new group), -2 = nothing / own group.
+fn drop_target(st: &App, id: i32, x: f32, y: f32, inside: bool) -> i32 {
+    if !inside {
+        return -2;
+    }
+    let src = st.id_group.get(id as usize).copied();
+    match st.geo.iter().position(|r| x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]) {
+        Some(i) if Some(i) == src => -2,
+        Some(i) => i as i32,
+        None => -1,
+    }
+}
+
+/// Move dragged item on disk into target group (or a new "Новая группа"), then rebuild panel.
+/// Any fs error: logged, item stays where it was.
+fn drop_item(panel: &Panel, app: &Shared, id: i32, target: i32) {
+    if target == -2 {
+        return;
+    }
+    let (root, created) = {
+        let st = app.borrow();
+        let (Some(f), Some(src), Some(&sg)) = (st.folder.as_ref(), st.ids.get(id as usize), st.id_group.get(id as usize)) else { return };
+        let root = f.dir.clone();
+        let src_dir = f.groups[sg].dir.clone();
+        let (dst, created) = if target >= 0 {
+            match f.groups.get(target as usize) {
+                Some(g) => (g.dir.clone(), None),
+                None => return,
+            }
+        } else {
+            match model::create_group(&root) {
+                Ok(n) => (root.join(&n), Some(n)),
+                Err(e) => {
+                    eprintln!("glass-folders: create group in {}: {e}", root.display());
+                    return;
+                }
+            }
+        };
+        if let Err(e) = model::move_into(src, &dst) {
+            eprintln!("glass-folders: move {} -> {}: {e}", src.display(), dst.display());
+            if created.is_some() {
+                model::remove_if_empty(&dst);
+            }
+            return;
+        }
+        // settings keyed by group name: drop stale ones (new name reused, emptied group removed)
+        let mut gone: Vec<String> = created.iter().cloned().collect();
+        if src_dir != root && model::remove_if_empty(&src_dir) {
+            gone.push(model::name_of(&src_dir));
+        }
+        let mut cfg = model::load_cfg(&root); // fresh from disk: tile rect may have changed since open
+        if gone.iter().any(|n| cfg.groups.contains_key(n) || cfg.order.contains(n)) {
+            gone.iter().for_each(|n| cfg.forget_group(n));
+            if let Err(e) = model::save_cfg(&root, &cfg) {
+                eprintln!("glass-folders: save config in {}: {e}", root.display());
+            }
+        }
+        (root, created)
+    };
+    rescan(panel, app, &root);
+    if let Some(n) = created {
+        let idx = app.borrow().folder.as_ref().and_then(|f| f.groups.iter().position(|g| g.name == n));
+        if let Some(i) = idx {
+            panel.set_rename_idx(i as i32);
+        }
+    }
+}
+
+/// Inline rename committed (Enter). Empty / unchanged = keep name.
+fn rename_group(panel: &Panel, app: &Shared, old: &str, typed: &str) {
+    panel.set_rename_idx(-1);
+    let name = model::clean_name(typed);
+    let root = app.borrow().folder.as_ref().map(|f| f.dir.clone());
+    if let (Some(root), false) = (root, name.is_empty() || name == old || old == model::LOOSE) {
+        match model::rename_group(&root, old, &name) {
+            Ok(n) => {
+                let mut cfg = model::load_cfg(&root);
+                if cfg.groups.contains_key(old) || cfg.order.iter().any(|o| o == old) {
+                    cfg.rename_group(old, &n);
+                    if let Err(e) = model::save_cfg(&root, &cfg) {
+                        eprintln!("glass-folders: save config in {}: {e}", root.display());
+                    }
+                }
+            }
+            Err(e) => eprintln!("glass-folders: rename group {old} -> {name}: {e}"),
+        }
+        rescan(panel, app, &root);
+    }
+    panel.invoke_focus_keys();
+}
+
+/// Folder changed on disk: re-read, redraw panel and the folder's desktop tile.
+fn rescan(panel: &Panel, app: &Shared, root: &Path) {
+    app.borrow_mut().folder = Some(model::scan(root));
+    render(panel, app);
+    let st = app.borrow();
+    if let Some(f) = st.folder.as_ref() {
+        for (_, t) in st.tiles.iter().filter(|(d, _)| d == root) {
+            tile_icons(t, f);
+        }
+    }
+}
+
 /// Tile glass look. Default: real live acrylic (win::glass + NC-active trick), only a matte layer
 /// by glass level. Env GF_FAKE_GLASS=1: old fallback, frosted copy of wallpaper under the tile.
 fn reblur(t: &Tile, dark: bool, glass: i32) {
@@ -283,9 +424,13 @@ fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
 fn close(panel: &Panel, app: &Shared) {
     let _ = panel.hide();
     panel.set_groups(ModelRc::default());
+    panel.set_rename_idx(-1);
+    panel.set_drop_target(-2);
     let mut st = app.borrow_mut();
     st.folder = None;
     st.ids.clear();
+    st.id_group.clear();
+    st.geo.clear();
     st.icons.clear(); // free icon memory while hidden
 }
 
@@ -297,6 +442,8 @@ fn render(panel: &Panel, app: &Shared) {
     let lay = model::layout(f);
     let icon_px = px(48.0, panel.window().scale_factor());
     st.ids.clear();
+    st.id_group.clear();
+    st.geo = lay.groups.iter().map(|g| [g.x, g.y, g.w, g.h]).collect();
     let mut groups = Vec::new();
     for (gi, (g, geo)) in f.groups.iter().zip(&lay.groups).enumerate() {
         let mut slots = Vec::new();
@@ -313,6 +460,7 @@ fn render(panel: &Panel, app: &Shared) {
                 d.name = model::name_of(path).into();
                 d.id = st.ids.len() as i32;
                 st.ids.push(path.clone());
+                st.id_group.push(gi);
                 d.icon = st
                     .icons
                     .entry(path.clone())
@@ -326,6 +474,7 @@ fn render(panel: &Panel, app: &Shared) {
             name: g.name.clone().into(),
             tint,
             colored,
+            fixed: g.dir == f.dir,
             idx: gi as i32,
             x: geo.x,
             y: geo.y,

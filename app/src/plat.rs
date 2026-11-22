@@ -24,7 +24,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -95,6 +96,7 @@ pub struct GfWindow {
     on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
+    surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
 }
 
 /// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
@@ -202,6 +204,7 @@ impl GfWindow {
             on_deactivate: RefCell::new(None),
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
+            surrogate: Cell::new(0),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -437,6 +440,26 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
     }
 }
 
+/// Virtual key -> Slint key (keys that have no text of their own, or Slint wants as key codes).
+fn key_of(vk: u16) -> Option<Key> {
+    Some(match VIRTUAL_KEY(vk) {
+        VK_ESCAPE => Key::Escape,
+        VK_RETURN => Key::Return,
+        VK_BACK => Key::Backspace,
+        VK_DELETE => Key::Delete,
+        VK_TAB => Key::Tab,
+        VK_LEFT => Key::LeftArrow,
+        VK_RIGHT => Key::RightArrow,
+        VK_UP => Key::UpArrow,
+        VK_DOWN => Key::DownArrow,
+        VK_HOME => Key::Home,
+        VK_END => Key::End,
+        VK_SHIFT => Key::Shift,
+        VK_CONTROL => Key::Control,
+        _ => return None,
+    })
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let Some(g) = lookup(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
     let btn = |m: u32| match m {
@@ -507,10 +530,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
             return LRESULT(0);
         }
-        WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
-            let t: slint::SharedString = Key::Escape.into();
-            g.window.dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
-            g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
+        // Keys: special keys from WM_KEYDOWN/UP, typed text from WM_CHAR (TranslateMessage).
+        WM_KEYDOWN | WM_KEYUP => {
+            let down = msg == WM_KEYDOWN;
+            let text: Option<slint::SharedString> = match key_of(wp.0 as u16) {
+                Some(k) => Some(k.into()),
+                // Ctrl+letter: WM_CHAR gives a control char, Slint shortcuts want the letter
+                None if (b'A' as u16..=b'Z' as u16).contains(&(wp.0 as u16)) && GetKeyState(VK_CONTROL.0 as i32) < 0 => {
+                    Some(((wp.0 as u8) as char).to_ascii_lowercase().to_string().into())
+                }
+                None => None,
+            };
+            if let Some(t) = text {
+                g.window.dispatch_event(if down { WindowEvent::KeyPressed { text: t } } else { WindowEvent::KeyReleased { text: t } });
+                return LRESULT(0);
+            }
+        }
+        WM_CHAR => {
+            let u = wp.0 as u16;
+            if (0xD800..0xDC00).contains(&u) {
+                g.surrogate.set(u); // high half, wait for low half
+                return LRESULT(0);
+            }
+            let hi = g.surrogate.replace(0);
+            let units: Vec<u16> = if (0xDC00..0xE000).contains(&u) && hi != 0 { vec![hi, u] } else { vec![u] };
+            let s = String::from_utf16_lossy(&units);
+            // control chars (Enter, Backspace, Esc, Ctrl+x) already came as keys
+            if !s.chars().any(|c| c.is_control()) {
+                let t: slint::SharedString = s.into();
+                g.window.dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
+                g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
+            }
             return LRESULT(0);
         }
         WM_CAPTURECHANGED => g.drag.set(None),

@@ -18,10 +18,11 @@ User: when folder opened, there is some strip/line at top. Must not exist.
 - Done: screenshot of open panel shows no strip on top edge.
 - Result: cause = DWM active-caption band over extended frame (panel is really active). win::glass now sets DWMWA_CAPTION_COLOR none for panel too (was tile-only).
 
-## T3. Drag shortcuts inside panel — agent: Opus/high — status: todo
+## T3. Drag shortcuts inside panel — agent: Opus/high — status: done
 Groups = real subfolders, "Разное" = root files of folder (see docs/SPEC.md, src/model.rs).
 - Press-and-drag a slot -> ghost icon follows cursor; drop on another group -> file moved (fs rename) into that subfolder (root for "Разное"); layout rebuilds.
 - Drop on empty panel area (outside groups) -> create new subfolder ("Новая группа", unique name), move file there, then inline rename field for group name (Enter = rename folder, Esc = keep default).
 - Short click without move still launches (threshold ~5px).
 - Name collisions: append " (2)". Errors -> no crash, item stays.
 - Done: move between groups works, new group created + renamed, files really moved on disk.
+- Result: Slot press+move >5px = drag (ghost, target group highlight, "+ Новая группа" zone at bottom while dragging); drop -> MoveFileExW no-replace + " (n)" names; emptied subfolder removed only if truly empty; new group -> inline TextInput (Enter rename, Esc/focus loss keep); double-click group title renames too; cfg keys follow rename. plat.rs now forwards WM_CHAR + edit keys. Verified on Desktop\GF_TEST.

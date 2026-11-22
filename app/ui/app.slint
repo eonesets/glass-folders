@@ -15,6 +15,7 @@ export struct GroupData {
     name: string,
     tint: color,
     colored: bool,
+    fixed: bool, // "Разное" = folder root, cannot be renamed
     idx: int,
     x: length,
     y: length,
@@ -104,15 +105,22 @@ component MenuRow inherits Rectangle {
     }
 }
 
+// Press + move > 5px = drag (pos in slot coords); else release = click. "+N" slot never drags.
 component Slot inherits Rectangle {
     in property <SlotData> d;
     in property <bool> labels;
     in property <bool> dark;
+    in property <bool> lifted; // this item is being dragged (ghost shows it)
     callback clicked;
+    callback drag-move(length, length);
+    callback drag-end(length, length);
+    callback drag-cancel();
+    property <bool> dragging;
     width: 76px;
     height: 76px;
     border-radius: 6px;
-    background: ta.pressed ? (dark ? #ffffff24 : #00000018) : ta.has-hover ? (dark ? #ffffff14 : #0000000c) : transparent;
+    opacity: lifted ? 0.3 : 1;
+    background: dragging ? transparent : ta.pressed ? (dark ? #ffffff24 : #00000018) : ta.has-hover ? (dark ? #ffffff14 : #0000000c) : transparent;
 
     if d.more == 0: Image {
         source: d.icon;
@@ -148,7 +156,30 @@ component Slot inherits Rectangle {
         overflow: elide;
     }
     ta := TouchArea {
-        clicked => { root.clicked(); }
+        moved => {
+            if (!dragging && d.more == 0
+                && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
+                dragging = true;
+            }
+            if (dragging) {
+                root.drag-move(self.mouse-x, self.mouse-y);
+            }
+        }
+        // clicked comes before the Up event -> dragging still set, no launch after a drag
+        clicked => {
+            if (!dragging) {
+                root.clicked();
+            }
+        }
+        pointer-event(e) => {
+            if (dragging && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                dragging = false;
+                root.drag-end(self.mouse-x, self.mouse-y);
+            } else if (dragging && e.kind == PointerEventKind.cancel) {
+                dragging = false;
+                root.drag-cancel();
+            }
+        }
     }
 }
 
@@ -177,6 +208,18 @@ export component Panel inherits Window {
     callback set-glass(int);
     callback drag-start();
     callback quit();
+    // drag of a shortcut: id, point in grid coords, inside panel body (else = cancel)
+    callback item-drag(int, length, length, bool);
+    callback item-drop(int, length, length, bool);
+    callback rename-group(string, string); // old name, typed name
+
+    in-out property <int> drop-target: -2; // from Rust: group idx, -1 = new group, -2 = nothing
+    in-out property <int> rename-idx: -1; // group whose title is an edit field
+    property <int> drag-id: -1;
+    property <image> drag-icon;
+    property <length> drag-x; // cursor, panel coords
+    property <length> drag-y;
+    property <length> zone-h: 56px; // "new group" drop zone, shown while dragging
 
     property <length> pad: 16px;
     property <length> top: 48px;
@@ -187,7 +230,12 @@ export component Panel inherits Window {
     property <float> matte: glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0;
 
     width: grid-w + 2 * pad;
-    height: grid-h + top + pad;
+    height: grid-h + top + pad + (drag-id >= 0 ? zone-h : 0);
+
+    // below header, inside window
+    pure function inside(x: length, y: length) -> bool {
+        x >= 0 && x <= root.width && y >= top - 8px && y <= root.height
+    }
 
     public function focus-keys() {
         fs.focus();
@@ -267,14 +315,15 @@ export component Panel inherits Window {
     }
 
     for g in groups: Rectangle {
+        property <bool> hot: root.drop-target == g.idx; // drop target under dragged item
         x: pad + g.x;
         y: top + g.y;
         width: g.w;
         height: g.h;
         border-radius: 8px;
-        background: g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
-        border-width: 1px;
-        border-color: g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
+        background: hot ? #0078d4.with-alpha(0.22) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
+        border-width: hot ? 2px : 1px;
+        border-color: hot ? #0078d4 : g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
 
         Dot {
             x: 7px;
@@ -289,7 +338,7 @@ export component Panel inherits Window {
                 cp.show();
             }
         }
-        Text {
+        if root.rename-idx != g.idx: Text {
             x: 26px;
             y: 3px;
             height: 20px;
@@ -301,12 +350,63 @@ export component Panel inherits Window {
             vertical-alignment: center;
             color: dark ? #ffffffe8 : #1b1b1be8;
         }
+        // double-click title = rename
+        if root.rename-idx != g.idx && !g.fixed: TouchArea {
+            x: 26px;
+            y: 0;
+            width: parent.width - 30px;
+            height: 26px;
+            double-clicked => { root.rename-idx = g.idx; }
+        }
+        // inline rename: Enter = rename folder, Esc / focus loss = keep name
+        if root.rename-idx == g.idx: Rectangle {
+            x: 22px;
+            y: 3px;
+            height: 20px;
+            width: parent.width - 26px;
+            border-radius: 4px;
+            background: dark ? #00000060 : #ffffffc0;
+            border-width: 1px;
+            border-color: #0078d4;
+            clip: true;
+            TextInput {
+                x: 4px;
+                width: parent.width - 8px;
+                height: parent.height;
+                text: g.name;
+                single-line: true;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+                color: dark ? #ffffff : #1b1b1b;
+                selection-background-color: #0078d480;
+                init => {
+                    self.focus();
+                    self.select-all();
+                }
+                accepted => { root.rename-group(g.name, self.text); }
+                key-pressed(e) => {
+                    if (e.text == Key.Escape) {
+                        root.rename-idx = -1;
+                        fs.focus();
+                        return accept;
+                    }
+                    return reject;
+                }
+                changed has-focus => {
+                    if (!self.has-focus && root.rename-idx == g.idx) {
+                        root.rename-idx = -1;
+                    }
+                }
+            }
+        }
         for s in g.items: Slot {
             x: s.x;
             y: s.y;
             d: s;
             labels: root.labels;
             dark: root.dark;
+            lifted: root.drag-id == s.id && s.id >= 0;
             clicked => {
                 if (s.more > 0) {
                     root.open-group(g.idx);
@@ -314,7 +414,53 @@ export component Panel inherits Window {
                     root.launch(s.id);
                 }
             }
+            drag-move(mx, my) => {
+                root.drag-id = s.id;
+                root.drag-icon = s.icon;
+                root.drag-x = pad + g.x + s.x + mx;
+                root.drag-y = top + g.y + s.y + my;
+                root.item-drag(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
+            }
+            drag-end(mx, my) => {
+                root.drag-x = pad + g.x + s.x + mx;
+                root.drag-y = top + g.y + s.y + my;
+                root.item-drop(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
+                root.drag-id = -1;
+                root.drop-target = -2;
+            }
+            drag-cancel => {
+                root.drag-id = -1;
+                root.drop-target = -2;
+            }
         }
+    }
+
+    // drop here = new group (empty space between groups works too)
+    if drag-id >= 0: Rectangle {
+        x: pad;
+        y: top + grid-h + 8px;
+        width: grid-w;
+        height: zone-h - 8px;
+        border-radius: 8px;
+        background: drop-target == -1 ? #0078d4.with-alpha(0.22) : (dark ? #ffffff08 : #ffffff30);
+        border-width: drop-target == -1 ? 2px : 1px;
+        border-color: drop-target == -1 ? #0078d4 : (dark ? #ffffff30 : #00000030);
+        Text {
+            text: "+ Новая группа";
+            font-size: 12px;
+            font-weight: 600;
+            color: dark ? #ffffffc0 : #1b1b1bc0;
+        }
+    }
+
+    // ghost of dragged icon follows cursor
+    if drag-id >= 0: Image {
+        source: drag-icon;
+        x: drag-x - 24px;
+        y: drag-y - 24px;
+        width: 48px;
+        height: 48px;
+        opacity: 0.85;
     }
 
     // color picker: first = no color, then palette

@@ -27,6 +27,8 @@ Progress: 35%
   - Panel draggable by header. Tiles: drag to move, bottom-right grip to resize, icon grid adapts;
     rect saved per folder in .glassfolder.json "tile". App settings: %APPDATA%/glass-folders/settings.json.
 
+- v0.3 (T1, T2): tiles resize/move snap to icon-cell grid; panel top strip (DWM caption band) removed.
+
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
 - Desktop layer: parent tiles to WorkerW / hide native icons (now: bottom-most windows; Win+D hides them).

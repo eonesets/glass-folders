@@ -40,7 +40,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let dark = app.borrow().dark;
     let panel = Panel::new()?;
     if let Some(h) = plat::hwnd_of(panel.window()) {
-        win::glass(h, dark, false);
+        win::glass(h, dark);
     }
     {
         let (a, p) = (app.clone(), panel.as_weak());
@@ -173,19 +173,24 @@ fn main() -> Result<(), slint::PlatformError> {
         }
         plat::set_kind(t.window(), plat::Kind::Tile);
         if let Some(h) = plat::hwnd_of(t.window()) {
-            win::glass(h, dark, true);
+            win::glass(h, dark);
         }
         let s = t.window().scale_factor();
-        let side = (112.0 * s) as i32;
+        let (side_w, side_h) = plat::snap_size(0, 0, s); // min tile = 2x2 cells
         let wa = win::work_area();
         let (mut x, mut y, mut w, mut h) =
-            (wa.right - ((24.0 + 112.0) * s) as i32, wa.top + ((24.0 + i as f32 * 128.0) * s) as i32, side, side);
+            (wa.right - ((24.0 + 112.0) * s) as i32, wa.top + ((24.0 + i as f32 * 128.0) * s) as i32, side_w, side_h);
         if let Some([sx, sy, sw, sh]) = f.cfg.tile {
             (x, y, w, h) = (sx, sy, sw, sh);
         }
         // dev: GF_TILE_AT=x,y puts tiles in a row from that point (to inspect the frosted look)
         if let Some((ax, ay)) = std::env::var("GF_TILE_AT").ok().and_then(|v| v.split_once(',').map(|(a, b)| (a.parse::<i32>().unwrap_or(0), b.parse::<i32>().unwrap_or(0)))) {
-            (x, y, w, h) = (ax + i as i32 * (side + 16), ay, side, side);
+            (x, y, w, h) = (ax + i as i32 * (side_w + 16), ay, side_w, side_h);
+        }
+        // saved or default rect -> whole cells / desktop grid (dev GF_TILE_AT stays free)
+        if std::env::var("GF_TILE_AT").is_err() {
+            (w, h) = plat::snap_size(w, h, s);
+            (x, y) = plat::snap_pos(x, y, s);
         }
         t.window().set_size(PhysicalSize::new(w as u32, h as u32));
         t.window().set_position(PhysicalPosition::new(x, y));

@@ -108,7 +108,26 @@ struct Drag {
 
 /// Bottom-right square of a tile that resizes instead of moving (logical px).
 pub const GRIP: f32 = 16.0;
-const TILE_MIN: f32 = 96.0; // logical
+// Tile grid (logical px): one icon cell. Tile size = cols x rows cells + padding; Tile in app.slint uses the same numbers.
+pub const CELL_W: f32 = 48.0;
+pub const CELL_H: f32 = 42.0;
+const PAD_W: f32 = 12.0; // tile width  = cols * CELL_W + PAD_W
+const PAD_H: f32 = 30.0; // tile height = rows * CELL_H + PAD_H (name strip)
+const MIN_CELLS: i32 = 2;
+
+/// Snap a tile size (physical px) to whole cells, min 2x2.
+pub fn snap_size(w: i32, h: i32, s: f32) -> (i32, i32) {
+    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
+    let rows = (((h as f32 / s - PAD_H) / CELL_H).round() as i32).max(MIN_CELLS);
+    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * CELL_H + PAD_H) * s).round() as i32)
+}
+
+/// Snap a tile position (physical px) to the desktop grid: cell pitch, origin = work area corner.
+pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
+    let wa = crate::win::work_area();
+    let snap = |v: i32, o: i32, pitch: f32| o + (((v - o) as f32 / (pitch * s)).round() * pitch * s).round() as i32;
+    (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
+}
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
 
 thread_local! {
@@ -221,17 +240,19 @@ impl GfWindow {
         d.moved = true;
         self.drag.set(Some(d));
         if d.resize {
-            let min = (TILE_MIN * self.scale.get()) as i32;
-            let w = (d.rect.right - d.rect.left + dx).max(min);
-            let h = (d.rect.bottom - d.rect.top + dy).max(min);
+            let (w, h) = snap_size(d.rect.right - d.rect.left + dx, d.rect.bottom - d.rect.top + dy, self.scale.get());
             self.resize_physical(w as u32, h as u32);
         } else {
+            let (mut x, mut y) = (d.rect.left + dx, d.rect.top + dy);
+            if self.kind.get() == Kind::Tile {
+                (x, y) = snap_pos(x, y, self.scale.get());
+            }
             unsafe {
                 let _ = SetWindowPos(
                     self.hwnd.get(),
                     None,
-                    d.rect.left + dx,
-                    d.rect.top + dy,
+                    x,
+                    y,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,

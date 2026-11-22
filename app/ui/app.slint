@@ -444,9 +444,9 @@ export component Tile inherits Window {
     in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
     callback open();
 
-    // size comes from Rust (user resizes the window); icon grid adapts
-    property <int> cols: max(2, floor((root.width - 16px) / 48px));
-    property <int> rows: max(1, floor((root.height - 26px) / 42px));
+    // size comes from Rust, snapped to whole cells (plat.rs: w = cols*48+12, h = rows*42+30); icon grid fills it
+    property <int> cols: max(2, round((root.width - 12px) / 48px));
+    property <int> rows: max(2, round((root.height - 30px) / 42px));
     property <length> grid-x: (root.width - cols * 48px + 12px) / 2;
 
     Image {

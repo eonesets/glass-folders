@@ -14,15 +14,18 @@ Rule: when files / key functions / props change, update this map in the same com
   - `Panel` — folder window. page 0 = groups, page 1 = settings. Props from Rust: groups, grid-w/h, settings
     (labels names dots ptitle tnames gravity glass snap), drop-target/index, ghost-*, lift-* (dragged group, free px).
     Callbacks -> Rust: launch, open-group (unfold/fold "+N"), item-drag/drop, group-drag/drop, set-opt(key,int), rename-group, quit.
-  - `Tile` — desktop tile. `named` = name strip (else square 48px cells).
+  - `Tile` — desktop tile. `named` = name strip (else square 48px cells). icons = most launched first;
+    icon click -> launch(i); last cell "+N" (total > cells), empty space -> open.
 - `src/main.rs` — app glue. `App` state (folder, base/prev rects, ghost, target, lift, unfolded, anim, tiles).
   - startup: make_tiles -> desk::hide_folders. quit/panic -> give_back_icons.
   - set_opt (settings page), push_settings.
   - drag: item_drag / group_drag (preview, uses plat::cursor_logical for groups) -> show_preview; drop_item / drop_group (fs moves, cfg save) -> rescan -> render.
+  - tiles: tile_icons (top_items -> icons, returns paths) -> App.tile_items; refresh_tile after launch / rescan.
+    Launch (panel or tile) -> model::bump_use.
   - render: model::layout + unfold, updates existing VecModel rows in place (plates animate).
   - open_folder / animate / close / finish_close: panel grows out of tile and folds back (plat::set_view).
 - `src/model.rs` — data, no UI. Folder scan, per-folder cfg `.glassfolder.json` (tile rect, group x/y/w/h/color/items order),
-  app Settings (%APPDATA%/glass-folders/settings.json), panel grid: GRect (cols 84px PITCH, half-rows 42px ROW,
+  launch counts `uses` (top_items, bump_use), app Settings (%APPDATA%/glass-folders/settings.json), panel grid: GRect (cols 84px PITCH, half-rows 42px ROW,
   h = 2*rows + header), resolve (push overlaps down), settle (gravity), layout, grid_px. Unit tests at bottom.
 - `src/plat.rs` — Slint platform on raw Win32: window per Slint window, DIB paint, mouse/keys, tile drag/resize
   (free follow, glide to cells on release), tile cell math (tile_cells/tile_size/snap_pos, TILE_NAMED, SNAP),

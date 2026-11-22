@@ -35,6 +35,8 @@ pub struct Config {
     pub groups: BTreeMap<String, GroupCfg>,
     /// Tile on desktop: [x, y, w, h] physical px. None = auto place, default size.
     pub tile: Option<[i32; 4]>,
+    /// launch count by item file name (tile shows most used first)
+    pub uses: BTreeMap<String, u32>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -73,10 +75,21 @@ impl Folder {
         let g = &self.groups[i];
         self.cfg.groups.get(&g.name).and_then(|c| c.color.clone())
     }
-    /// First n items across groups, for tile preview.
-    pub fn first_items(&self, n: usize) -> Vec<PathBuf> {
-        self.groups.iter().flat_map(|g| g.items.iter().cloned()).take(n).collect()
+    /// All items, most launched first; ties keep panel order (stable sort).
+    pub fn top_items(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.groups.iter().flat_map(|g| g.items.iter().cloned()).collect();
+        let n = |p: &PathBuf| file_name(p).and_then(|k| self.cfg.uses.get(&k).copied()).unwrap_or(0);
+        v.sort_by_key(|p| std::cmp::Reverse(n(p)));
+        v
     }
+}
+
+/// +1 launch of `item` (inside folder `root`). Fresh cfg from disk, so nothing else is lost.
+pub fn bump_use(root: &Path, item: &Path) {
+    let Some(k) = file_name(item) else { return };
+    let mut cfg = load_cfg(root);
+    *cfg.uses.entry(k).or_insert(0) += 1;
+    let _ = save_cfg(root, &cfg);
 }
 
 fn is_hidden(p: &Path) -> bool {
@@ -514,6 +527,17 @@ mod tests {
 
     fn r(x: i32, y: i32, w: i32, h: i32) -> GRect {
         GRect { x, y, w, h }
+    }
+
+    #[test]
+    fn top_items_by_uses() {
+        let items = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let mut f = Folder { name: "x".into(), dir: "x".into(), cfg: Config::default(), groups: vec![] };
+        f.groups.push(Group { name: "a".into(), dir: "a".into(), items: items(&["a/one.lnk", "a/two.lnk"]) });
+        f.groups.push(Group { name: "b".into(), dir: "b".into(), items: items(&["b/three.lnk", "b/four.lnk"]) });
+        f.cfg.uses.insert("four.lnk".into(), 5);
+        f.cfg.uses.insert("two.lnk".into(), 2);
+        assert_eq!(f.top_items(), items(&["b/four.lnk", "a/two.lnk", "a/one.lnk", "b/three.lnk"]));
     }
 
     #[test]

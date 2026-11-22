@@ -1074,12 +1074,14 @@ export component Tile inherits Window {
     in property <string> name;
     in property <color> tint;
     in property <bool> colored;
-    in property <[image]> icons;
+    in property <[image]> icons; // most launched first
+    in property <int> total; // all items in the folder (icons holds at most 24)
     in property <bool> dark; // set from Rust (Windows app theme)
     in property <image> backdrop; // fallback only (GF_FAKE_GLASS): frosted wallpaper copy
     in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
     in property <bool> named: true; // name strip under icons; off = square cells, even edges
     callback open();
+    callback launch(int); // icon index -> run that file
 
     // size comes from Rust, snapped to whole cells (plat.rs tile_size: w = cols*48+12, h = rows*42+30 or rows*48+12)
     // floor: while a resize is dragged the size is free -> only whole cells that fit are shown
@@ -1106,14 +1108,6 @@ export component Tile inherits Window {
         border-width: 1px;
         border-color: colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
     }
-    for ic[i] in icons: Image {
-        visible: i < cols * rows;
-        source: ic;
-        width: 36px;
-        height: 36px;
-        x: grid-x + mod(i, cols) * 48px;
-        y: pad-top + floor(i / cols) * cell-h;
-    }
     if named: Text {
         x: 8px;
         y: parent.height - 21px;
@@ -1126,8 +1120,50 @@ export component Tile inherits Window {
         horizontal-alignment: center;
         color: dark ? #ffffff : #1b1b1b;
     }
+    // cells: icon click = launch; empty space / name / "more" cell = open folder
+    property <int> cap: cols * rows;
+    property <bool> over: total > cap; // last cell becomes "+N" -> panel
     ta := TouchArea {
         clicked => { root.open(); }
+        for ic[i] in icons: Rectangle {
+            visible: over ? i < cap - 1 : i < cap;
+            x: grid-x + mod(i, cols) * 48px - 4px;
+            y: pad-top + floor(i / cols) * cell-h - 3px;
+            width: 44px;
+            height: 42px;
+            border-radius: 6px;
+            background: it.pressed ? (dark ? #ffffff30 : #00000020) : it.has-hover ? (dark ? #ffffff1c : #ffffff70) : transparent;
+            Image {
+                x: 4px;
+                y: 3px;
+                source: ic;
+                width: 36px;
+                height: 36px;
+            }
+            it := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.launch(i); }
+            }
+        }
+        if over: Rectangle {
+            x: grid-x + mod(cap - 1, cols) * 48px - 4px;
+            y: pad-top + floor((cap - 1) / cols) * cell-h - 3px;
+            width: 44px;
+            height: 42px;
+            border-radius: 6px;
+            background: mt.has-hover ? (dark ? #ffffff1c : #ffffff70) : transparent;
+            Text {
+                text: "+" + (total - cap + 1);
+                font-size: 13px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                color: dark ? #ffffffc0 : #1b1b1bc0;
+            }
+            mt := TouchArea {
+                clicked => { root.open(); }
+            }
+        }
     }
     // resize grip hint (bottom-right, see plat::GRIP)
     if ta.has-hover: Rectangle {

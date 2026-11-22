@@ -47,6 +47,7 @@ struct App {
     set: model::Settings,
     dark: bool,
     tiles: Vec<(PathBuf, Tile)>,
+    tile_items: HashMap<PathBuf, Vec<PathBuf>>, // folder -> files behind its tile icons (index = icon)
     // panel layout: base = as rendered, prev = shown now (while dragging), ghost = new-group plate
     base: Vec<GRect>,
     prev: Vec<GRect>,
@@ -118,8 +119,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_launch(move |id| {
             let path = a.borrow().ids.get(id as usize).cloned();
+            let root = a.borrow().folder.as_ref().map(|f| f.dir.clone());
             if let Some(path) = path {
                 win::open(&path);
+                if let Some(root) = root {
+                    model::bump_use(&root, &path);
+                    refresh_tile(&a, &root);
+                }
             }
             if let Some(p) = p.upgrade() {
                 close(&p, &a);
@@ -414,13 +420,27 @@ fn make_tiles(
         let (c, on) = model::tint(&f.tint());
         t.set_tint(c);
         t.set_colored(on);
-        tile_icons(&t, &f);
+        let items = tile_icons(&t, &f);
+        app.borrow_mut().tile_items.insert(dir.clone(), items);
         {
             let (a, p, d) = (app.clone(), panel.as_weak(), dir.clone());
             t.on_open(move || {
                 if let Some(p) = p.upgrade() {
                     open_folder(&p, &a, &d);
                 }
+            });
+        }
+        {
+            // click on a tile icon: run it right from the desktop, no panel
+            let (a, d) = (app.clone(), dir.clone());
+            t.on_launch(move |i| {
+                let path = a.borrow().tile_items.get(&d).and_then(|v| v.get(i as usize).cloned());
+                let Some(path) = path else { return };
+                win::open(&path);
+                model::bump_use(&d, &path);
+                // deferred: icons model is rebuilt, the clicked icon belongs to it
+                let (a, d) = (a.clone(), d.clone());
+                slint::Timer::single_shot(Duration::ZERO, move || refresh_tile(&a, &d));
             });
         }
         plat::set_kind(t.window(), plat::Kind::Tile);
@@ -499,10 +519,28 @@ fn free_spot(start: (i32, i32), w: i32, h: i32, taken: &[RECT], s: f32) -> (i32,
     (x0, y0)
 }
 
-/// Tile preview icons. Enough for a big tile; Slint shows only what fits.
-fn tile_icons(t: &Tile, f: &model::Folder) {
-    let icons: Vec<Image> = f.first_items(24).iter().filter_map(|p| win::icon(p, px(36.0, t.window().scale_factor()))).collect();
+/// Tile icons: most launched first. Enough for a big tile; Slint shows only what fits.
+/// Returns the files behind the icons (same order) for launch from the tile.
+fn tile_icons(t: &Tile, f: &model::Folder) -> Vec<PathBuf> {
+    let all = f.top_items();
+    t.set_total(all.len() as i32);
+    let s = t.window().scale_factor();
+    let (items, icons): (Vec<PathBuf>, Vec<Image>) =
+        all.into_iter().take(24).filter_map(|p| win::icon(&p, px(36.0, s)).map(|i| (p, i))).unzip();
     t.set_icons(ModelRc::new(VecModel::from(icons)));
+    items
+}
+
+/// Re-read one folder from disk and redraw its desktop tile (launch counts changed).
+fn refresh_tile(app: &Shared, dir: &Path) {
+    let f = model::scan(dir);
+    let items = {
+        let st = app.borrow();
+        st.tiles.iter().find(|(d, _)| d == dir).map(|(_, t)| tile_icons(t, &f))
+    };
+    if let Some(items) = items {
+        app.borrow_mut().tile_items.insert(dir.to_path_buf(), items);
+    }
 }
 
 // ---------- panel drag: preview ----------
@@ -774,12 +812,7 @@ fn rename_group(panel: &Panel, app: &Shared, old: &str, typed: &str) {
 fn rescan(panel: &Panel, app: &Shared, root: &Path) {
     app.borrow_mut().folder = Some(model::scan(root));
     render(panel, app);
-    let st = app.borrow();
-    if let Some(f) = st.folder.as_ref() {
-        for (_, t) in st.tiles.iter().filter(|(d, _)| d == root) {
-            tile_icons(t, f);
-        }
-    }
+    refresh_tile(app, root);
 }
 
 /// Tile glass look. Default: real live acrylic (win::glass + NC-active trick), only a matte layer

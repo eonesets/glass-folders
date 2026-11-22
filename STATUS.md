@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.6: настройки разделены на «Папка» и «Группы внутри», плитка без подписи становится ровной (квадратные клетки), группы без заголовка облегают ярлыки, «+N» раскрывает группу на месте, группы в окне двигаются плавно за курсором.
+Кратко: приложение «стеклянные папки» для рабочего стола. v0.7: на плитке — самые запускаемые ярлыки (считаются запуски), клик по иконке на плитке запускает её сразу, последняя клетка «+N» и пустое место открывают папку.
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-22 (v0.6)
-Progress: 70%
+Updated: 2026-11-22 (v0.7)
+Progress: 72%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -87,3 +87,9 @@ GitHub (private): https://github.com/eonesets/glass-folders, branch main.
 ## Run
 `app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
 Build: `cargo build --release` in app/.
+
+- v0.7 (2026-11-22): launch from tile.
+  - Launch counts per item file name in .glassfolder.json "uses" (panel + tile launches).
+  - Tile icons sorted by uses desc (ties = panel order). Click icon = run it, no panel; hover/press highlight.
+  - Items > cells: last cell "+N" opens panel. Empty space / name strip also open panel.
+  - Verified on screen: VS Code launched from Кодинг tile, count saved, moved to first cell.

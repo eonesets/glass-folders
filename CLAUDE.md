@@ -4,6 +4,7 @@
 
 Windows desktop app: each Desktop folder -> glass tile on the desktop; click -> panel with groups (= subfolders).
 Rust + Slint 1.x, software renderer, own Win32 platform layer. State/progress: STATUS.md. Spec: docs/SPEC.md.
+Rule: when files / key functions / props change, update this map in the same commit. Read only the code the task touches.
 
 ## Files (app/)
 - `ui/app.slint` — ALL UI. Only draws; geometry comes from Rust.

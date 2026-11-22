@@ -16,8 +16,11 @@ pub const PAL: [&str; 10] = [
 pub const CELL: f32 = 76.0; // square slot
 pub const GAP: f32 = 8.0;
 pub const PITCH: f32 = CELL + GAP; // one grid step, same inside and between groups
-pub const HEAD: f32 = 26.0; // group header
-pub const GPAD: f32 = 4.0; // bottom padding of group
+// Panel grid: columns = PITCH, rows = half PITCH. Group of r slot rows = 2r+1 grid rows
+// (extra half row = header 30 + bottom pad 12). So groups align on a free canvas.
+pub const ROW: f32 = PITCH / 2.0;
+pub const HEAD: f32 = 30.0; // group header (app.slint uses the same)
+pub const GPAD: f32 = 12.0; // bottom padding of group; HEAD + GPAD = ROW
 
 pub const LOOSE: &str = "Разное";
 const CFG: &str = ".glassfolder.json";
@@ -38,9 +41,15 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct GroupCfg {
+    /// size in slots (cols x rows). None = auto from item count.
     pub w: Option<u32>,
     pub h: Option<u32>,
     pub color: Option<String>,
+    /// place on panel grid: column, half-row. None = auto (first free spot).
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    /// item order by file name; unlisted items follow alphabetically.
+    pub items: Vec<String>,
 }
 
 pub struct Group {
@@ -126,6 +135,12 @@ pub fn scan(dir: &Path) -> Folder {
     // Saved order first, then the rest as scanned (Разное already last).
     let rank = |g: &Group| cfg.order.iter().position(|n| *n == g.name).unwrap_or(usize::MAX);
     groups.sort_by_key(|g| rank(g));
+    // user item order inside each group (stable sort keeps alphabetical for the rest)
+    for g in &mut groups {
+        if let Some(order) = cfg.groups.get(&g.name).map(|c| &c.items).filter(|o| !o.is_empty()) {
+            g.items.sort_by_key(|p| order.iter().position(|n| Some(n.as_str()) == file_name(p).as_deref()).unwrap_or(usize::MAX));
+        }
+    }
     Folder { name: name_of(dir), dir: dir.to_path_buf(), cfg, groups }
 }
 
@@ -309,27 +324,56 @@ pub fn hex(c: slint::Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
 }
 
-// ---------- layout ----------
 
-pub struct SlotGeo {
-    pub x: f32,
-    pub y: f32,
-    pub item: usize,
-    pub more: usize,
+/// File name with extension (key in GroupCfg.items).
+pub fn file_name(p: &Path) -> Option<String> {
+    p.file_name().map(|s| s.to_string_lossy().into_owned())
 }
 
-pub struct GroupGeo {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-    pub slots: Vec<SlotGeo>,
+// ---------- layout: free grid of groups ----------
+
+/// Group rect on the panel grid. x, w in columns; y, h in half-rows (h = 2 * slot rows + 1).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
-pub struct Layout {
-    pub groups: Vec<GroupGeo>,
-    pub w: f32,
-    pub h: f32,
+impl GRect {
+    pub fn slots(w: i32, rows: i32, x: i32, y: i32) -> GRect {
+        GRect { x, y, w, h: 2 * rows + 1 }
+    }
+    pub fn rows(&self) -> i32 {
+        (self.h - 1) / 2
+    }
+    pub fn hits(&self, o: &GRect) -> bool {
+        self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
+    }
+    /// pixel rect (x, y, w, h) inside the panel grid area
+    pub fn px(&self) -> [f32; 4] {
+        [self.x as f32 * PITCH, self.y as f32 * ROW, self.w as f32 * PITCH - GAP, self.h as f32 * ROW - GAP]
+    }
+}
+
+/// Overlaps -> push groups down until none overlap. `first` keeps its place (the one being dragged);
+/// the rest go top-to-bottom, each moved just below whatever it hits. Never moves anything up.
+pub fn resolve(r: &mut [GRect], first: Option<usize>) {
+    let mut order: Vec<usize> = (0..r.len()).filter(|&i| Some(i) != first).collect();
+    order.sort_by_key(|&i| (r[i].y, r[i].x));
+    let mut placed: Vec<usize> = first.into_iter().collect();
+    for i in order {
+        while let Some(b) = placed.iter().filter(|&&p| r[p].hits(&r[i])).map(|&p| r[p].y + r[p].h).max() {
+            r[i].y = b;
+        }
+        placed.push(i);
+    }
+}
+
+/// Grid extent (cols, half-rows) of all rects.
+pub fn extent(r: &[GRect]) -> (i32, i32) {
+    r.iter().fold((0, 0), |(c, h), g| (c.max(g.x + g.w), h.max(g.y + g.h)))
 }
 
 /// Near-square size that fits n items, width capped.
@@ -340,67 +384,62 @@ pub fn auto_size(n: usize, maxw: u32) -> (u32, u32) {
     (w, h)
 }
 
-pub fn layout(f: &Folder) -> Layout {
+/// Rects of all groups: saved place/size, else auto size + first free spot.
+pub fn layout(f: &Folder) -> Vec<GRect> {
     let total: usize = f.groups.iter().map(|g| g.items.len().max(1)).sum();
-    let cols = f
-        .cfg
-        .cols
-        .unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, 8)) as usize;
-
-    let mut bottom = vec![0f32; cols];
-    let mut used = 1usize;
-    let mut out = Vec::new();
-    for g in &f.groups {
+    let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, 8)) as i32;
+    let mut rects = Vec::new();
+    let mut placed = Vec::new(); // groups with saved place
+    for (i, g) in f.groups.iter().enumerate() {
         let c = f.cfg.groups.get(&g.name);
         let (mut aw, mut ah) = auto_size(g.items.len(), cols as u32);
         if f.groups.len() == 1 && aw < 3 {
             // single group fills the min 3-cell panel width -> even edges
             aw = 3;
-            ah = ((g.items.len().max(1) + 2) / 3) as u32;
+            ah = g.items.len().max(1).div_ceil(3) as u32;
         }
-        let w = c.and_then(|c| c.w).unwrap_or(aw).clamp(1, cols as u32) as usize;
-        let h = c.and_then(|c| c.h).unwrap_or(ah).max(1) as usize;
-        let gw = w as f32 * PITCH - GAP;
-        let gh = HEAD + h as f32 * PITCH - GAP + GPAD;
-
-        // skyline: lowest spot, leftmost on tie
-        let (mut best_c, mut best_y) = (0, f32::MAX);
-        for col in 0..=cols - w {
-            let y = bottom[col..col + w].iter().cloned().fold(0f32, f32::max);
-            if y < best_y {
-                best_y = y;
-                best_c = col;
+        let w = c.and_then(|c| c.w).unwrap_or(aw).max(1) as i32;
+        let h = c.and_then(|c| c.h).unwrap_or(ah).max(1) as i32;
+        let pos = c.and_then(|c| c.x.zip(c.y));
+        let (x, y) = pos.unwrap_or((-1, -1));
+        if pos.is_some() {
+            placed.push(i);
+        }
+        rects.push(GRect::slots(w, h, x.max(0), y.max(0)));
+    }
+    // saved ones: fix overlaps (a group may have grown since)
+    let mut fixed: Vec<GRect> = placed.iter().map(|&i| rects[i]).collect();
+    resolve(&mut fixed, None);
+    for (k, &i) in placed.iter().enumerate() {
+        rects[i] = fixed[k];
+    }
+    // others: first free spot, row by row
+    for i in 0..rects.len() {
+        if placed.contains(&i) {
+            continue;
+        }
+        let mut r = rects[i];
+        let span = cols.max(r.w);
+        'find: for y in 0.. {
+            for x in 0..=span - r.w {
+                r.x = x;
+                r.y = y;
+                if !fixed.iter().any(|o| o.hits(&r)) {
+                    break 'find;
+                }
             }
         }
-        for b in &mut bottom[best_c..best_c + w] {
-            *b = best_y + gh + GAP;
-        }
-        used = used.max(best_c + w);
-
-        let cap = w * h;
-        let n = g.items.len();
-        let shown = if n > cap { cap - 1 } else { n };
-        let mut slots: Vec<SlotGeo> = (0..shown)
-            .map(|i| SlotGeo {
-                x: (i % w) as f32 * PITCH,
-                y: HEAD + (i / w) as f32 * PITCH,
-                item: i,
-                more: 0,
-            })
-            .collect();
-        if n > cap {
-            let i = cap - 1;
-            slots.push(SlotGeo {
-                x: (i % w) as f32 * PITCH,
-                y: HEAD + (i / w) as f32 * PITCH,
-                item: 0,
-                more: n - shown,
-            });
-        }
-        out.push(GroupGeo { x: best_c as f32 * PITCH, y: best_y, w: gw, h: gh, slots });
+        rects[i] = r;
+        fixed.push(r);
+        placed.push(i);
     }
-    let h = bottom.iter().cloned().fold(0f32, f32::max) - GAP;
-    // min 3 cells wide: header (name + buttons) must fit
-    let w = (used.max(3)) as f32 * PITCH - GAP;
-    Layout { groups: out, w, h: h.max(CELL) }
+    rects
+}
+
+/// Panel grid size in px for rects (+ extra free cols / half-rows), min 3 columns wide.
+pub fn grid_px(r: &[GRect], extra_c: i32, extra_r: i32) -> (f32, f32) {
+    let (c, h) = extent(r);
+    let c = (c + extra_c).max(3);
+    let h = (h + extra_r).max(3);
+    (c as f32 * PITCH - GAP, h as f32 * ROW - GAP)
 }

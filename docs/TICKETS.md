@@ -26,3 +26,14 @@ Groups = real subfolders, "Разное" = root files of folder (see docs/SPEC.m
 - Name collisions: append " (2)". Errors -> no crash, item stays.
 - Done: move between groups works, new group created + renamed, files really moved on disk.
 - Result: Slot press+move >5px = drag (ghost, target group highlight, "+ Новая группа" zone at bottom while dragging); drop -> MoveFileExW no-replace + " (n)" names; emptied subfolder removed only if truly empty; new group -> inline TextInput (Enter rename, Esc/focus loss keep); double-click group title renames too; cfg keys follow rename. plat.rs now forwards WM_CHAR + edit keys. Verified on Desktop\GF_TEST.
+
+# v0.4 (2026-11-22) — done by Claude (Opus) directly
+
+## T4. Tiles replace desktop folders — status: done
+Start: hide native desktop icons (no positions changed), tiles first placed at folder icon spots, rect remembered.
+Quit: icons back. Result: src/desk.rs (hide/restore, icon_positions), main.rs make_tiles/free_spot.
+
+## T5. Panel = free grid of groups — status: done
+Reorder shortcuts in group; drag out -> new-group plate under cursor anywhere (not only new column);
+move groups by header, resize by corner (e.g. flat 4x1). Result: model.rs GRect/resolve/layout, main.rs item_drag/group_drag/drop_*,
+app.slint slots placed by index k (live shift), ghost plate, grip.

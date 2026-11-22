@@ -37,6 +37,8 @@ pub struct Config {
     pub tile: Option<[i32; 4]>,
     /// launch count by item file name (tile shows most used first)
     pub uses: BTreeMap<String, u32>,
+    /// Pinned open on the desktop: panel top-left [x, y] physical px (tile hidden). None = not pinned.
+    pub pin: Option<[i32; 2]>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -308,11 +310,22 @@ pub struct Settings {
     /// folder icons parked away by a running app: path -> home spot [x, y] (screen px).
     /// Non-empty at start = last run was killed -> put them back.
     pub homes: BTreeMap<String, [i32; 2]>,
+    /// icon size: 0 small, 1 medium, 2 large = zoom of panels and tiles (ZOOM)
+    pub isize: i32,
+}
+
+/// Window zoom per icon size setting.
+pub const ZOOM: [f32; 3] = [0.85, 1.0, 1.2];
+
+impl Settings {
+    pub fn zoom(&self) -> f32 {
+        ZOOM[self.isize.clamp(0, 2) as usize]
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, ptitle: true, tnames: true, homes: BTreeMap::new() }
+        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, ptitle: true, tnames: true, homes: BTreeMap::new(), isize: 1 }
     }
 }
 

@@ -63,6 +63,8 @@ impl TargetPixel for Bgra {
 pub enum Kind {
     Panel,
     Tile,
+    /// name hint near the cursor: topmost, no focus, clicks go through
+    Hint,
 }
 
 struct Dib {
@@ -89,8 +91,11 @@ pub struct GfWindow {
     renderer: SoftwareRenderer,
     hwnd: Cell<HWND>,
     size: Cell<PhysicalSize>,
-    scale: Cell<f32>,
+    scale: Cell<f32>, // = dpi * zoom
+    dpi: Cell<f32>,
+    zoom: Cell<f32>, // icon size setting
     kind: Cell<Kind>,
+    pinned: Cell<bool>, // panel pinned on the desktop: bottom z-order, glass stays live
     tracking: Cell<bool>,
     dib: RefCell<Option<Dib>>,
     on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
@@ -188,8 +193,33 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
         let hwnd = g.hwnd.get();
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let n = if kind == Kind::Tile { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
+            let n = if kind != Kind::Panel { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
+        }
+    }
+}
+
+/// Icon size: window content zoom on top of DPI. Slint sees it as the scale factor.
+pub fn set_zoom(window: &slint::Window, zoom: f32) {
+    if let Some(g) = find(window) {
+        g.zoom.set(zoom);
+        let s = g.dpi.get() * zoom;
+        g.scale.set(s);
+        g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: s });
+    }
+}
+
+/// Pinned panel: lives on the desktop like a tile (bottom z-order, live glass when not focused),
+/// still takes focus when clicked (rename, keys).
+pub fn set_pinned(window: &slint::Window, on: bool) {
+    let Some(g) = find(window) else { return };
+    g.pinned.set(on);
+    if on {
+        let hwnd = g.hwnd.get();
+        unsafe {
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+            let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -283,7 +313,10 @@ impl GfWindow {
             hwnd: Cell::new(hwnd),
             size: Cell::new(PhysicalSize::new(1, 1)),
             scale: Cell::new(scale),
+            dpi: Cell::new(scale),
+            zoom: Cell::new(1.0),
             kind: Cell::new(Kind::Panel),
+            pinned: Cell::new(false),
             tracking: Cell::new(false),
             dib: RefCell::new(None),
             on_deactivate: RefCell::new(None),
@@ -480,7 +513,13 @@ impl WindowAdapter for GfWindow {
         let hwnd = self.hwnd.get();
         unsafe {
             if visible {
-                let tile = self.kind.get() == Kind::Tile;
+                if self.kind.get() == Kind::Hint {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                    return Ok(());
+                }
+                let tile = self.kind.get() == Kind::Tile || self.pinned.get();
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
                     let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -519,8 +558,8 @@ impl WindowAdapter for GfWindow {
         }
     }
     fn update_window_properties(&self, properties: WindowProperties<'_>) {
-        if self.kind.get() == Kind::Tile {
-            return; // tile size is set from Rust (saved per folder, user can resize)
+        if self.kind.get() != Kind::Panel {
+            return; // tile / hint size is set from Rust (tile: saved per folder, user can resize)
         }
         // Our components have fixed width/height -> use preferred size.
         let c = properties.layout_constraints();
@@ -534,6 +573,7 @@ impl WindowAdapter for GfWindow {
 // ---------- native window + message handling ----------
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_TILES_DOWN: u32 = WM_APP + 7; // put tiles under pinned panels
 const CLASS: PCWSTR = w!("GlassFoldersWnd");
 
 fn create_hwnd() -> Result<HWND, PlatformError> {
@@ -709,10 +749,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(1);
             }
         }
-        WM_MOUSEACTIVATE if g.kind.get() == Kind::Tile => return LRESULT(MA_NOACTIVATE as isize),
-        // Tile: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
+        WM_MOUSEACTIVATE if g.kind.get() != Kind::Panel => return LRESULT(MA_NOACTIVATE as isize),
+        // Tile / hint / pinned panel: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
         // lParam -1: DefWindowProc skips NC repaint. Focus/foreground untouched.
-        WM_NCACTIVATE if g.kind.get() == Kind::Tile => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
+        WM_NCACTIVATE if g.kind.get() != Kind::Panel || g.pinned.get() => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));
@@ -722,19 +762,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
         }
-        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile => {
-            // keep tiles at the bottom whenever z-order changes; plain moves (drag) stay cheap
+        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile || g.pinned.get() => {
+            // keep tiles + pinned panels at the bottom whenever z-order changes; plain moves (drag) stay cheap
             let pos = &mut *(lp.0 as *mut WINDOWPOS);
             if (pos.flags & SWP_NOZORDER).0 == 0 {
                 pos.hwndInsertAfter = HWND_BOTTOM;
+                if g.pinned.get() {
+                    // pinned panel went to the bottom: tiles go under it again (after this change lands)
+                    let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
+                }
             }
         }
+        WM_TILES_DOWN => {
+            for t in ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()) {
+                if t.kind.get() == Kind::Tile && IsWindowVisible(t.hwnd.get()).as_bool() {
+                    let _ = SetWindowPos(t.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+            return LRESULT(0);
+        }
         WM_DPICHANGED => {
-            let scale = (wp.0 & 0xffff) as f32 / 96.0;
+            let dpi = (wp.0 & 0xffff) as f32 / 96.0;
+            g.dpi.set(dpi);
+            let scale = dpi * g.zoom.get();
             g.scale.set(scale);
             g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
         }
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        WM_NCHITTEST if g.kind.get() == Kind::Hint => return LRESULT(-1), // HTTRANSPARENT: mouse goes to the window below
         WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
         WM_CLOSE => return LRESULT(0),
         _ => {}

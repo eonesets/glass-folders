@@ -14,9 +14,14 @@ Rule: when files / key functions / props change, update this map in the same com
   - `Panel` — folder window. page 0 = groups, page 1 = settings. Props from Rust: groups, grid-w/h, settings
     (labels names dots ptitle tnames gravity glass snap), drop-target/index, ghost-*, lift-* (dragged group, free px).
     Callbacks -> Rust: launch, open-group (unfold/fold "+N"), item-drag/drop, group-drag/drop, set-opt(key,int), rename-group, quit.
+    Header: gear, pin (toggle-pin, `pinned`), X. `hover(id, rect)` -> name hint. `isize` = icon size seg.
+  - `Hint` — name hint window (text, pw = width for Rust).
   - `Tile` — desktop tile. `named` = name strip (else square 48px cells). icons = most launched first;
     icon click -> launch(i); last cell "+N" (total > cells), empty space -> open.
-- `src/main.rs` — app glue. `App` state (folder, base/prev rects, ghost, target, lift, unfolded, anim, tiles).
+- `src/main.rs` — app glue. `Global` via `g()` (settings, tiles, tile_items, panels, hint): app-wide.
+  `App` = state of ONE folder window (folder, base/prev rects, ghost, target, lift, unfolded, anim, pinned).
+  - panels: make_panel wires a window; panels[0] = the one tiles open; set_pin / pin_open (cfg "pin"); finish_close drops
+    non-[0] windows. hint_at / hide_hint. set_opt applies to all panels (isize -> plat::set_zoom, icon_scale).
   - startup: make_tiles -> desk::hide_folders. quit/panic -> give_back_icons.
   - set_opt (settings page), push_settings.
   - drag: item_drag / group_drag (preview, uses plat::cursor_logical for groups) -> show_preview; drop_item / drop_group (fs moves, cfg save) -> rescan -> render.
@@ -29,7 +34,8 @@ Rule: when files / key functions / props change, update this map in the same com
   h = 2*rows + header), resolve (push overlaps down), settle (gravity), layout, grid_px. Unit tests at bottom.
 - `src/plat.rs` — Slint platform on raw Win32: window per Slint window, DIB paint, mouse/keys, tile drag/resize
   (free follow, glide to cells on release), tile cell math (tile_cells/tile_size/snap_pos, TILE_NAMED, SNAP),
-  set_view (show part of panel = open animation), cursor_logical.
+  set_view (show part of panel = open animation), cursor_logical. Kind Panel/Tile/Hint; set_zoom (scale = dpi*zoom);
+  set_pinned (pinned panel: bottom z, live glass; WM_TILES_DOWN keeps tiles under it).
 - `src/desk.rs` — Explorer desktop: icon positions (IShellWindows/IFolderView), hide tiled folders via
   FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
 - `src/win.rs` — misc Win32: acrylic glass, dark mode, work area, shell icons, ShellExecute open, wallpaper blur fallback.

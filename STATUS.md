@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.7: на плитке — самые запускаемые ярлыки (считаются запуски), клик по иконке на плитке запускает её сразу, последняя клетка «+N» и пустое место открывают папку.
+Кратко: приложение «стеклянные папки» для рабочего стола. v0.8: кнопка «закрепить» (папка висит открытой на столе, плитка прячется), подсказка с названием ярлыка при наведении, размер иконок в настройках, «+N» на плитке без своей подсветки.
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-22 (v0.7)
-Progress: 72%
+Updated: 2026-11-22 (v0.8)
+Progress: 76%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -93,3 +93,17 @@ Build: `cargo build --release` in app/.
   - Tile icons sorted by uses desc (ties = panel order). Click icon = run it, no panel; hover/press highlight.
   - Items > cells: last cell "+N" opens panel. Empty space / name strip also open panel.
   - Verified on screen: VS Code launched from Кодинг tile, count saved, moved to first cell.
+
+- v0.8 (2026-11-22): pin, name hint, icon size.
+  - Pin button (header, between gear and X): folder window stays on the desktop (bottom z-order like tiles,
+    live glass via NC-active trick, no close on focus loss / launch / Esc), its tile hides. Saved as cfg "pin" [x, y]
+    (moved by header -> saved). Start: pinned folders open at their spot. Unpin = tile back; X on pinned = unpin + fold.
+    Several windows now: Global.panels ([0] = the one tiles open; pinning [0] makes a fresh [0]). Tiles kept under pinned.
+  - Name hint: own topmost click-through window (Kind::Hint) under a hovered shortcut after 400 ms; tile icons always,
+    panel only when labels are off. Follows at once between shortcuts.
+  - Icon size (settings: small / medium / large = zoom 0.85 / 1 / 1.2): window scale = DPI x zoom (plat::set_zoom),
+    panels + tiles scale, tiles keep their cells. Large: icons fetched at plain DPI (bigger = shell frames low-res icons).
+  - Tile "+N": no own plate/hover; it is part of the tile (whole tile lights, drag moves it). Icon hover kept.
+  - Fix: tiles no longer snapped on start when "Плитки по сетке" is off.
+  - Verified on screen: hint (tile + panel), pin -> outside click keeps it, restart restores it, other folder opens
+    meanwhile, unpin -> tile back, large size + back to medium. RAM private ~8.6 MB.

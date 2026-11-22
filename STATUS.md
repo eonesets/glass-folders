@@ -66,6 +66,8 @@ Progress: 70%
     panel kept inside work area (fit_panel). Folded again by the slot or on close.
   - Group move/resize: plate follows cursor freely (lift-x/y/w/h), glides onto the grid on release.
     render() updates rows of the existing model -> plates animate instead of jumping.
+  - Group drag/resize point = real cursor (plat::cursor_logical), not pointer pos relative to the moving grip
+    (that drifted -> resize shook). Filmed: size now tracks cursor 1:1 both ways.
 
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

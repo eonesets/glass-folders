@@ -243,6 +243,20 @@ pub fn view_home(window: &slint::Window) -> Option<POINT> {
 }
 
 /// Screen rect of a window (physical px).
+/// Cursor in window content coords (logical px). Drags use this: a pointer position relative to
+/// an element that itself moves with the drag drifts.
+pub fn cursor_logical(window: &slint::Window) -> Option<(f32, f32)> {
+    let g = find(window)?;
+    let mut c = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut c);
+        let _ = ScreenToClient(g.hwnd.get(), &mut c);
+    }
+    let (ox, oy) = g.offset();
+    let s = g.scale.get();
+    Some(((c.x + ox) as f32 / s, (c.y + oy) as f32 / s))
+}
+
 pub fn rect_of(window: &slint::Window) -> Option<RECT> {
     let g = find(window)?;
     let mut r = RECT::default();

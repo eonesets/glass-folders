@@ -208,6 +208,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_group_drag(move |idx, x, y, resize| {
             if let Some(p) = p.upgrade() {
+                // real cursor, grid coords (pad 16, header 48 as in app.slint)
+                let (x, y) = plat::cursor_logical(p.window()).map_or((x, y), |(cx, cy)| (cx - 16.0, cy - 48.0));
                 group_drag(&mut a.borrow_mut(), idx as usize, x, y, resize);
                 show_preview(&p, &a.borrow(), true);
             }

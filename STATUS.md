@@ -2,7 +2,7 @@
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-22 (v0.8)
+Updated: 2026-11-23 (v0.8 + Threads promo)
 Progress: 76%
 
 ## Done
@@ -68,6 +68,9 @@ Progress: 76%
     render() updates rows of the existing model -> plates animate instead of jumping.
   - Group drag/resize point = real cursor (plat::cursor_logical), not pointer pos relative to the moving grip
     (that drifted -> resize shook). Filmed: size now tracks cursor 1:1 both ways.
+
+- Promo (2026-11-23): Threads thread draft + 5 demo GIFs/MP4 in promo/threads/ (tiles, open, groups, settings, pin).
+  Dev env GF_DESKTOP=dir runs app on a demo folder (filmed with copies of Start-menu shortcuts, APPDATA redirected).
 
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

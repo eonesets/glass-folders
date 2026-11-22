@@ -21,6 +21,10 @@ pub fn com_init() {
 }
 
 pub fn desktop_dir() -> PathBuf {
+    // dev: GF_DESKTOP=dir uses a demo folder instead of the real Desktop (screenshots, GIFs)
+    if let Ok(d) = std::env::var("GF_DESKTOP") {
+        return PathBuf::from(d);
+    }
     unsafe {
         if let Ok(p) = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) {
             let s = p.to_string().unwrap_or_default();

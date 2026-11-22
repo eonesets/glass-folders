@@ -45,7 +45,7 @@ Rule: when files / key functions / props change, update this map in the same com
   (killed run is safe: hidden folders restored on next start from settings "homes").
 - Tests: `cargo test --release` (model layout/gravity).
 - Run: `app/target/release/glass-folders.exe` (dev: `--open NAME`, env GF_STAY=1 keep panel open, GF_KEEP_ICONS=1,
-  GF_TILE_AT=x,y, GF_FAKE_GLASS=1).
+  GF_TILE_AT=x,y, GF_FAKE_GLASS=1, GF_DESKTOP=dir = demo folder instead of real Desktop).
 - Visual check: screenshots + synthetic mouse via PowerShell (SetProcessDPIAware, CopyFromScreen, SetCursorPos/mouse_event).
   Screen 2560x1440, scale 1. Careful: drags in the panel move REAL files (user's Desktop folders).
 

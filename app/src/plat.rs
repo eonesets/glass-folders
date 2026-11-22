@@ -24,7 +24,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
+    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -95,6 +96,7 @@ pub struct GfWindow {
     on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
+    surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
 }
 
 /// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
@@ -108,7 +110,26 @@ struct Drag {
 
 /// Bottom-right square of a tile that resizes instead of moving (logical px).
 pub const GRIP: f32 = 16.0;
-const TILE_MIN: f32 = 96.0; // logical
+// Tile grid (logical px): one icon cell. Tile size = cols x rows cells + padding; Tile in app.slint uses the same numbers.
+pub const CELL_W: f32 = 48.0;
+pub const CELL_H: f32 = 42.0;
+const PAD_W: f32 = 12.0; // tile width  = cols * CELL_W + PAD_W
+const PAD_H: f32 = 30.0; // tile height = rows * CELL_H + PAD_H (name strip)
+const MIN_CELLS: i32 = 2;
+
+/// Snap a tile size (physical px) to whole cells, min 2x2.
+pub fn snap_size(w: i32, h: i32, s: f32) -> (i32, i32) {
+    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
+    let rows = (((h as f32 / s - PAD_H) / CELL_H).round() as i32).max(MIN_CELLS);
+    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * CELL_H + PAD_H) * s).round() as i32)
+}
+
+/// Snap a tile position (physical px) to the desktop grid: cell pitch, origin = work area corner.
+pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
+    let wa = crate::win::work_area();
+    let snap = |v: i32, o: i32, pitch: f32| o + (((v - o) as f32 / (pitch * s)).round() * pitch * s).round() as i32;
+    (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
+}
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
 
 thread_local! {
@@ -183,6 +204,7 @@ impl GfWindow {
             on_deactivate: RefCell::new(None),
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
+            surrogate: Cell::new(0),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -221,17 +243,19 @@ impl GfWindow {
         d.moved = true;
         self.drag.set(Some(d));
         if d.resize {
-            let min = (TILE_MIN * self.scale.get()) as i32;
-            let w = (d.rect.right - d.rect.left + dx).max(min);
-            let h = (d.rect.bottom - d.rect.top + dy).max(min);
+            let (w, h) = snap_size(d.rect.right - d.rect.left + dx, d.rect.bottom - d.rect.top + dy, self.scale.get());
             self.resize_physical(w as u32, h as u32);
         } else {
+            let (mut x, mut y) = (d.rect.left + dx, d.rect.top + dy);
+            if self.kind.get() == Kind::Tile {
+                (x, y) = snap_pos(x, y, self.scale.get());
+            }
             unsafe {
                 let _ = SetWindowPos(
                     self.hwnd.get(),
                     None,
-                    d.rect.left + dx,
-                    d.rect.top + dy,
+                    x,
+                    y,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -416,6 +440,26 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
     }
 }
 
+/// Virtual key -> Slint key (keys that have no text of their own, or Slint wants as key codes).
+fn key_of(vk: u16) -> Option<Key> {
+    Some(match VIRTUAL_KEY(vk) {
+        VK_ESCAPE => Key::Escape,
+        VK_RETURN => Key::Return,
+        VK_BACK => Key::Backspace,
+        VK_DELETE => Key::Delete,
+        VK_TAB => Key::Tab,
+        VK_LEFT => Key::LeftArrow,
+        VK_RIGHT => Key::RightArrow,
+        VK_UP => Key::UpArrow,
+        VK_DOWN => Key::DownArrow,
+        VK_HOME => Key::Home,
+        VK_END => Key::End,
+        VK_SHIFT => Key::Shift,
+        VK_CONTROL => Key::Control,
+        _ => return None,
+    })
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let Some(g) = lookup(hwnd) else { return DefWindowProcW(hwnd, msg, wp, lp) };
     let btn = |m: u32| match m {
@@ -486,10 +530,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
             return LRESULT(0);
         }
-        WM_KEYDOWN if wp.0 as u16 == VK_ESCAPE.0 => {
-            let t: slint::SharedString = Key::Escape.into();
-            g.window.dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
-            g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
+        // Keys: special keys from WM_KEYDOWN/UP, typed text from WM_CHAR (TranslateMessage).
+        WM_KEYDOWN | WM_KEYUP => {
+            let down = msg == WM_KEYDOWN;
+            let text: Option<slint::SharedString> = match key_of(wp.0 as u16) {
+                Some(k) => Some(k.into()),
+                // Ctrl+letter: WM_CHAR gives a control char, Slint shortcuts want the letter
+                None if (b'A' as u16..=b'Z' as u16).contains(&(wp.0 as u16)) && GetKeyState(VK_CONTROL.0 as i32) < 0 => {
+                    Some(((wp.0 as u8) as char).to_ascii_lowercase().to_string().into())
+                }
+                None => None,
+            };
+            if let Some(t) = text {
+                g.window.dispatch_event(if down { WindowEvent::KeyPressed { text: t } } else { WindowEvent::KeyReleased { text: t } });
+                return LRESULT(0);
+            }
+        }
+        WM_CHAR => {
+            let u = wp.0 as u16;
+            if (0xD800..0xDC00).contains(&u) {
+                g.surrogate.set(u); // high half, wait for low half
+                return LRESULT(0);
+            }
+            let hi = g.surrogate.replace(0);
+            let units: Vec<u16> = if (0xDC00..0xE000).contains(&u) && hi != 0 { vec![hi, u] } else { vec![u] };
+            let s = String::from_utf16_lossy(&units);
+            // control chars (Enter, Backspace, Esc, Ctrl+x) already came as keys
+            if !s.chars().any(|c| c.is_control()) {
+                let t: slint::SharedString = s.into();
+                g.window.dispatch_event(WindowEvent::KeyPressed { text: t.clone() });
+                g.window.dispatch_event(WindowEvent::KeyReleased { text: t });
+            }
             return LRESULT(0);
         }
         WM_CAPTURECHANGED => g.drag.set(None),

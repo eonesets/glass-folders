@@ -3,7 +3,7 @@
 
 # glass-folders — STATUS
 Updated: 2026-11-22
-Progress: 35%
+Progress: 40%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -26,6 +26,9 @@ Progress: 35%
   - Panel header: Windows-style red X (closes folder) + gear menu (labels toggle, glass level, quit app).
   - Panel draggable by header. Tiles: drag to move, bottom-right grip to resize, icon grid adapts;
     rect saved per folder in .glassfolder.json "tile". App settings: %APPDATA%/glass-folders/settings.json.
+
+- v0.3 (T1, T2): tiles resize/move snap to icon-cell grid; panel top strip (DWM caption band) removed.
+- v0.3 (T3): drag shortcuts in panel between groups / to new group (real fs move), inline group rename (new group + double-click title), keyboard text input in panel.
 
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

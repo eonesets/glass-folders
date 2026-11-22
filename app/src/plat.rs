@@ -63,6 +63,8 @@ impl TargetPixel for Bgra {
 pub enum Kind {
     Panel,
     Tile,
+    /// name hint near the cursor: topmost, no focus, clicks go through
+    Hint,
 }
 
 struct Dib {
@@ -89,14 +91,21 @@ pub struct GfWindow {
     renderer: SoftwareRenderer,
     hwnd: Cell<HWND>,
     size: Cell<PhysicalSize>,
-    scale: Cell<f32>,
+    scale: Cell<f32>, // = dpi * zoom
+    dpi: Cell<f32>,
+    zoom: Cell<f32>, // icon size setting
     kind: Cell<Kind>,
+    pinned: Cell<bool>, // panel pinned on the desktop: bottom z-order, glass stays live
     tracking: Cell<bool>,
     dib: RefCell<Option<Dib>>,
     on_deactivate: RefCell<Option<Rc<dyn Fn()>>>,
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
     surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
+    /// Animation: window shows only part of its content. (home = where content's top-left is on screen,
+    /// shown rect). Slint keeps its full size; paint + mouse are offset.
+    view: Cell<Option<(POINT, RECT)>>,
+    glide: RefCell<Option<slint::Timer>>,
 }
 
 /// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
@@ -117,11 +126,34 @@ const PAD_W: f32 = 12.0; // tile width  = cols * CELL_W + PAD_W
 const PAD_H: f32 = 30.0; // tile height = rows * CELL_H + PAD_H (name strip)
 const MIN_CELLS: i32 = 2;
 
+/// Tile row pitch + vertical padding: with name strip (42, 30), or without (48, 12 = square cells, even edges).
+fn tile_v() -> (f32, f32) {
+    if TILE_NAMED.with(|v| v.get()) { (CELL_H, PAD_H) } else { (CELL_W, PAD_W) }
+}
+
+/// Tile size in cells (cols, rows) for a size in physical px, min 2x2.
+pub fn tile_cells(w: i32, h: i32, s: f32) -> (i32, i32) {
+    let (ch, ph) = tile_v();
+    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
+    let rows = (((h as f32 / s - ph) / ch).round() as i32).max(MIN_CELLS);
+    (cols, rows)
+}
+
+/// Physical px size of a tile of cols x rows cells.
+pub fn tile_size(cols: i32, rows: i32, s: f32) -> (i32, i32) {
+    let (ch, ph) = tile_v();
+    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * ch + ph) * s).round() as i32)
+}
+
 /// Snap a tile size (physical px) to whole cells, min 2x2.
 pub fn snap_size(w: i32, h: i32, s: f32) -> (i32, i32) {
-    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
-    let rows = (((h as f32 / s - PAD_H) / CELL_H).round() as i32).max(MIN_CELLS);
-    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * CELL_H + PAD_H) * s).round() as i32)
+    let (c, r) = tile_cells(w, h, s);
+    tile_size(c, r, s)
+}
+
+/// Tiles show the folder name (taller cells) or not (square cells).
+pub fn set_tile_named(on: bool) {
+    TILE_NAMED.with(|v| v.set(on));
 }
 
 /// Snap a tile position (physical px) to the desktop grid: cell pitch, origin = work area corner.
@@ -131,8 +163,12 @@ pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
     (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
 }
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
+const GLIDE_MS: f32 = 130.0; // tile settles onto the grid after release
 
 thread_local! {
+    /// Tiles land on the grid after a move (setting). Size always snaps to whole cells.
+    static SNAP: Cell<bool> = const { Cell::new(true) };
+    static TILE_NAMED: Cell<bool> = const { Cell::new(true) };
     static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
     static ALL: RefCell<Vec<Weak<GfWindow>>> = const { RefCell::new(Vec::new()) };
 }
@@ -157,8 +193,33 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
         let hwnd = g.hwnd.get();
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let n = if kind == Kind::Tile { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
+            let n = if kind != Kind::Panel { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
+        }
+    }
+}
+
+/// Icon size: window content zoom on top of DPI. Slint sees it as the scale factor.
+pub fn set_zoom(window: &slint::Window, zoom: f32) {
+    if let Some(g) = find(window) {
+        g.zoom.set(zoom);
+        let s = g.dpi.get() * zoom;
+        g.scale.set(s);
+        g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: s });
+    }
+}
+
+/// Pinned panel: lives on the desktop like a tile (bottom z-order, live glass when not focused),
+/// still takes focus when clicked (rename, keys).
+pub fn set_pinned(window: &slint::Window, on: bool) {
+    let Some(g) = find(window) else { return };
+    g.pinned.set(on);
+    if on {
+        let hwnd = g.hwnd.get();
+        unsafe {
+            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+            let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -181,6 +242,60 @@ pub fn start_move(window: &slint::Window) {
     g.drag.set(Some(d));
 }
 
+pub fn set_snap(on: bool) {
+    SNAP.with(|s| s.set(on));
+}
+
+/// Animation frame: window shows `shown` (screen rect) of its content, whose top-left sits at `home`.
+/// None = normal (window = content at home). Content size is untouched (no relayout per frame).
+pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
+    let Some(g) = find(window) else { return };
+    let was = g.view.replace(v);
+    let hwnd = g.hwnd.get();
+    let (x, y, w, h) = match (v, was) {
+        (Some((_, r)), _) => (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)),
+        (None, Some((home, _))) => {
+            let PhysicalSize { width, height } = g.size.get();
+            (home.x, home.y, width as i32, height as i32)
+        }
+        (None, None) => return,
+    };
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = UpdateWindow(hwnd); // paint now: no frame with stale content
+    }
+}
+
+/// Where the content's top-left is while an animation frame is shown.
+pub fn view_home(window: &slint::Window) -> Option<POINT> {
+    find(window)?.view.get().map(|(h, _)| h)
+}
+
+/// Screen rect of a window (physical px).
+/// Cursor in window content coords (logical px). Drags use this: a pointer position relative to
+/// an element that itself moves with the drag drifts.
+pub fn cursor_logical(window: &slint::Window) -> Option<(f32, f32)> {
+    let g = find(window)?;
+    let mut c = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut c);
+        let _ = ScreenToClient(g.hwnd.get(), &mut c);
+    }
+    let (ox, oy) = g.offset();
+    let s = g.scale.get();
+    Some(((c.x + ox) as f32 / s, (c.y + oy) as f32 / s))
+}
+
+pub fn rect_of(window: &slint::Window) -> Option<RECT> {
+    let g = find(window)?;
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(g.hwnd.get(), &mut r);
+    }
+    Some(r)
+}
+
 pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
     if let Some(g) = find(window) {
         *g.on_deactivate.borrow_mut() = Some(Rc::new(f));
@@ -198,13 +313,18 @@ impl GfWindow {
             hwnd: Cell::new(hwnd),
             size: Cell::new(PhysicalSize::new(1, 1)),
             scale: Cell::new(scale),
+            dpi: Cell::new(scale),
+            zoom: Cell::new(1.0),
             kind: Cell::new(Kind::Panel),
+            pinned: Cell::new(false),
             tracking: Cell::new(false),
             dib: RefCell::new(None),
             on_deactivate: RefCell::new(None),
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
             surrogate: Cell::new(0),
+            view: Cell::new(None),
+            glide: RefCell::new(None),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -220,7 +340,52 @@ impl GfWindow {
         let x = (lp.0 & 0xffff) as i16 as f32;
         let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
         let s = self.scale.get();
-        LogicalPosition::new(x / s, y / s)
+        let (ox, oy) = self.offset();
+        LogicalPosition::new((x + ox as f32) / s, (y + oy as f32) / s)
+    }
+
+    /// Content px hidden left/above the shown part (animation), else 0.
+    fn offset(&self) -> (i32, i32) {
+        match self.view.get() {
+            Some((home, r)) => (r.left - home.x, r.top - home.y),
+            None => (0, 0),
+        }
+    }
+
+    /// Ease the window to rect `to` (screen px), then report the final rect (tile settles onto grid).
+    fn glide_to(self: &Rc<Self>, to: RECT) {
+        let mut from = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd.get(), &mut from);
+        }
+        let start = Instant::now();
+        let weak = Rc::downgrade(self);
+        let t = slint::Timer::default();
+        t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+            let Some(g) = weak.upgrade() else { return };
+            if g.glide.borrow().is_none() {
+                return; // finished
+            }
+            let k = (start.elapsed().as_secs_f32() * 1000.0 / GLIDE_MS).min(1.0);
+            let e = 1.0 - (1.0 - k).powi(3); // ease-out cubic
+            let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
+            let (x, y) = (mix(from.left, to.left), mix(from.top, to.top));
+            let (w, h) = (mix(from.right - from.left, to.right - to.left), mix(from.bottom - from.top, to.bottom - to.top));
+            unsafe {
+                let _ = SetWindowPos(g.hwnd.get(), None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            g.resize_physical(w as u32, h as u32);
+            if k >= 1.0 {
+                // stop: drop the timer later (we are inside its callback)
+                if let Some(t) = g.glide.borrow_mut().take() {
+                    slint::Timer::single_shot(Duration::ZERO, move || drop(t));
+                }
+                if let Some(f) = g.on_moved.borrow().clone() {
+                    f(to);
+                }
+            }
+        });
+        *self.glide.borrow_mut() = Some(t);
     }
 
     fn in_grip(&self, p: LogicalPosition) -> bool {
@@ -243,13 +408,14 @@ impl GfWindow {
         d.moved = true;
         self.drag.set(Some(d));
         if d.resize {
-            let (w, h) = snap_size(d.rect.right - d.rect.left + dx, d.rect.bottom - d.rect.top + dy, self.scale.get());
+            // follows the cursor smoothly; whole cells on release (glide). Not below 2x2 cells.
+            let (mw, mh) = snap_size(0, 0, self.scale.get());
+            let w = (d.rect.right - d.rect.left + dx).max(mw);
+            let h = (d.rect.bottom - d.rect.top + dy).max(mh);
             self.resize_physical(w as u32, h as u32);
         } else {
-            let (mut x, mut y) = (d.rect.left + dx, d.rect.top + dy);
-            if self.kind.get() == Kind::Tile {
-                (x, y) = snap_pos(x, y, self.scale.get());
-            }
+            // free move under the cursor; grid (if on) only on release
+            let (x, y) = (d.rect.left + dx, d.rect.top + dy);
             unsafe {
                 let _ = SetWindowPos(
                     self.hwnd.get(),
@@ -270,16 +436,10 @@ impl GfWindow {
             return;
         }
         self.size.set(PhysicalSize::new(w, h));
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd.get(),
-                None,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+        if self.view.get().is_none() {
+            unsafe {
+                let _ = SetWindowPos(self.hwnd.get(), None, 0, 0, w as i32, h as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         let s = self.scale.get();
         self.window.dispatch_event(WindowEvent::Resized { size: LogicalSize::new(w as f32 / s, h as f32 / s) });
@@ -310,7 +470,8 @@ impl GfWindow {
             let hdc = BeginPaint(hwnd, &mut ps);
             if self.draw(hdc) {
                 if let Some(d) = self.dib.borrow().as_ref() {
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), 0, 0, SRCCOPY);
+                    let (ox, oy) = self.offset();
+                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
                 }
             }
             let _ = EndPaint(hwnd, &ps);
@@ -352,7 +513,13 @@ impl WindowAdapter for GfWindow {
         let hwnd = self.hwnd.get();
         unsafe {
             if visible {
-                let tile = self.kind.get() == Kind::Tile;
+                if self.kind.get() == Kind::Hint {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                    return Ok(());
+                }
+                let tile = self.kind.get() == Kind::Tile || self.pinned.get();
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
                     let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -391,8 +558,8 @@ impl WindowAdapter for GfWindow {
         }
     }
     fn update_window_properties(&self, properties: WindowProperties<'_>) {
-        if self.kind.get() == Kind::Tile {
-            return; // tile size is set from Rust (saved per folder, user can resize)
+        if self.kind.get() != Kind::Panel {
+            return; // tile / hint size is set from Rust (tile: saved per folder, user can resize)
         }
         // Our components have fixed width/height -> use preferred size.
         let c = properties.layout_constraints();
@@ -406,6 +573,7 @@ impl WindowAdapter for GfWindow {
 // ---------- native window + message handling ----------
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_TILES_DOWN: u32 = WM_APP + 7; // put tiles under pinned panels
 const CLASS: PCWSTR = w!("GlassFoldersWnd");
 
 fn create_hwnd() -> Result<HWND, PlatformError> {
@@ -498,6 +666,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             SetCapture(hwnd);
             if msg == WM_LBUTTONDOWN && g.kind.get() == Kind::Tile {
+                g.glide.borrow_mut().take();
                 let mut d = Drag { resize: g.in_grip(g.logical(lp)), cursor: POINT::default(), rect: RECT::default(), moved: false };
                 let _ = GetCursorPos(&mut d.cursor);
                 let _ = GetWindowRect(hwnd, &mut d.rect);
@@ -520,7 +689,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         });
                         let mut r = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut r);
-                        if let Some(f) = g.on_moved.borrow().clone() {
+                        if g.kind.get() == Kind::Tile {
+                            // land: size on whole cells, place on grid (setting) -> short glide there
+                            let s = g.scale.get();
+                            let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
+                            let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
+                            g.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
+                        } else if let Some(f) = g.on_moved.borrow().clone() {
                             f(r);
                         }
                         return LRESULT(0);
@@ -574,10 +749,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(1);
             }
         }
-        WM_MOUSEACTIVATE if g.kind.get() == Kind::Tile => return LRESULT(MA_NOACTIVATE as isize),
-        // Tile: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
+        WM_MOUSEACTIVATE if g.kind.get() != Kind::Panel => return LRESULT(MA_NOACTIVATE as isize),
+        // Tile / hint / pinned panel: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
         // lParam -1: DefWindowProc skips NC repaint. Focus/foreground untouched.
-        WM_NCACTIVATE if g.kind.get() == Kind::Tile => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
+        WM_NCACTIVATE if g.kind.get() != Kind::Panel || g.pinned.get() => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));
@@ -587,17 +762,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
         }
-        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile => {
+        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile || g.pinned.get() => {
+            // keep tiles + pinned panels at the bottom whenever z-order changes; plain moves (drag) stay cheap
             let pos = &mut *(lp.0 as *mut WINDOWPOS);
-            pos.hwndInsertAfter = HWND_BOTTOM;
-            pos.flags &= !SWP_NOZORDER;
+            if (pos.flags & SWP_NOZORDER).0 == 0 {
+                pos.hwndInsertAfter = HWND_BOTTOM;
+                if g.pinned.get() {
+                    // pinned panel went to the bottom: tiles go under it again (after this change lands)
+                    let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+        WM_TILES_DOWN => {
+            for t in ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()) {
+                if t.kind.get() == Kind::Tile && IsWindowVisible(t.hwnd.get()).as_bool() {
+                    let _ = SetWindowPos(t.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+            return LRESULT(0);
         }
         WM_DPICHANGED => {
-            let scale = (wp.0 & 0xffff) as f32 / 96.0;
+            let dpi = (wp.0 & 0xffff) as f32 / 96.0;
+            g.dpi.set(dpi);
+            let scale = dpi * g.zoom.get();
             g.scale.set(scale);
             g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
         }
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        WM_NCHITTEST if g.kind.get() == Kind::Hint => return LRESULT(-1), // HTTRANSPARENT: mouse goes to the window below
         WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
         WM_CLOSE => return LRESULT(0),
         _ => {}

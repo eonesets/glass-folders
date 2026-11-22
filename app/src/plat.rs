@@ -121,11 +121,34 @@ const PAD_W: f32 = 12.0; // tile width  = cols * CELL_W + PAD_W
 const PAD_H: f32 = 30.0; // tile height = rows * CELL_H + PAD_H (name strip)
 const MIN_CELLS: i32 = 2;
 
+/// Tile row pitch + vertical padding: with name strip (42, 30), or without (48, 12 = square cells, even edges).
+fn tile_v() -> (f32, f32) {
+    if TILE_NAMED.with(|v| v.get()) { (CELL_H, PAD_H) } else { (CELL_W, PAD_W) }
+}
+
+/// Tile size in cells (cols, rows) for a size in physical px, min 2x2.
+pub fn tile_cells(w: i32, h: i32, s: f32) -> (i32, i32) {
+    let (ch, ph) = tile_v();
+    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
+    let rows = (((h as f32 / s - ph) / ch).round() as i32).max(MIN_CELLS);
+    (cols, rows)
+}
+
+/// Physical px size of a tile of cols x rows cells.
+pub fn tile_size(cols: i32, rows: i32, s: f32) -> (i32, i32) {
+    let (ch, ph) = tile_v();
+    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * ch + ph) * s).round() as i32)
+}
+
 /// Snap a tile size (physical px) to whole cells, min 2x2.
 pub fn snap_size(w: i32, h: i32, s: f32) -> (i32, i32) {
-    let cols = (((w as f32 / s - PAD_W) / CELL_W).round() as i32).max(MIN_CELLS);
-    let rows = (((h as f32 / s - PAD_H) / CELL_H).round() as i32).max(MIN_CELLS);
-    (((cols as f32 * CELL_W + PAD_W) * s).round() as i32, ((rows as f32 * CELL_H + PAD_H) * s).round() as i32)
+    let (c, r) = tile_cells(w, h, s);
+    tile_size(c, r, s)
+}
+
+/// Tiles show the folder name (taller cells) or not (square cells).
+pub fn set_tile_named(on: bool) {
+    TILE_NAMED.with(|v| v.set(on));
 }
 
 /// Snap a tile position (physical px) to the desktop grid: cell pitch, origin = work area corner.
@@ -140,6 +163,7 @@ const GLIDE_MS: f32 = 130.0; // tile settles onto the grid after release
 thread_local! {
     /// Tiles land on the grid after a move (setting). Size always snaps to whole cells.
     static SNAP: Cell<bool> = const { Cell::new(true) };
+    static TILE_NAMED: Cell<bool> = const { Cell::new(true) };
     static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
     static ALL: RefCell<Vec<Weak<GfWindow>>> = const { RefCell::new(Vec::new()) };
 }

@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.5: красивая страница настроек (подписи, названия групп, цветные метки, притяжение групп, стекло, плитки по сетке), окно папки вырастает из плитки, плитки двигаются плавно, на столе снова работают выделение и обычные ярлыки (прячутся только папки с плитками).
+Кратко: приложение «стеклянные папки» для рабочего стола. v0.6: настройки разделены на «Папка» и «Группы внутри», плитка без подписи становится ровной (квадратные клетки), группы без заголовка облегают ярлыки, «+N» раскрывает группу на месте, группы в окне двигаются плавно за курсором.
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-22 (v0.5)
-Progress: 65%
+Updated: 2026-11-22 (v0.6)
+Progress: 70%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -55,6 +55,17 @@ Progress: 65%
     placed centered on the tile. plat::set_view = show part of content without relayout.
   - Tiles: free move/resize under cursor, on release short glide to whole cells (+ grid if "по сетке" on).
     Tile z-order forced only on real z changes (cheaper drag).
+
+- v0.6 (2026-11-22):
+  - Settings split: "Папка" (name in panel header = ptitle, name under tile = tnames, snap) / "Группы внутри"
+    (names, dots, labels, gravity on own line -> no overlap on narrowest panel) / glass. SwitchRow component.
+  - Tile without name: square cells (row pitch 48, pad 12; plat::tile_v). Toggle keeps cell count, resizes tiles.
+  - Groups without title+dot: no header row (model::set_header -> GRect h = 2r), plate hugs slots.
+    Plate edges (6 px strips, move cursor) = drag handles, always (only ones without header).
+  - "+N" click unfolds the group in place (all items + "свернуть" slot, wider if > 6 rows), others make room;
+    panel kept inside work area (fit_panel). Folded again by the slot or on close.
+  - Group move/resize: plate follows cursor freely (lift-x/y/w/h), glides onto the grid on release.
+    render() updates rows of the existing model -> plates animate instead of jumping.
 
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

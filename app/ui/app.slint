@@ -22,6 +22,7 @@ export struct GroupData {
     cols: int, // size in slots
     rows: int,
     n: int, // item count (all items are in `items`; overflow shown as "+N")
+    open: bool, // unfolded by a click on "+N": all items + a "fold" slot at the end
     items: [SlotData],
 }
 
@@ -178,6 +179,40 @@ component Hairline inherits Rectangle {
     background: dark ? #0000004d : #0000000d;
 }
 
+// Card row: label (+ hint) and a switch on the right; `line` = hairline above it.
+component SwitchRow inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in property <bool> on;
+    in property <bool> line;
+    in property <bool> dark;
+    in property <color> accent;
+    callback toggled;
+    if line: Hairline {
+        x: 14px;
+        y: 0;
+        width: parent.width - 28px;
+        dark: root.dark;
+    }
+    RowText {
+        x: 0;
+        y: 0;
+        width: parent.width - 64px;
+        height: parent.height;
+        label: root.label;
+        hint: root.hint;
+        dark: root.dark;
+    }
+    Switch {
+        x: parent.width - 54px;
+        y: (parent.height - self.height) / 2;
+        on: root.on;
+        dark: root.dark;
+        accent: root.accent;
+        toggled => { root.toggled(); }
+    }
+}
+
 component SectionTitle inherits Text {
     in property <bool> dark;
     height: 20px;
@@ -193,7 +228,7 @@ component Slot inherits Rectangle {
     in property <bool> labels;
     in property <bool> dark;
     in property <float> lifted: 1; // opacity: dragged item = faint placeholder / hidden
-    in property <int> more; // > 0: this slot shows "+N" instead of its icon
+    in property <int> more; // > 0: this slot shows "+N" instead of its icon; < 0: "fold back" slot
     callback clicked;
     callback drag-move(length, length);
     callback drag-end(length, length);
@@ -212,7 +247,7 @@ component Slot inherits Rectangle {
         x: 14px;
         y: labels ? 6px : 14px;
     }
-    if more > 0: Rectangle {
+    if more != 0: Rectangle {
         width: 48px;
         height: 48px;
         x: 14px;
@@ -220,15 +255,16 @@ component Slot inherits Rectangle {
         border-radius: 10px;
         background: dark ? #ffffff1a : #0000000f;
         Text {
-            text: "+" + more;
-            font-size: 16px;
+            text: more > 0 ? "+" + more : "\u{E70E}"; // chevron up = fold
+            font-family: more > 0 ? "" : "Segoe Fluent Icons";
+            font-size: more > 0 ? 16px : 14px;
             font-weight: 600;
             color: dark ? #ffffff : #1b1b1b;
         }
     }
     Text {
         visible: labels;
-        text: more > 0 ? "ещё" : d.name;
+        text: more > 0 ? "ещё" : more < 0 ? "свернуть" : d.name;
         x: 3px;
         y: 57px;
         width: parent.width - 6px;
@@ -240,7 +276,7 @@ component Slot inherits Rectangle {
     }
     ta := TouchArea {
         moved => {
-            if (!dragging && more == 0
+            if (!dragging && more == 0 && d.id >= 0
                 && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
                 dragging = true;
             }
@@ -266,6 +302,35 @@ component Slot inherits Rectangle {
     }
 }
 
+// Drag handle of a group plate (edge strip): press + move > 5px = move the group.
+// Points are in plate coords.
+component Grip inherits TouchArea {
+    callback lifted();
+    callback go(length, length);
+    callback done(length, length);
+    callback cancel();
+    property <bool> moving;
+    mouse-cursor: move;
+    moved => {
+        if (!moving && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
+            moving = true;
+            root.lifted();
+        }
+        if (moving) {
+            root.go(self.x + self.mouse-x, self.y + self.mouse-y);
+        }
+    }
+    pointer-event(e) => {
+        if (moving && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+            moving = false;
+            root.done(self.x + self.mouse-x, self.y + self.mouse-y);
+        } else if (moving && e.kind == PointerEventKind.cancel) {
+            moving = false;
+            root.cancel();
+        }
+    }
+}
+
 export component Panel inherits Window {
     no-frame: true;
     background: transparent;
@@ -286,11 +351,13 @@ export component Panel inherits Window {
     in property <int> glass: 1; // 0 dense .. 2 clear
     in property <int> gravity: 1; // 0 none, 1 top-left, 2 top-right
     in property <bool> snap: true;
+    in property <bool> ptitle: true; // folder name + dot in the header
+    in property <bool> tnames: true; // folder name under desktop tiles
     in property <float> reveal: 1; // open / close animation: content fade (Rust drives it)
     in-out property <int> page: 0; // 0 = folder, 1 = settings
 
     callback launch(int);
-    callback open-group(int);
+    callback open-group(int); // "+N" / fold slot: unfold the group / fold it back
     callback pick-color(int, color);
     callback clear-color(int);
     callback close-panel();
@@ -321,11 +388,16 @@ export component Panel inherits Window {
     property <image> drag-icon;
     property <length> drag-x; // cursor, panel coords
     property <length> drag-y;
+    // moved / resized group follows the cursor freely (grid px, from Rust); lands on the grid on release
+    in-out property <length> lift-x;
+    in-out property <length> lift-y;
+    in-out property <length> lift-w;
+    in-out property <length> lift-h;
 
     property <length> pad: 16px;
     property <length> top: 48px;
-    // group header: title and/or dot -> 30px; none -> slots centered (21 + 21 around them; main.rs App::head)
-    property <length> head: names || dots ? 30px : 21px;
+    // group header: title and/or dot -> 30px; none -> plate hugs its slots (main.rs App::head, model::set_header)
+    property <length> head: names || dots ? 30px : 0px;
     property <int> pick-target: -1;
     property <length> pick-x;
     property <length> pick-y;
@@ -335,7 +407,7 @@ export component Panel inherits Window {
     property <color> accent: dark ? #60cdff : #005fb8;
     // settings page needs room: panel grows while it is shown
     out property <length> min-w: page == 1 ? 372px : 0px;
-    property <length> settings-h: 506px;
+    property <length> settings-h: 634px;
 
     width: max(grid-w + 2 * pad, min-w);
     height: page == 1 ? max(grid-h + top + pad, settings-h) : grid-h + top + pad;
@@ -347,6 +419,15 @@ export component Panel inherits Window {
 
     public function focus-keys() {
         fs.focus();
+    }
+
+    // group starts moving / resizing: drawn from where it is now
+    function lift-group(g: GroupData) {
+        lift-x = g.x;
+        lift-y = g.y;
+        lift-w = g.w;
+        lift-h = g.h;
+        gdrag = g.idx;
     }
 
     function pick-for(idx: int, x: length, y: length) {
@@ -394,7 +475,7 @@ export component Panel inherits Window {
             }
         }
 
-        if page == 0: Dot {
+        if page == 0 && ptitle: Dot {
             x: pad + 2px;
             y: 17px;
             c: folder-tint;
@@ -412,6 +493,7 @@ export component Panel inherits Window {
             clicked => { page = 0; }
         }
         Text {
+            visible: page == 1 || ptitle;
             x: page == 0 ? pad + 26px : 50px;
             y: 12px;
             height: 24px;
@@ -476,11 +558,12 @@ export component Panel inherits Window {
                 property <int> n-eff: g.n - (src && !hot ? 1 : 0) + (hot && !src ? 1 : 0);
                 property <int> cap: g.cols * g.rows;
                 property <bool> lifting: root.gdrag == g.idx;
-                x: pad + g.x;
-                y: top + g.y;
-                width: g.w;
-                height: g.h;
-                animate x, y, width, height { duration: 160ms; easing: ease-out; }
+                x: pad + (lifting ? root.lift-x : g.x);
+                y: top + (lifting ? root.lift-y : g.y);
+                width: lifting ? root.lift-w : g.w;
+                height: lifting ? root.lift-h : g.h;
+                // under the cursor: no lag; else (others making room, landing after release): glide
+                animate x, y, width, height { duration: lifting ? 0ms : 170ms; easing: ease-out; }
                 border-radius: 8px;
                 background: hot ? accent.with-alpha(0.2) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
                 border-width: hot || lifting ? 2px : 1px;
@@ -535,7 +618,7 @@ export component Panel inherits Window {
                     moved => {
                         if (!moving && (abs(self.mouse-x - self.pressed-x) > 5px || abs(self.mouse-y - self.pressed-y) > 5px)) {
                             moving = true;
-                            root.gdrag = g.idx;
+                            root.lift-group(g);
                         }
                         if (moving) {
                             root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, false);
@@ -614,7 +697,7 @@ export component Panel inherits Window {
                     lifted: me ? (hot ? 0.3 : 0) : 1;
                     clicked => {
                         if (self.more > 0) {
-                            root.open-group(g.idx);
+                            root.open-group(g.idx); // unfold in place
                         } else {
                             root.launch(s.id);
                         }
@@ -643,6 +726,75 @@ export component Panel inherits Window {
                         root.drag-cancel();
                     }
                 }
+                // unfolded group: last slot folds it back
+                if g.open: Slot {
+                    property <int> e: n-eff;
+                    x: mod(e, g.cols) * 84px;
+                    y: root.head + floor(e / g.cols) * 84px;
+                    animate x, y { duration: 160ms; easing: ease-out; }
+                    d: { name: "", id: -1, k: -1 };
+                    more: -1;
+                    labels: root.labels;
+                    dark: root.dark;
+                    clicked => { root.open-group(g.idx); }
+                }
+                // plate edges = drag handles too (the only ones when there is no header)
+                Grip {
+                    x: 0; y: 0; width: 6px; height: parent.height;
+                    enabled: root.drag-id < 0;
+                    lifted => { root.lift-group(g); }
+                    go(px, py) => { root.group-drag(g.idx, gr.x + px - pad, gr.y + py - top, false); }
+                    done(px, py) => {
+                        root.gdrag = -1;
+                        root.group-drop(g.idx, gr.x + px - pad, gr.y + py - top, false);
+                    }
+                    cancel => {
+                        root.gdrag = -1;
+                        root.drag-cancel();
+                    }
+                }
+                Grip {
+                    x: parent.width - 6px; y: 0; width: 6px; height: parent.height;
+                    enabled: root.drag-id < 0;
+                    lifted => { root.lift-group(g); }
+                    go(px, py) => { root.group-drag(g.idx, gr.x + px - pad, gr.y + py - top, false); }
+                    done(px, py) => {
+                        root.gdrag = -1;
+                        root.group-drop(g.idx, gr.x + px - pad, gr.y + py - top, false);
+                    }
+                    cancel => {
+                        root.gdrag = -1;
+                        root.drag-cancel();
+                    }
+                }
+                Grip {
+                    x: 0; y: parent.height - 6px; width: parent.width; height: 6px;
+                    enabled: root.drag-id < 0;
+                    lifted => { root.lift-group(g); }
+                    go(px, py) => { root.group-drag(g.idx, gr.x + px - pad, gr.y + py - top, false); }
+                    done(px, py) => {
+                        root.gdrag = -1;
+                        root.group-drop(g.idx, gr.x + px - pad, gr.y + py - top, false);
+                    }
+                    cancel => {
+                        root.gdrag = -1;
+                        root.drag-cancel();
+                    }
+                }
+                if root.head == 0: Grip {
+                    x: 0; y: 0; width: parent.width; height: 6px;
+                    enabled: root.drag-id < 0;
+                    lifted => { root.lift-group(g); }
+                    go(px, py) => { root.group-drag(g.idx, gr.x + px - pad, gr.y + py - top, false); }
+                    done(px, py) => {
+                        root.gdrag = -1;
+                        root.group-drop(g.idx, gr.x + px - pad, gr.y + py - top, false);
+                    }
+                    cancel => {
+                        root.gdrag = -1;
+                        root.drag-cancel();
+                    }
+                }
                 // resize grip (bottom-right): drag = change size in whole slots
                 TouchArea {
                     x: parent.width - 18px;
@@ -653,7 +805,7 @@ export component Panel inherits Window {
                     moved => {
                         if (self.pressed) {
                             sizing = true;
-                            root.gdrag = g.idx;
+                            root.lift-group(g);
                             root.group-drag(g.idx, gr.x + self.x + self.mouse-x - pad, gr.y + self.y + self.mouse-y - top, true);
                         }
                     }
@@ -695,6 +847,7 @@ export component Panel inherits Window {
         }
 
         // ---------- settings page ----------
+        // two blocks: the folder itself (window header + desktop tile) and the groups inside it
         if page == 1: Rectangle {
             property <length> cw: parent.width - 2 * pad; // card width
             opacity: 0;
@@ -704,85 +857,106 @@ export component Panel inherits Window {
             SectionTitle {
                 x: pad + 2px;
                 y: top;
-                text: "Окно папки";
+                text: "Папка";
                 dark: root.dark;
             }
             Card {
                 x: pad;
                 y: top + 24px;
                 width: cw;
-                height: 3 * 44px + 52px;
+                height: 44px + 52px + 52px;
                 dark: root.dark;
-                RowText {
+                SwitchRow {
                     y: 0;
                     height: 44px;
-                    label: "Подписи под ярлыками";
+                    label: "Название в окне папки";
+                    on: root.ptitle;
                     dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("ptitle", root.ptitle ? 0 : 1); }
                 }
-                Switch {
-                    x: parent.width - 54px;
-                    y: 12px;
+                SwitchRow {
+                    y: 44px;
+                    height: 52px;
+                    line: true;
+                    label: "Название под плиткой";
+                    hint: root.tnames ? "Подпись на рабочем столе" : "Плитка без подписи, ровная";
+                    on: root.tnames;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("tnames", root.tnames ? 0 : 1); }
+                }
+                SwitchRow {
+                    y: 96px;
+                    height: 52px;
+                    line: true;
+                    label: "Плитки по сетке";
+                    hint: root.snap ? "Встают ровно по клеткам" : "Стоят там, где отпустили";
+                    on: root.snap;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("snap", root.snap ? 0 : 1); }
+                }
+            }
+
+            SectionTitle {
+                x: pad + 2px;
+                y: top + 188px;
+                text: "Группы внутри";
+                dark: root.dark;
+            }
+            Card {
+                x: pad;
+                y: top + 212px;
+                width: cw;
+                height: 3 * 44px + 84px;
+                dark: root.dark;
+                SwitchRow {
+                    y: 0;
+                    height: 44px;
+                    label: "Названия групп";
+                    on: root.names;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("names", root.names ? 0 : 1); }
+                }
+                SwitchRow {
+                    y: 44px;
+                    height: 44px;
+                    line: true;
+                    label: "Цветные метки";
+                    on: root.dots;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("dots", root.dots ? 0 : 1); }
+                }
+                SwitchRow {
+                    y: 88px;
+                    height: 44px;
+                    line: true;
+                    label: "Подписи под ярлыками";
                     on: root.labels;
                     dark: root.dark;
                     accent: root.accent;
                     toggled => { root.set-opt("labels", root.labels ? 0 : 1); }
                 }
                 Hairline {
-                    y: 44px;
-                    x: 14px;
-                    width: parent.width - 28px;
-                    dark: root.dark;
-                }
-                RowText {
-                    y: 44px;
-                    height: 44px;
-                    label: "Названия групп";
-                    dark: root.dark;
-                }
-                Switch {
-                    x: parent.width - 54px;
-                    y: 44px + 12px;
-                    on: root.names;
-                    dark: root.dark;
-                    accent: root.accent;
-                    toggled => { root.set-opt("names", root.names ? 0 : 1); }
-                }
-                Hairline {
-                    y: 88px;
-                    x: 14px;
-                    width: parent.width - 28px;
-                    dark: root.dark;
-                }
-                RowText {
-                    y: 88px;
-                    height: 44px;
-                    label: "Цветные метки групп";
-                    dark: root.dark;
-                }
-                Switch {
-                    x: parent.width - 54px;
-                    y: 88px + 12px;
-                    on: root.dots;
-                    dark: root.dark;
-                    accent: root.accent;
-                    toggled => { root.set-opt("dots", root.dots ? 0 : 1); }
-                }
-                Hairline {
                     y: 132px;
                     x: 14px;
                     width: parent.width - 28px;
                     dark: root.dark;
                 }
+                // label on its own line, choice under it: fits the narrowest panel
                 RowText {
                     y: 132px;
-                    height: 52px;
-                    label: "Притяжение";
-                    hint: "Группы стягиваются в угол";
+                    height: 40px;
+                    label: "Притяжение групп к углу";
                     dark: root.dark;
                 }
                 Seg {
-                    x: parent.width - self.width - 12px;
-                    y: 132px + 12px;
+                    x: 12px;
+                    y: 132px + 40px;
+                    seg-w: (parent.width - 28px) / 3;
                     items: ["Нет", "Влево", "Вправо"];
                     sel: root.gravity;
                     dark: root.dark;
@@ -792,13 +966,13 @@ export component Panel inherits Window {
 
             SectionTitle {
                 x: pad + 2px;
-                y: top + 224px;
+                y: top + 444px;
                 text: "Стекло";
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 248px;
+                y: top + 468px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -813,39 +987,10 @@ export component Panel inherits Window {
                 }
             }
 
-            SectionTitle {
-                x: pad + 2px;
-                y: top + 316px;
-                text: "Рабочий стол";
-                dark: root.dark;
-            }
-            Card {
-                x: pad;
-                y: top + 340px;
-                width: cw;
-                height: 52px;
-                dark: root.dark;
-                RowText {
-                    y: 0;
-                    height: 52px;
-                    label: "Плитки по сетке";
-                    hint: snap ? "Встают ровно по клеткам" : "Стоят там, где отпустили";
-                    dark: root.dark;
-                }
-                Switch {
-                    x: parent.width - 54px;
-                    y: 16px;
-                    on: root.snap;
-                    dark: root.dark;
-                    accent: root.accent;
-                    toggled => { root.set-opt("snap", root.snap ? 0 : 1); }
-                }
-            }
-
             // quit: quiet text button, red only on hover
             qb := Rectangle {
                 x: pad;
-                y: top + 408px;
+                y: top + 536px;
                 width: 180px;
                 height: 34px;
                 border-radius: 6px;
@@ -933,12 +1078,15 @@ export component Tile inherits Window {
     in property <bool> dark; // set from Rust (Windows app theme)
     in property <image> backdrop; // fallback only (GF_FAKE_GLASS): frosted wallpaper copy
     in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
+    in property <bool> named: true; // name strip under icons; off = square cells, even edges
     callback open();
 
-    // size comes from Rust, snapped to whole cells (plat.rs: w = cols*48+12, h = rows*42+30); icon grid fills it
+    // size comes from Rust, snapped to whole cells (plat.rs tile_size: w = cols*48+12, h = rows*42+30 or rows*48+12)
     // floor: while a resize is dragged the size is free -> only whole cells that fit are shown
+    property <length> cell-h: named ? 42px : 48px;
+    property <length> pad-top: named ? 8px : 12px;
     property <int> cols: max(2, floor((root.width - 12px + 1px) / 48px));
-    property <int> rows: max(2, floor((root.height - 30px + 1px) / 42px));
+    property <int> rows: max(2, floor((root.height - (named ? 30px : 12px) + 1px) / cell-h));
     property <length> grid-x: (root.width - cols * 48px + 12px) / 2;
 
     Image {
@@ -964,9 +1112,9 @@ export component Tile inherits Window {
         width: 36px;
         height: 36px;
         x: grid-x + mod(i, cols) * 48px;
-        y: 8px + floor(i / cols) * 42px;
+        y: pad-top + floor(i / cols) * cell-h;
     }
-    Text {
+    if named: Text {
         x: 8px;
         y: parent.height - 21px;
         width: parent.width - 16px;

@@ -20,7 +20,6 @@ pub const PITCH: f32 = CELL + GAP; // one grid step, same inside and between gro
 // (extra half row = header 30 + bottom pad 12). So groups align on a free canvas.
 pub const ROW: f32 = PITCH / 2.0;
 pub const HEAD: f32 = 30.0; // group header (app.slint uses the same)
-pub const GPAD: f32 = 12.0; // bottom padding of group; HEAD + GPAD = ROW
 
 pub const LOOSE: &str = "Разное";
 const CFG: &str = ".glassfolder.json";
@@ -289,6 +288,10 @@ pub struct Settings {
     pub gravity: i32,
     /// desktop tiles land on the icon grid (else free place)
     pub snap: bool,
+    /// folder name + color dot in the panel header
+    pub ptitle: bool,
+    /// folder name under the desktop tile. Off: tile shrinks to square cells.
+    pub tnames: bool,
     /// folder icons parked away by a running app: path -> home spot [x, y] (screen px).
     /// Non-empty at start = last run was killed -> put them back.
     pub homes: BTreeMap<String, [i32; 2]>,
@@ -296,7 +299,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, homes: BTreeMap::new() }
+        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, ptitle: true, tnames: true, homes: BTreeMap::new() }
     }
 }
 
@@ -344,7 +347,22 @@ pub fn file_name(p: &Path) -> Option<String> {
 
 // ---------- layout: free grid of groups ----------
 
-/// Group rect on the panel grid. x, w in columns; y, h in half-rows (h = 2 * slot rows + 1).
+thread_local! {
+    /// Half-rows of group header: 1 (title / dot shown) or 0 (plain plate, hugs its slots).
+    static HDR: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// Groups have a header row (title or dot) or not. Changes GRect height for a slot count.
+pub fn set_header(on: bool) {
+    HDR.with(|h| h.set(i32::from(on)));
+}
+
+/// Header height of a group in px (with its bottom padding): ROW or 0.
+pub fn header_px() -> f32 {
+    HDR.with(|h| h.get()) as f32 * ROW
+}
+
+/// Group rect on the panel grid. x, w in columns; y, h in half-rows (h = 2 * slot rows + header).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct GRect {
     pub x: i32,
@@ -355,10 +373,10 @@ pub struct GRect {
 
 impl GRect {
     pub fn slots(w: i32, rows: i32, x: i32, y: i32) -> GRect {
-        GRect { x, y, w, h: 2 * rows + 1 }
+        GRect { x, y, w, h: 2 * rows + HDR.with(|h| h.get()) }
     }
     pub fn rows(&self) -> i32 {
-        (self.h - 1) / 2
+        (self.h - HDR.with(|h| h.get())) / 2
     }
     pub fn hits(&self, o: &GRect) -> bool {
         self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
-use model::{GRect, GAP, GPAD, HEAD, PITCH, ROW};
+use model::{GRect, GAP, HEAD, PITCH, ROW};
 use slint::{ComponentHandle, Image, Model, ModelRc, PhysicalPosition, PhysicalSize, VecModel};
 use windows::Win32::Foundation::{POINT, RECT};
 
@@ -53,19 +53,22 @@ struct App {
     ghost: Option<GRect>,
     target: Target,
     grab: Option<(f32, f32)>, // group move: cursor offset from group corner
+    lift: [f32; 4],           // moved / resized group as drawn under the cursor (grid px)
     groups: Option<Rc<VecModel<GroupData>>>,
     // open / close animation of the panel
     anim: Option<slint::Timer>,
     closing: bool,
+    // group unfolded by its "+N" slot (until folded back or panel closed)
+    unfolded: Option<usize>,
 }
 
 impl App {
-    /// Group header height in panel px. No title and no dot: slots centered in the plate.
+    /// Group header height in panel px. No title and no dot: plate hugs its slots.
     fn head(&self) -> f32 {
         if self.set.names || self.set.dots {
             HEAD
         } else {
-            (HEAD + GPAD) / 2.0
+            0.0
         }
     }
     fn tile_rect(&self, dir: &Path) -> Option<RECT> {
@@ -106,6 +109,8 @@ fn main() -> Result<(), slint::PlatformError> {
     panel.set_dark(dark);
     push_settings(&panel, &app.borrow().set);
     plat::set_snap(app.borrow().set.snap);
+    plat::set_tile_named(app.borrow().set.tnames);
+    model::set_header(app.borrow().set.names || app.borrow().set.dots);
     let pal: Vec<slint::Color> = model::PAL.iter().map(|h| model::color(h)).collect();
     panel.set_pal(ModelRc::new(VecModel::from(pal)));
 
@@ -124,13 +129,18 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_open_group(move |idx| {
-            let dir = a.borrow().folder.as_ref().and_then(|f| f.groups.get(idx as usize)).map(|g| g.dir.clone());
-            if let Some(dir) = dir {
-                win::open(&dir);
-            }
-            if let Some(p) = p.upgrade() {
-                close(&p, &a);
-            }
+            // deferred: the clicked slot belongs to the model that render() updates
+            let (a, p) = (a.clone(), p.clone());
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                let Some(p) = p.upgrade() else { return };
+                {
+                    let mut st = a.borrow_mut();
+                    let i = idx as usize;
+                    st.unfolded = if st.unfolded == Some(i) { None } else { Some(i) };
+                }
+                render(&p, &a);
+                fit_panel(&p);
+            });
         });
     }
     {
@@ -293,19 +303,24 @@ fn push_settings(panel: &Panel, set: &model::Settings) {
     panel.set_glass(set.glass);
     panel.set_gravity(set.gravity);
     panel.set_snap(set.snap);
+    panel.set_ptitle(set.ptitle);
+    panel.set_tnames(set.tnames);
 }
 
 /// One setting changed in the settings page.
 fn set_opt(panel: &Panel, app: &Shared, key: &str, v: i32) {
-    let (relayout, snap_now) = {
+    let (relayout, snap_now, retile) = {
         let mut st = app.borrow_mut();
         let on = v != 0;
         let mut relayout = false;
         let mut snap_now = false;
+        let mut retile = false;
         match key {
             "labels" => st.set.labels = on,
             "names" => (st.set.names, relayout) = (on, true),
             "dots" => (st.set.dots, relayout) = (on, true),
+            "ptitle" => st.set.ptitle = on,
+            "tnames" => (st.set.tnames, retile) = (on, true),
             "gravity" => (st.set.gravity, relayout) = (v.clamp(0, 2), true),
             "glass" => st.set.glass = v.clamp(0, 2),
             "snap" => (st.set.snap, snap_now) = (on, on),
@@ -314,11 +329,30 @@ fn set_opt(panel: &Panel, app: &Shared, key: &str, v: i32) {
         model::save_settings(&st.set);
         push_settings(panel, &st.set);
         plat::set_snap(st.set.snap);
+        model::set_header(st.set.names || st.set.dots);
         for (_, t) in &st.tiles {
             reblur(t, st.dark, st.set.glass);
         }
-        (relayout, snap_now)
+        (relayout, snap_now, retile)
     };
+    if retile {
+        // same cells, new cell shape: tile grows / shrinks by the name strip
+        let st = app.borrow();
+        let on = st.set.tnames;
+        for (d, t) in &st.tiles {
+            let Some(r) = plat::rect_of(t.window()) else { continue };
+            let s = t.window().scale_factor();
+            plat::set_tile_named(!on); // measure the old way
+            let (c, rows) = plat::tile_cells(r.right - r.left, r.bottom - r.top, s);
+            plat::set_tile_named(on);
+            let (w, h) = plat::tile_size(c, rows, s);
+            t.set_named(on);
+            t.window().set_size(PhysicalSize::new(w as u32, h as u32));
+            let mut cfg = model::load_cfg(d);
+            cfg.tile = Some([r.left, r.top, w, h]);
+            let _ = model::save_cfg(d, &cfg);
+        }
+    }
     if snap_now {
         // grid switched on: every tile onto the grid now
         let st = app.borrow();
@@ -374,6 +408,7 @@ fn make_tiles(
         let t = Tile::new()?;
         t.set_dark(dark);
         t.set_name(f.name.clone().into());
+        t.set_named(app.borrow().set.tnames);
         let (c, on) = model::tint(&f.tint());
         t.set_tint(c);
         t.set_colored(on);
@@ -530,15 +565,18 @@ fn item_drag(st: &mut App, id: i32, x: f32, y: f32, inside: bool) {
 /// Group header / grip dragged to grid point (x, y): move or resize it; others make room.
 fn group_drag(st: &mut App, idx: usize, x: f32, y: f32, resize: bool) {
     let Some(mut r) = st.base.get(idx).copied() else { return };
-    let [rx, ry, _, _] = r.px();
+    let [rx, ry, rw, rh] = r.px();
     if resize {
-        r.w = ((x - rx + GAP) / PITCH).round().max(1.0) as i32;
-        let rows = ((y - ry - HEAD - GPAD + GAP) / PITCH).round().max(1.0) as i32;
-        r.h = 2 * rows + 1;
+        let w = ((x - rx + GAP) / PITCH).round().max(1.0) as i32;
+        let rows = ((y - ry - model::header_px() + GAP) / PITCH).round().max(1.0) as i32;
+        r = GRect::slots(w, rows, r.x, r.y);
+        // plate follows the cursor, not smaller than one slot
+        st.lift = [rx, ry, (x - rx).max(model::CELL), (y - ry).max(model::CELL + model::header_px() - GAP)];
     } else {
         let (ox, oy) = *st.grab.get_or_insert((x - rx, y - ry));
         r.x = ((x - ox) / PITCH).round().max(0.0) as i32;
         r.y = ((y - oy) / ROW).round().max(0.0) as i32;
+        st.lift = [(x - ox).max(0.0), (y - oy).max(0.0), rw, rh];
     }
     let mut all = st.base.clone();
     all[idx] = r;
@@ -567,6 +605,11 @@ fn show_preview(panel: &Panel, st: &App, dragging: bool) {
     };
     panel.set_drop_target(t);
     panel.set_drop_index(k);
+    let [lx, ly, lw, lh] = st.lift;
+    panel.set_lift_x(lx);
+    panel.set_lift_y(ly);
+    panel.set_lift_w(lw);
+    panel.set_lift_h(lh);
     if let Some(g) = st.ghost {
         let [x, y, w, h] = g.px();
         panel.set_ghost_x(x);
@@ -785,7 +828,11 @@ fn set_color(panel: &Panel, app: &Shared, idx: i32, hx: Option<String>) {
 fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
     // a fold-back still running (click on another tile closed the panel): finish it now
     finish_close(panel, app);
-    app.borrow_mut().folder = Some(model::scan(dir));
+    {
+        let mut st = app.borrow_mut();
+        st.folder = Some(model::scan(dir));
+        st.unfolded = None;
+    }
     panel.set_page(0);
     render(panel, app);
     // size = same formula as Panel width/height in app.slint
@@ -894,6 +941,7 @@ fn finish_close(panel: &Panel, app: &Shared) {
     st.id_group.clear();
     st.base.clear();
     st.groups = None;
+    st.unfolded = None;
     reset_preview(&mut st);
     st.icons.clear(); // free icon memory while hidden
 }
@@ -904,7 +952,18 @@ fn render(panel: &Panel, app: &Shared) {
     let mut st = app.borrow_mut();
     let st = &mut *st;
     let Some(f) = st.folder.as_ref() else { return };
-    let rects = model::layout(f, st.set.gravity);
+    let mut rects = model::layout(f, st.set.gravity);
+    // unfolded group: only while it really overflows
+    let unfolded = st.unfolded.filter(|&i| f.groups.get(i).is_some_and(|g| (g.items.len() as i32) > rects[i].w * rects[i].rows()));
+    st.unfolded = unfolded;
+    if let Some(i) = unfolded {
+        // all items + fold slot; wider if it would get very tall
+        let n = f.groups[i].items.len() as i32 + 1;
+        let w = rects[i].w.max((n + 5) / 6);
+        rects[i] = GRect::slots(w, (n + w - 1) / w, rects[i].x, rects[i].y);
+        model::resolve(&mut rects, Some(i));
+        model::settle(&mut rects, st.set.gravity);
+    }
     let icon_px = px(48.0, panel.window().scale_factor());
     st.ids.clear();
     st.id_group.clear();
@@ -933,6 +992,7 @@ fn render(panel: &Panel, app: &Shared) {
             cols: r.w,
             rows: r.rows(),
             n: g.items.len() as i32,
+            open: unfolded == Some(gi),
             items: ModelRc::new(VecModel::from(slots)),
         });
     }
@@ -947,7 +1007,29 @@ fn render(panel: &Panel, app: &Shared) {
     panel.set_grid_h(gh);
     panel.set_drop_target(-2);
     panel.set_ghost_on(false);
-    let m = Rc::new(VecModel::from(groups));
-    panel.set_groups(ModelRc::from(m.clone()));
-    st.groups = Some(m);
+    // same groups: update rows in place (plates glide to new places); else new model
+    if let Some(m) = st.groups.as_ref().filter(|m| m.row_count() == groups.len()) {
+        for (i, g) in groups.into_iter().enumerate() {
+            m.set_row_data(i, g);
+        }
+    } else {
+        let m = Rc::new(VecModel::from(groups));
+        panel.set_groups(ModelRc::from(m.clone()));
+        st.groups = Some(m);
+    }
+}
+
+/// Panel grew (unfolded group): keep it inside the work area.
+fn fit_panel(panel: &Panel) {
+    let s = panel.window().scale_factor();
+    let w = ((panel.get_grid_w() + 32.0).max(panel.get_min_w()) * s).round() as i32;
+    let h = ((panel.get_grid_h() + 64.0) * s).round() as i32;
+    let p = panel.window().position();
+    let wa = win::work_area();
+    let m = (8.0 * s) as i32;
+    let x = p.x.min(wa.right - w - m).max(wa.left + m);
+    let y = p.y.min(wa.bottom - h - m).max(wa.top + m);
+    if (x, y) != (p.x, p.y) {
+        panel.window().set_position(PhysicalPosition::new(x, y));
+    }
 }

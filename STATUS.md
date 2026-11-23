@@ -2,7 +2,7 @@
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v0.9.0 release: English UI + language switch, EN/RU README GIFs)
+Updated: 2026-11-23 (headless UI tests: GF_SCRIPT, tests/ui/run.ps1)
 Progress: 76%
 
 ## Done
@@ -77,6 +77,11 @@ Progress: 76%
   README GIFs re-recorded per language: docs/media/en, docs/media/ru (old Russian-only GIFs removed).
 - Public on GitHub (2026-11-23): README EN/RU with demo GIFs, MIT, release v0.8.0 (zip). Goal: stars.
 
+- Headless UI tests (2026-11-23): env GF_SCRIPT=scenario runs the app with invisible click-through windows,
+  events go straight to Slint (virtual cursor, real mouse untouched), shots/frames from the DIB to PNG, exit 0/1.
+  tests/ui/run.ps1 (demo desktop + own APPDATA in %TEMP%), scenarios open-close, drag-item, hover-hint: all PASS.
+  tests/ui/idle.ps1 = guard for rare real-input checks (abort if user idle < 120 s).
+
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
 - Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them).
@@ -95,6 +100,7 @@ GitHub (private): https://github.com/eonesets/glass-folders, branch main.
 ## Run
 `app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
 Build: `cargo build --release` in app/.
+UI tests (no real mouse): `powershell -File tests/ui/run.ps1` (GF_SCRIPT, GF_OUT, GF_OFFSCREEN, GF_TIMEOUT). See CLAUDE.md.
 
 - v0.7 (2026-11-22): launch from tile.
   - Launch counts per item file name in .glassfolder.json "uses" (panel + tile launches).

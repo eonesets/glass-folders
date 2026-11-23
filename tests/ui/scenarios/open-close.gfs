@@ -1,0 +1,11 @@
+# Кратко: открыть папку Work (панель вырастает из плитки), снимок, закрыть (сворачивается обратно).
+hidden panel
+frames open 400
+open Work
+wait 500
+shown panel
+shot panel
+frames close 300
+close
+wait 400
+hidden panel

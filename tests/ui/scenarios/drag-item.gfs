@@ -1,0 +1,18 @@
+# Кратко: перетащить ярлык alpha из группы Docs в группу Tools; файл реально переезжает в папку Tools.
+open Work
+wait 500
+exists Work/Docs/alpha.bat
+move 68 105
+down
+move 90 105
+move 130 105
+move 180 105
+move 230 105
+move 240 108
+wait 50
+shot drag_mid
+up
+wait 400
+shot drag_done
+exists Work/Tools/alpha.bat
+missing Work/Docs/alpha.bat

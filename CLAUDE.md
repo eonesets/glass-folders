@@ -41,18 +41,31 @@ Rule: when files / key functions / props change, update this map in the same com
   (free follow, glide to cells on release), tile cell math (tile_cells/tile_size/snap_pos, TILE_NAMED, SNAP),
   set_view (show part of panel = open animation), cursor_logical. Kind Panel/Tile/Hint; set_zoom (scale = dpi*zoom);
   set_pinned (pinned panel: bottom z, live glass; WM_TILES_DOWN keeps tiles under it).
+  Mouse path: wndproc -> GfWindow::mouse_move/down/up (shared with scripts). cursor_pos() = real cursor, or virtual in script mode.
+  Test hooks (bottom): set_offscreen (layered alpha 0 + click-through + no activate), inject (Ptr event -> dispatch_event),
+  shot (render DIB -> PNG), record/take_frames (every drawn frame, shown part only), save_png.
+- `src/script.rs` — headless scenario runner (env GF_SCRIPT). Command list in its header. Calls main.rs open_folder/close,
+  plat::inject/shot/record. Ends app with exit code 0/1, writes OUT/log.txt.
 - `src/desk.rs` — Explorer desktop: icon positions (IShellWindows/IFolderView), hide tiled folders via
   FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
 - `src/win.rs` — misc Win32: acrylic glass, dark mode, work area, shell icons, ShellExecute open, wallpaper blur fallback.
 
 ## Build / run / check
-- Build: `cd app; cargo build --release`. Running exe locks the file: `taskkill //IM glass-folders.exe //F` first
-  (killed run is safe: hidden folders restored on next start from settings "homes").
+- Build: `cd app; cargo build --release`. Running exe locks the file: stop THAT exe first (killed run is safe:
+  hidden folders restored on next start from settings "homes").
 - Tests: `cargo test --release` (model layout/gravity).
 - Run: `app/target/release/glass-folders.exe` (dev: `--open NAME`, env GF_STAY=1 keep panel open, GF_KEEP_ICONS=1,
   GF_TILE_AT=x,y, GF_FAKE_GLASS=1, GF_DESKTOP=dir = demo folder instead of real Desktop).
-- Visual check: screenshots + synthetic mouse via PowerShell (SetProcessDPIAware, CopyFromScreen, SetCursorPos/mouse_event).
+- UI tests (default, safe while user works): `powershell -File tests/ui/run.ps1 [name ...]` -> PASS/FAIL per
+  `tests/ui/scenarios/*.gfs`, PNGs + log in tests/ui/out/<name>/ (gitignored). Fresh demo desktop + APPDATA in %TEMP%.
+  GF_SCRIPT implies GF_OFFSCREEN=1 (windows invisible, click-through, never focused) + virtual cursor + no desktop icon hiding.
+  Coords in scripts = logical px of window content; find them from a `shot` first. `#settings {json}` line = settings for that run.
+  Not covered headless: DWM acrylic look, real timing on screen, Explorer icon hide/restore.
+- Real-screen check (rare): synthetic mouse via PowerShell (SetCursorPos/mouse_event, CopyFromScreen) hijacks the user's PC.
+  Such scripts MUST start with `& tests/ui/idle.ps1 -Require 120; if ($LASTEXITCODE) { exit 1 }` (abort if user active).
   Screen 2560x1440, scale 1. Careful: drags in the panel move REAL files (user's Desktop folders).
+- Never `taskkill /IM glass-folders.exe` blindly: it kills the user's running copy too (their folders stay hidden until restart).
+  Kill by path, or not at all (worktree exe is a different file, no lock).
 
 ## Gotchas
 - Never rebuild the Slint groups model inside a slot's own event handler: defer with Timer::single_shot(ZERO).

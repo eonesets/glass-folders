@@ -8,6 +8,7 @@ slint::include_modules!();
 mod desk;
 mod model;
 mod plat;
+mod script;
 mod win;
 
 use std::cell::{Cell, RefCell};
@@ -113,6 +114,16 @@ fn all_panels() -> Vec<(Panel, Shared)> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // headless test (GF_SCRIPT): no real input, invisible windows, desktop icons untouched
+    let script = std::env::var("GF_SCRIPT").ok().map(PathBuf::from);
+    if script.is_some() {
+        plat::set_virtual_cursor();
+    }
+    plat::set_offscreen(match std::env::var("GF_OFFSCREEN").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => script.is_some(),
+    });
     slint::platform::set_platform(Box::new(plat::GfPlatform::new())).expect("platform");
     win::com_init();
     // any crash: give the user their desktop icons back
@@ -142,15 +153,18 @@ fn main() -> Result<(), slint::PlatformError> {
     g().panels.borrow_mut().push(first);
 
     // v0.4 left-over (whole icon layer hidden by a killed run) + folder icons parked by a killed run
-    desk::unhide_icon_layer();
-    let killed: HashMap<PathBuf, POINT> =
-        g().set.borrow().homes.iter().map(|(k, [x, y])| (PathBuf::from(k), POINT { x: *x, y: *y })).collect();
+    let killed: HashMap<PathBuf, POINT> = if script.is_some() {
+        HashMap::new()
+    } else {
+        desk::unhide_icon_layer();
+        g().set.borrow().homes.iter().map(|(k, [x, y])| (PathBuf::from(k), POINT { x: *x, y: *y })).collect()
+    };
     desk::restore_folders(&killed);
 
     let homes = make_tiles(&desktop, &killed)?;
     // tiles stand where the folders were -> hide the folder icons (dev: GF_KEEP_ICONS=1 keeps them).
     // Spots saved first: a killed run gets them back on next start.
-    if std::env::var("GF_KEEP_ICONS").is_err() && !homes.is_empty() {
+    if std::env::var("GF_KEEP_ICONS").is_err() && script.is_none() && !homes.is_empty() {
         {
             let mut s = g().set.borrow_mut();
             s.homes = homes.iter().map(|(k, p)| (k.to_string_lossy().into_owned(), [p.x, p.y])).collect();
@@ -179,8 +193,15 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    if let Some(path) = script.as_deref() {
+        script::start(path, desktop.clone());
+    }
+
     let r = slint::run_event_loop();
     give_back_icons();
+    if let Some(code) = script::exit_code() {
+        std::process::exit(code);
+    }
     r
 }
 

@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -193,7 +194,7 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
         let hwnd = g.hwnd.get();
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let n = if kind != Kind::Panel { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
+            let n = if kind != Kind::Panel || offscreen() { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
         }
     }
@@ -234,9 +235,8 @@ pub fn set_on_moved(window: &slint::Window, f: impl Fn(RECT) + 'static) {
 /// Panel: header was pressed -> following mouse moves drag the window (same code as tile move).
 pub fn start_move(window: &slint::Window) {
     let Some(g) = find(window) else { return };
-    let mut d = Drag { resize: false, cursor: POINT::default(), rect: RECT::default(), moved: false };
+    let mut d = Drag { resize: false, cursor: cursor_pos(), rect: RECT::default(), moved: false };
     unsafe {
-        let _ = GetCursorPos(&mut d.cursor);
         let _ = GetWindowRect(g.hwnd.get(), &mut d.rect);
     }
     g.drag.set(Some(d));
@@ -277,9 +277,8 @@ pub fn view_home(window: &slint::Window) -> Option<POINT> {
 /// an element that itself moves with the drag drifts.
 pub fn cursor_logical(window: &slint::Window) -> Option<(f32, f32)> {
     let g = find(window)?;
-    let mut c = POINT::default();
+    let mut c = cursor_pos();
     unsafe {
-        let _ = GetCursorPos(&mut c);
         let _ = ScreenToClient(g.hwnd.get(), &mut c);
     }
     let (ox, oy) = g.offset();
@@ -388,6 +387,51 @@ impl GfWindow {
         *self.glide.borrow_mut() = Some(t);
     }
 
+    fn mouse_move(&self, p: LogicalPosition) {
+        if self.drag_to() {
+            return;
+        }
+        self.window.dispatch_event(WindowEvent::PointerMoved { position: p });
+    }
+
+    fn mouse_down(&self, p: LogicalPosition, button: PointerEventButton) {
+        if button == PointerEventButton::Left && self.kind.get() == Kind::Tile {
+            self.glide.borrow_mut().take();
+            let mut d = Drag { resize: self.in_grip(p), cursor: cursor_pos(), rect: RECT::default(), moved: false };
+            unsafe {
+                let _ = GetWindowRect(self.hwnd.get(), &mut d.rect);
+            }
+            self.drag.set(Some(d));
+        }
+        self.window.dispatch_event(WindowEvent::PointerPressed { position: p, button });
+    }
+
+    /// `drag` = taken by the caller (wndproc must take it before ReleaseCapture clears it).
+    fn mouse_up(self: &Rc<Self>, p: LogicalPosition, button: PointerEventButton, drag: Option<Drag>) {
+        if drag.is_some_and(|d| d.moved) {
+            // drag ended: release outside -> TouchArea gives no click
+            self.window.dispatch_event(WindowEvent::PointerReleased {
+                position: LogicalPosition::new(-1.0, -1.0),
+                button: PointerEventButton::Left,
+            });
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(self.hwnd.get(), &mut r);
+            }
+            if self.kind.get() == Kind::Tile {
+                // land: size on whole cells, place on grid (setting) -> short glide there
+                let s = self.scale.get();
+                let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
+                let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
+                self.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
+            } else if let Some(f) = self.on_moved.borrow().clone() {
+                f(r);
+            }
+            return;
+        }
+        self.window.dispatch_event(WindowEvent::PointerReleased { position: p, button });
+    }
+
     fn in_grip(&self, p: LogicalPosition) -> bool {
         let s = self.scale.get();
         let PhysicalSize { width: w, height: h } = self.size.get();
@@ -397,10 +441,7 @@ impl GfWindow {
     /// Tile drag step. Returns true while a real drag (not a click) is going on.
     fn drag_to(&self) -> bool {
         let Some(mut d) = self.drag.get() else { return false };
-        let mut c = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut c);
-        }
+        let c = cursor_pos();
         let (dx, dy) = (c.x - d.cursor.x, c.y - d.cursor.y);
         if !d.moved && dx.abs() <= DRAG_START && dy.abs() <= DRAG_START {
             return false;
@@ -457,6 +498,22 @@ impl GfWindow {
         let buf = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
         buf.fill(Bgra::default());
         self.renderer.render(buf, w as usize);
+        REC.with(|r| {
+            let mut r = r.borrow_mut();
+            let Some(rec) = r.as_mut().filter(|r| r.hwnd == self.hwnd.get().0 as isize && Instant::now() < r.until) else { return };
+            // animation: keep only the shown part
+            let (ox, oy, fw, fh) = match self.view.get() {
+                Some((_, v)) => {
+                    let (ox, oy) = self.offset();
+                    (ox.max(0) as u32, oy.max(0) as u32, (v.right - v.left).max(1) as u32, (v.bottom - v.top).max(1) as u32)
+                }
+                None => (0, 0, w, h),
+            };
+            let (fw, fh) = (fw.min(w.saturating_sub(ox)), fh.min(h.saturating_sub(oy)));
+            if fw > 0 && fh > 0 {
+                rec.frames.push((fw, fh, rgba(buf, w, ox, oy, fw, fh)));
+            }
+        });
         true
     }
 
@@ -517,6 +574,12 @@ impl WindowAdapter for GfWindow {
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                    return Ok(());
+                }
+                if offscreen() {
+                    // headless test: never take focus from the user; Slint still sees an active window
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    self.window.dispatch_event(WindowEvent::WindowActiveChanged(true));
                     return Ok(());
                 }
                 let tile = self.kind.get() == Kind::Tile || self.pinned.get();
@@ -588,8 +651,10 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
             ..Default::default()
         };
         RegisterClassExW(&wc); // fails harmlessly after the first time
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+        // headless test: layered alpha 0 + click-through = invisible, mouse goes to the user's windows
+        let ex = if offscreen() { WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE } else { WS_EX_TOOLWINDOW };
+        let hwnd = CreateWindowExW(
+            ex,
             CLASS,
             w!("Glass Folders"),
             // Thick frame = DWM treats it as a framed window -> per-pixel alpha + backdrop work.
@@ -604,7 +669,11 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
             Some(inst.into()),
             None,
         )
-        .map_err(|e| PlatformError::Other(e.to_string()))
+        .map_err(|e| PlatformError::Other(e.to_string()))?;
+        if offscreen() {
+            let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
+        }
+        Ok(hwnd)
     }
 }
 
@@ -652,10 +721,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = TrackMouseEvent(&mut t);
                 g.tracking.set(true);
             }
-            if g.drag_to() {
-                return LRESULT(0);
-            }
-            g.window.dispatch_event(WindowEvent::PointerMoved { position: g.logical(lp) });
+            g.mouse_move(g.logical(lp));
             return LRESULT(0);
         }
         WM_MOUSELEAVE => {
@@ -665,44 +731,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             SetCapture(hwnd);
-            if msg == WM_LBUTTONDOWN && g.kind.get() == Kind::Tile {
-                g.glide.borrow_mut().take();
-                let mut d = Drag { resize: g.in_grip(g.logical(lp)), cursor: POINT::default(), rect: RECT::default(), moved: false };
-                let _ = GetCursorPos(&mut d.cursor);
-                let _ = GetWindowRect(hwnd, &mut d.rect);
-                g.drag.set(Some(d));
-            }
-            g.window.dispatch_event(WindowEvent::PointerPressed { position: g.logical(lp), button: btn(msg) });
+            g.mouse_down(g.logical(lp), btn(msg));
             return LRESULT(0);
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
             // take drag first: ReleaseCapture sends WM_CAPTURECHANGED, which clears it
             let drag = if msg == WM_LBUTTONUP { g.drag.take() } else { None };
             let _ = ReleaseCapture();
-            {
-                if let Some(d) = drag {
-                    if d.moved {
-                        // drag ended: release outside -> TouchArea gives no click
-                        g.window.dispatch_event(WindowEvent::PointerReleased {
-                            position: LogicalPosition::new(-1.0, -1.0),
-                            button: PointerEventButton::Left,
-                        });
-                        let mut r = RECT::default();
-                        let _ = GetWindowRect(hwnd, &mut r);
-                        if g.kind.get() == Kind::Tile {
-                            // land: size on whole cells, place on grid (setting) -> short glide there
-                            let s = g.scale.get();
-                            let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
-                            let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
-                            g.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
-                        } else if let Some(f) = g.on_moved.borrow().clone() {
-                            f(r);
-                        }
-                        return LRESULT(0);
-                    }
-                }
-            }
-            g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
+            g.mouse_up(g.logical(lp), btn(msg), drag);
             return LRESULT(0);
         }
         // Keys: special keys from WM_KEYDOWN/UP, typed text from WM_CHAR (TranslateMessage).
@@ -891,4 +927,135 @@ impl Platform for GfPlatform {
             }
         }
     }
+}
+// ---------- headless test hooks (GF_SCRIPT) ----------
+// Script events go straight to Slint (dispatch_event); the real cursor is never read or moved.
+// Drag code reads cursor_pos(): in script mode = virtual cursor set by inject().
+
+thread_local! {
+    static OFFSCREEN: Cell<bool> = const { Cell::new(false) };
+    static VCURSOR: Cell<Option<POINT>> = const { Cell::new(None) };
+    static REC: RefCell<Option<Rec>> = const { RefCell::new(None) };
+}
+
+struct Rec {
+    hwnd: isize,
+    until: Instant,
+    frames: Vec<(u32, u32, Vec<u8>)>,
+}
+
+/// Windows invisible + click-through + never activated. Call before the first window is made.
+pub fn set_offscreen(on: bool) {
+    OFFSCREEN.with(|v| v.set(on));
+}
+
+fn offscreen() -> bool {
+    OFFSCREEN.with(|v| v.get())
+}
+
+/// Script mode: cursor_pos() = virtual cursor (starts far away), real cursor never read.
+pub fn set_virtual_cursor() {
+    VCURSOR.with(|v| v.set(Some(POINT { x: -30000, y: -30000 })));
+}
+
+/// Cursor on screen (physical px): real, or virtual in script mode.
+fn cursor_pos() -> POINT {
+    VCURSOR.with(|v| v.get()).unwrap_or_else(|| {
+        let mut c = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut c);
+        }
+        c
+    })
+}
+
+#[derive(Clone, Copy)]
+pub enum Ptr {
+    Move,
+    Down(PointerEventButton),
+    Up(PointerEventButton),
+    Leave,
+}
+
+/// Scripted pointer event at content coords (logical px) of a window. Same path as the real mouse,
+/// minus SetCapture / TrackMouseEvent. Returns false if the window is unknown.
+pub fn inject(window: &slint::Window, ev: Ptr, x: f32, y: f32) -> bool {
+    let Some(g) = find(window) else { return false };
+    let s = g.scale.get();
+    let (ox, oy) = g.offset();
+    let mut pt = POINT { x: (x * s).round() as i32 - ox, y: (y * s).round() as i32 - oy };
+    unsafe {
+        let _ = ClientToScreen(g.hwnd.get(), &mut pt);
+    }
+    VCURSOR.with(|v| v.set(Some(pt)));
+    let p = LogicalPosition::new(x, y);
+    match ev {
+        Ptr::Move => g.mouse_move(p),
+        Ptr::Down(b) => g.mouse_down(p, b),
+        Ptr::Up(b) => {
+            let d = if b == PointerEventButton::Left { g.drag.take() } else { None };
+            g.mouse_up(p, b, d)
+        }
+        Ptr::Leave => g.window.dispatch_event(WindowEvent::PointerExited),
+    }
+    true
+}
+
+pub fn is_shown(window: &slint::Window) -> bool {
+    find(window).is_some_and(|g| unsafe { IsWindowVisible(g.hwnd.get()).as_bool() })
+}
+
+/// Render the window now and save its whole content as PNG (straight RGBA). Returns (w, h).
+pub fn shot(window: &slint::Window, path: &Path) -> Result<(u32, u32), String> {
+    let g = find(window).ok_or("unknown window")?;
+    if !unsafe { IsWindowVisible(g.hwnd.get()).as_bool() } {
+        return Err("window hidden".into());
+    }
+    let ok = unsafe {
+        let dc = GetDC(None);
+        let ok = g.draw(dc);
+        ReleaseDC(None, dc);
+        ok
+    };
+    let dib = g.dib.borrow();
+    let d = dib.as_ref().filter(|_| ok).ok_or("no pixels")?;
+    let buf = unsafe { std::slice::from_raw_parts(d.bits, (d.w * d.h) as usize) };
+    save_png(path, d.w, d.h, &rgba(buf, d.w, 0, 0, d.w, d.h))?;
+    Ok((d.w, d.h))
+}
+
+/// Start keeping every frame this window renders for `ms` (animation check).
+pub fn record(window: &slint::Window, ms: u64) -> bool {
+    let Some(g) = find(window) else { return false };
+    REC.with(|r| {
+        *r.borrow_mut() = Some(Rec { hwnd: g.hwnd.get().0 as isize, until: Instant::now() + Duration::from_millis(ms), frames: Vec::new() })
+    });
+    true
+}
+
+/// Frames kept by record(): (w, h, straight RGBA).
+pub fn take_frames() -> Vec<(u32, u32, Vec<u8>)> {
+    REC.with(|r| r.borrow_mut().take()).map(|r| r.frames).unwrap_or_default()
+}
+
+/// Premultiplied BGRA sub-rect -> straight RGBA bytes.
+fn rgba(buf: &[Bgra], stride: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let from = (row * stride + x) as usize;
+        for p in &buf[from..from + w as usize] {
+            let un = |c: u8| if p.a == 0 { 0 } else { ((c as u32 * 255 + p.a as u32 / 2) / p.a as u32).min(255) as u8 };
+            out.extend_from_slice(&[un(p.r), un(p.g), un(p.b), p.a]);
+        }
+    }
+    out
+}
+
+pub fn save_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+    wr.write_image_data(rgba).map_err(|e| e.to_string())
 }

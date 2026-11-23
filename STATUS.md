@@ -2,7 +2,7 @@
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (English UI + language switch, EN/RU README GIFs)
+Updated: 2026-11-23 (v0.9.0 release: English UI + language switch, EN/RU README GIFs)
 Progress: 76%
 
 ## Done

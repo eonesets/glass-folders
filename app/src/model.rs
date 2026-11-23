@@ -473,14 +473,12 @@ pub fn layout(f: &Folder, gravity: i32) -> Vec<GRect> {
     let mut placed = Vec::new(); // groups with saved place
     for (i, g) in f.groups.iter().enumerate() {
         let c = f.cfg.groups.get(&g.name);
-        let (mut aw, mut ah) = auto_size(g.items.len(), cols as u32, maxh);
-        if f.groups.len() == 1 && aw < 3 {
-            // single group fills the min 3-cell panel width -> even edges
-            aw = 3;
-            ah = g.items.len().max(1).div_ceil(3) as u32;
-        }
-        let w = c.and_then(|c| c.w).unwrap_or(aw).max(1) as i32;
-        let h = c.and_then(|c| c.h).unwrap_or(ah).max(1) as i32;
+        // panel hugs its groups: no padding to a minimum width
+        let (aw, ah) = auto_size(g.items.len(), cols as u32, maxh);
+        // saved size never wider / taller than its items need (old builds padded to 3 cols -> empty cells)
+        let n = g.items.len().max(1) as u32;
+        let w = c.and_then(|c| c.w).unwrap_or(aw).clamp(1, n) as i32;
+        let h = c.and_then(|c| c.h).unwrap_or(ah).clamp(1, n.div_ceil(w as u32)) as i32;
         let pos = c.and_then(|c| c.x.zip(c.y));
         let (x, y) = pos.unwrap_or((-1, -1));
         if pos.is_some() {
@@ -551,11 +549,12 @@ pub fn settle(r: &mut [GRect], gravity: i32) {
     }
 }
 
-/// Panel grid size in px for rects (+ extra free cols / half-rows), min 3 columns wide.
+/// Panel grid size in px for rects (+ extra free cols / half-rows). No minimum: the window hugs the
+/// groups (header buttons keep it >= PANEL_MIN_W, see app.slint).
 pub fn grid_px(r: &[GRect], extra_c: i32, extra_r: i32) -> (f32, f32) {
     let (c, h) = extent(r);
-    let c = (c + extra_c).max(3);
-    let h = (h + extra_r).max(3);
+    let c = (c + extra_c).max(1);
+    let h = (h + extra_r).max(3); // smallest group: 1 slot row = 3 half-rows
     (c as f32 * PITCH - GAP, h as f32 * ROW - GAP)
 }
 

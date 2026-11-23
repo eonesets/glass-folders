@@ -81,6 +81,21 @@ pub fn glass(hwnd: HWND, dark: bool) {
     }
 }
 
+/// Frameless popup with per-pixel alpha and no system backdrop (name hint): DWM blends the DIB's
+/// alpha, nothing drawn behind it.
+pub fn clear(hwnd: HWND) {
+    unsafe {
+        let off: i32 = 1;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as _, 4);
+        let c = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &c as *const _ as _, 4);
+        let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        let b = DWMSBT_NONE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const _ as _, 4);
+    }
+}
+
 /// Frosted copy of the desktop wallpaper under screen rect `r` (primary monitor), acrylic-like tint.
 /// glass: 0 dense .. 2 clear (how much of the wallpaper shows through the tint).
 pub fn wallpaper_blur(r: RECT, dark: bool, glass: i32) -> Option<Image> {

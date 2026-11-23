@@ -137,7 +137,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let hint = Hint::new()?;
     plat::set_kind(hint.window(), plat::Kind::Hint);
     if let Some(h) = plat::hwnd_of(hint.window()) {
-        win::glass(h, g().dark.get());
+        win::clear(h);
     }
     hint.set_dark(g().dark.get());
     *g().hint.borrow_mut() = Some(hint);

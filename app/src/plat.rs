@@ -219,6 +219,14 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             let n = if kind != Kind::Panel { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
+            if kind == Kind::Hint {
+                // Hint: plain popup. A thick frame makes Windows keep the window >= ~39px tall whatever
+                // WM_GETMINMAXINFO says -> the 28px label got a second, empty glass strip under it.
+                // No frame = no system backdrop: the label paints its own (near-opaque) background.
+                let st = GetWindowLongPtrW(hwnd, GWL_STYLE) & !((WS_CAPTION.0 | WS_THICKFRAME.0) as isize);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, st);
+                let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
         }
     }
 }
@@ -935,8 +943,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
         }
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
-        // Thick frame -> Windows clamps size to a min track size (~136x39): the 28px hint got an empty
-        // glass strip under it, and the open animation could not start at the tile's real size.
+        // Thick frame -> Windows clamps size to a min track size (~136x39); this lifts the width part
+        // (open animation starts at the tile's real size). Height stays >= ~39 on framed windows: Hint has no frame.
         WM_GETMINMAXINFO => {
             let mm = &mut *(lp.0 as *mut MINMAXINFO);
             mm.ptMinTrackSize = POINT { x: 1, y: 1 };

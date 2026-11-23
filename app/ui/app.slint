@@ -426,7 +426,8 @@ export component Panel inherits Window {
     property <color> fg: dark ? #ffffff : #1b1b1b;
     property <color> accent: dark ? #60cdff : #005fb8;
     // settings page needs room: panel grows while it is shown
-    out property <length> min-w: page == 1 ? 372px : 0px;
+    // folder page: hugs its groups, but the header keeps 3 buttons + a drag strip (buttons slide left with the edge)
+    out property <length> min-w: page == 1 ? 372px : 168px;
     property <length> settings-h: 802px;
 
     in property <bool> grow-anim; // window size glides (groups make room, unfold, settings); off while opening
@@ -530,6 +531,7 @@ export component Panel inherits Window {
             y: page == 0 ? 12px : 0px; // settings title: centered with back arrow / gear (36px buttons)
             height: page == 0 ? 24px : 36px;
             width: parent.width - self.x - 142px;
+            opacity: self.width > 36px ? 1 : 0; // narrow window: dot only, no "..." stub
             text: page == 0 ? folder-name : (root.en ? "Settings" : "Настройки");
             font-size: page == 0 ? 16px : 14px;
             font-weight: 600;
@@ -1303,7 +1305,7 @@ export component Hint inherits Window {
     out property <length> pw: min(t.preferred-width, 320px) + 20px; // Rust sizes the window from it
     Rectangle {
         border-radius: 6px;
-        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.92);
+        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.97); // own window, no glass behind it
         border-width: 1px;
         border-color: dark ? #ffffff24 : #00000018;
     }

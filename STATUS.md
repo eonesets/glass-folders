@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. Готовим 1.0: большие папки открываются мгновенно, анимации плавные, окно папки по размеру иконок, меню по ПКМ (переименовать, значок, удалить, удалить программу), ярлык можно вытащить на стол или в другую папку. Ветка claude/animations-performance-v1-3ed962, не слита.
-Ждём: проверка пользователем на своём столе.
+Кратко: приложение «стеклянные папки» для рабочего стола. Вышла версия 1.0 (релиз v1.0.0 на GitHub): мгновенные большие папки, плавные анимации, меню по ПКМ на ярлыке, ярлык можно вытащить на стол или в другую папку, папки возвращаются даже после вылета.
+Ждём: отзывы пользователя после 1.0.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (1.0: hug-size panel, hint fix, shortcut menu, drag out, guard restores folders on kill)
-Progress: 90%
+Updated: 2026-11-23 (v1.0.0 released: github.com/eonesets/glass-folders/releases/tag/v1.0.0)
+Progress: 92%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -95,7 +95,7 @@ Progress: 90%
   tests/ui/idle.ps1 = guard for rare real-input checks (abort if user idle < 120 s).
 
 ## Next
-- 1.0: user check on the real desktop, then merge branch + bump version + release.
+- 1.0 released 2026-11-23 (merged to main, v1.0.0). Next: feedback, fixes.
   Not checked on the real screen yet (headless tests only): native menu look (dark), rename box focus, PickIconDlg,
   uninstaller run, drop onto the real desktop (icon placed at drop point), Fly icon + tile highlight while dragging.
 - Guard: killing app AND guard together (taskkill /IM glass-folders.exe /F) still leaves folders hidden until next start.

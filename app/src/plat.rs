@@ -19,6 +19,7 @@ use slint::platform::{
 use slint::{EventLoopError, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, PlatformError};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -28,6 +29,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+// ---------- dev perf log: env GF_PERF=file -> timings (paint ms, open steps) ----------
+
+thread_local! {
+    static PERF: Option<RefCell<std::fs::File>> =
+        std::env::var("GF_PERF").ok().and_then(|p| std::fs::File::create(p).ok()).map(RefCell::new);
+    static T0: Instant = Instant::now();
+}
+
+/// One line "t_ms text" to the GF_PERF file (no-op without it).
+pub fn perf(msg: impl FnOnce() -> String) {
+    PERF.with(|p| {
+        if let Some(f) = p {
+            use std::io::Write;
+            let t = T0.with(|t| t.elapsed().as_secs_f64() * 1000.0);
+            let _ = writeln!(f.borrow_mut(), "{t:9.1} {}", msg());
+        }
+    });
+}
 
 // ---------- pixel type = DIB layout (premultiplied BGRA) ----------
 
@@ -163,6 +183,9 @@ pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
     (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
 }
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
+/// Interval for timers that step an animation: "every frame". The event loop runs one pass per screen
+/// refresh while such a timer is due (DwmFlush), so each pass = one new frame, evenly spaced.
+pub const FRAME: Duration = Duration::from_millis(1);
 const GLIDE_MS: f32 = 130.0; // tile settles onto the grid after release
 
 thread_local! {
@@ -261,9 +284,18 @@ pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
         (None, None) => return,
     };
     unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        let _ = InvalidateRect(Some(hwnd), None, false);
-        let _ = UpdateWindow(hwnd); // paint now: no frame with stale content
+        // frame ready before the window changes, then move + blit in one go (no WM_PAINT round trip,
+        // no copy of old bits): DWM gets new geometry and new content together
+        let sdc = GetDC(None);
+        let ok = g.draw(sdc);
+        let _ = ReleaseDC(None, sdc);
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
+        if ok {
+            g.blit();
+            let _ = ValidateRect(Some(hwnd), None);
+        } else {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 }
 
@@ -361,7 +393,7 @@ impl GfWindow {
         let start = Instant::now();
         let weak = Rc::downgrade(self);
         let t = slint::Timer::default();
-        t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+        t.start(slint::TimerMode::Repeated, FRAME, move || {
             let Some(g) = weak.upgrade() else { return };
             if g.glide.borrow().is_none() {
                 return; // finished
@@ -462,13 +494,28 @@ impl GfWindow {
 
     /// WM_PAINT + BitBlt. Panel: DWM reads alpha via the hidden extended frame.
     /// Tile: content is opaque (own blurred wallpaper), DWM rounds the corners.
+    /// Copy the rendered DIB to the window now (shown part only while animating).
+    unsafe fn blit(&self) {
+        let hwnd = self.hwnd.get();
+        let PhysicalSize { width: w, height: h } = self.size.get();
+        if let Some(d) = self.dib.borrow().as_ref() {
+            let (ox, oy) = self.offset();
+            let hdc = GetDC(Some(hwnd));
+            let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
+            let _ = ReleaseDC(Some(hwnd), hdc);
+        }
+    }
+
     fn paint(&self) {
         let hwnd = self.hwnd.get();
         let PhysicalSize { width: w, height: h } = self.size.get();
         let mut ps = PAINTSTRUCT::default();
         unsafe {
             let hdc = BeginPaint(hwnd, &mut ps);
+            let t = Instant::now();
             if self.draw(hdc) {
+                let k = self.kind.get() as u8;
+                perf(|| format!("paint k{k} {w}x{h} {:.2}ms", t.elapsed().as_secs_f64() * 1000.0));
                 if let Some(d) = self.dib.borrow().as_ref() {
                     let (ox, oy) = self.offset();
                     let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
@@ -789,6 +836,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
         }
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        // Thick frame -> Windows clamps size to a min track size (~136x39): the 28px hint got an empty
+        // glass strip under it, and the open animation could not start at the tile's real size.
+        WM_GETMINMAXINFO => {
+            let mm = &mut *(lp.0 as *mut MINMAXINFO);
+            mm.ptMinTrackSize = POINT { x: 1, y: 1 };
+            return LRESULT(0);
+        }
         WM_NCHITTEST if g.kind.get() == Kind::Hint => return LRESULT(-1), // HTTRANSPARENT: mouse goes to the window below
         WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
         WM_CLOSE => return LRESULT(0),
@@ -867,26 +921,34 @@ impl Platform for GfPlatform {
             if self.quit.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            // Animations running -> ~60 fps; else sleep until next timer or input (idle = 0 CPU).
+            // Animation running (Slint's own, or a frame timer of ours): one pass per screen refresh,
+            // paced by DwmFlush (waits for the next composition). Was: a 16 ms wait / 8 ms timers on the
+            // ~15.6 ms system tick -> 50-60 fps on a 120 Hz screen with uneven steps (judder).
+            // Else sleep until the next timer or input (idle = 0 CPU).
             let animating = ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).any(|g| g.window.has_active_animations()));
             if animating {
                 ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).for_each(|g| g.request_redraw()));
             }
-            let timeout = if animating {
-                16
+            let next = slint::platform::duration_until_next_timer_update();
+            let paced = animating || next.is_some_and(|d| d <= Duration::from_millis(12));
+            let timeout = if paced {
+                0
             } else {
-                slint::platform::duration_until_next_timer_update()
-                    .map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32)
-                    .unwrap_or(u32::MAX) // INFINITE
+                next.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(u32::MAX) // INFINITE
             };
             unsafe {
-                MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                if timeout > 0 {
+                    MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                }
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
                         return Ok(());
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                }
+                if paced {
+                    let _ = DwmFlush();
                 }
             }
         }

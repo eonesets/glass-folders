@@ -210,18 +210,19 @@ pub fn work_area() -> RECT {
 // ---------- icons and launch ----------
 
 /// Shell icon of a file/shortcut as straight-alpha RGBA image.
-pub fn icon(path: &Path, px: i32) -> Option<Image> {
+/// Shell icon as RGBA pixels. Thread-safe (needs COM on the calling thread): icons.rs runs it on workers.
+pub fn icon_pixels(path: &Path, px: i32) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
     unsafe {
         let p = HSTRING::from(path.as_os_str());
         let f: IShellItemImageFactory = SHCreateItemFromParsingName(&p, None).ok()?;
         let hb = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
-        let img = bitmap_to_image(hb);
+        let img = bitmap_to_pixels(hb);
         let _ = DeleteObject(hb.into());
         img
     }
 }
 
-unsafe fn bitmap_to_image(hb: HBITMAP) -> Option<Image> {
+unsafe fn bitmap_to_pixels(hb: HBITMAP) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
     let mut bm = BITMAP::default();
     if GetObjectW(hb.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
         return None;
@@ -259,7 +260,7 @@ unsafe fn bitmap_to_image(hb: HBITMAP) -> Option<Image> {
     }
     let mut pb = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
     pb.make_mut_bytes().copy_from_slice(&buf);
-    Some(Image::from_rgba8(pb))
+    Some(pb)
 }
 
 pub fn open(path: &Path) {

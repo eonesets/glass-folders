@@ -419,8 +419,10 @@ export component Panel inherits Window {
     out property <length> min-w: page == 1 ? 372px : 0px;
     property <length> settings-h: 802px;
 
+    in property <bool> grow-anim; // window size glides (groups make room, unfold, settings); off while opening
     width: max(grid-w + 2 * pad, min-w);
     height: page == 1 ? max(grid-h + top + pad, settings-h) : grid-h + top + pad;
+    animate width, height { duration: grow-anim ? 170ms : 0ms; easing: ease-out; }
 
     // below header, inside window
     pure function inside(x: length, y: length) -> bool {
@@ -544,10 +546,11 @@ export component Panel inherits Window {
         }
 
         // ---------- folder page ----------
+        // page switch: one page fades out fast, the other comes in after it (no double-exposure mix)
         Rectangle {
             opacity: page == 0 ? 1 : 0;
             visible: self.opacity > 0.01;
-            animate opacity { duration: 140ms; }
+            animate opacity { duration: page == 0 ? 160ms : 90ms; delay: page == 0 ? 60ms : 0ms; easing: ease-out; }
 
             // plate of the new group, appears under the dragged item over empty space
             if ghost-on: Rectangle {
@@ -874,8 +877,13 @@ export component Panel inherits Window {
         if page == 1: Rectangle {
             property <length> cw: parent.width - 2 * pad; // card width
             opacity: 0;
-            init => { self.opacity = 1; }
-            animate opacity { duration: 160ms; }
+            y: 10px;
+            init => {
+                self.opacity = 1;
+                self.y = 0;
+            }
+            animate opacity { duration: 180ms; delay: 70ms; easing: ease-out; }
+            animate y { duration: 240ms; delay: 70ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
 
             SectionTitle {
                 x: pad + 2px;

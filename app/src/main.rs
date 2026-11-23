@@ -6,6 +6,7 @@
 
 slint::include_modules!();
 mod desk;
+mod icons;
 mod model;
 mod plat;
 mod win;
@@ -46,7 +47,6 @@ struct App {
     folder: Option<model::Folder>,
     ids: Vec<PathBuf>,    // slot id -> file
     id_group: Vec<usize>, // slot id -> group index
-    icons: HashMap<PathBuf, Image>,
     // panel layout: base = as rendered, prev = shown now (while dragging), ghost = new-group plate
     base: Vec<GRect>,
     prev: Vec<GRect>,
@@ -71,6 +71,8 @@ struct Global {
     dark: Cell<bool>,
     tiles: RefCell<Vec<(PathBuf, Tile)>>,
     tile_items: RefCell<HashMap<PathBuf, Vec<PathBuf>>>, // folder -> files behind its tile icons (index = icon)
+    /// tiles whose icons are still loading: folder -> candidate files (most launched first)
+    tile_wait: RefCell<HashMap<PathBuf, Vec<PathBuf>>>,
     /// Folder windows. [0] = the one tiles open; others = pinned (or just unpinned, closing).
     panels: RefCell<Vec<(Panel, Shared)>>,
     hint: RefCell<Option<Hint>>,
@@ -147,7 +149,9 @@ fn main() -> Result<(), slint::PlatformError> {
         g().set.borrow().homes.iter().map(|(k, [x, y])| (PathBuf::from(k), POINT { x: *x, y: *y })).collect();
     desk::restore_folders(&killed);
 
+    icons::on_ready(icons_ready);
     let homes = make_tiles(&desktop, &killed)?;
+    prefetch_icons();
     // tiles stand where the folders were -> hide the folder icons (dev: GF_KEEP_ICONS=1 keeps them).
     // Spots saved first: a killed run gets them back on next start.
     if std::env::var("GF_KEEP_ICONS").is_err() && !homes.is_empty() {
@@ -182,6 +186,16 @@ fn main() -> Result<(), slint::PlatformError> {
     let r = slint::run_event_loop();
     give_back_icons();
     r
+}
+
+/// Background: icons of every folder at panel size, so the first open is instant too.
+fn prefetch_icons() {
+    let Some((p, _)) = main_panel() else { return };
+    let ipx = px(48.0, icon_scale(p.window()));
+    for (d, _) in g().tiles.borrow().iter() {
+        let f = model::scan(d);
+        icons::want(f.groups.iter().flat_map(|g| g.items.iter().cloned()), ipx, false);
+    }
 }
 
 /// New folder window (hidden) with all its callbacks.
@@ -428,6 +442,7 @@ fn pin_open(panel: &Panel, app: &Shared, dir: &Path, x: i32, y: i32) {
     panel.set_pinned(true);
     plat::set_pinned(panel.window(), true);
     let _ = panel.show();
+    panel.set_grow_anim(true);
     show_tile(dir, false);
 }
 
@@ -609,12 +624,21 @@ fn set_opt(key: &str, v: i32) {
             }
             tiles.iter().map(|(d, _)| d.clone()).collect()
         };
+        // only the new pixel sizes stay cached; the rest loads in the background
+        let mut sizes = Vec::new();
+        if let Some((p, _)) = main_panel() {
+            sizes.push(px(48.0, icon_scale(p.window())));
+        }
+        if let Some((_, t)) = g().tiles.borrow().first() {
+            sizes.push(px(36.0, icon_scale(t.window())));
+        }
+        icons::keep_sizes(&sizes);
         for d in dirs {
             refresh_tile(&d); // icons at the new pixel size
         }
+        prefetch_icons();
         for (p, a) in &panels {
             plat::set_zoom(p.window(), z);
-            a.borrow_mut().icons.clear();
             if a.borrow().folder.is_some() {
                 render(p, a);
                 let (w, h) = panel_size(p);
@@ -792,11 +816,76 @@ fn free_spot(start: (i32, i32), w: i32, h: i32, taken: &[RECT], s: f32) -> (i32,
 fn tile_icons(t: &Tile, f: &model::Folder) -> Vec<PathBuf> {
     let all = f.top_items();
     t.set_total(all.len() as i32);
-    let s = icon_scale(t.window());
-    let (items, icons): (Vec<PathBuf>, Vec<Image>) =
-        all.into_iter().take(24).filter_map(|p| win::icon(&p, px(36.0, s)).map(|i| (p, i))).unzip();
-    t.set_icons(ModelRc::new(VecModel::from(icons)));
+    let cand: Vec<PathBuf> = all.into_iter().take(24).collect();
+    let (items, done) = set_tile_icons(t, &cand);
+    let mut wait = g().tile_wait.borrow_mut();
+    if done {
+        wait.remove(&f.dir);
+    } else {
+        wait.insert(f.dir.clone(), cand);
+    }
     items
+}
+
+/// Tile icons from the cache; missing ones queued and shown empty (in place) until they land.
+/// Files the shell has no icon for are left out. Returns (files behind the icons, all loaded).
+fn set_tile_icons(t: &Tile, cand: &[PathBuf]) -> (Vec<PathBuf>, bool) {
+    let ipx = px(36.0, icon_scale(t.window()));
+    let mut missing = Vec::new();
+    let mut items = Vec::new();
+    let mut imgs = Vec::new();
+    for p in cand {
+        match icons::get(p, ipx) {
+            Some(i) if i.size().width == 0 => continue,
+            Some(i) => imgs.push(i),
+            None => {
+                missing.push(p.clone());
+                imgs.push(Image::default());
+            }
+        }
+        items.push(p.clone());
+    }
+    let done = missing.is_empty();
+    icons::want(missing, ipx, true);
+    t.set_icons(ModelRc::new(VecModel::from(imgs)));
+    (items, done)
+}
+
+/// New icons arrived: fill the empty slots of open panels and of tiles still waiting.
+fn icons_ready() {
+    for (p, a) in all_panels() {
+        patch_icons(&p, &a);
+    }
+    let wait: Vec<(PathBuf, Vec<PathBuf>)> = g().tile_wait.borrow().iter().map(|(d, c)| (d.clone(), c.clone())).collect();
+    for (dir, cand) in wait {
+        let Some(t) = g().tiles.borrow().iter().find(|(d, _)| *d == dir).map(|(_, t)| t.clone_strong()) else { continue };
+        let (items, done) = set_tile_icons(&t, &cand);
+        g().tile_items.borrow_mut().insert(dir.clone(), items);
+        if done {
+            g().tile_wait.borrow_mut().remove(&dir);
+        }
+    }
+}
+
+/// Put freshly loaded icons into the panel's slots, in place (no relayout).
+fn patch_icons(panel: &Panel, app: &Shared) {
+    let st = app.borrow();
+    let Some(groups) = st.groups.as_ref() else { return };
+    let ipx = px(48.0, icon_scale(panel.window()));
+    for gi in 0..groups.row_count() {
+        let Some(gd) = groups.row_data(gi) else { continue };
+        for k in 0..gd.items.row_count() {
+            let Some(mut s) = gd.items.row_data(k) else { continue };
+            if s.icon.size().width > 0 {
+                continue;
+            }
+            let Some(path) = st.ids.get(s.id as usize) else { continue };
+            if let Some(i) = icons::get(path, ipx).filter(|i| i.size().width > 0) {
+                s.icon = i;
+                gd.items.set_row_data(k, s);
+            }
+        }
+    }
 }
 
 /// Re-read one folder from disk and redraw its desktop tile (launch counts changed).
@@ -1128,14 +1217,18 @@ fn set_color(panel: &Panel, app: &Shared, idx: i32, hx: Option<String>) {
 fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
     // a fold-back still running (click on another tile closed the panel): finish it now
     finish_close(panel, app);
+    let t0 = std::time::Instant::now();
     {
         let mut st = app.borrow_mut();
         st.folder = Some(model::scan(dir));
         st.unfolded = None;
     }
+    plat::perf(|| format!("open {:?}: scan {:.1}ms", dir.file_name().unwrap_or_default(), t0.elapsed().as_secs_f64() * 1000.0));
+    panel.set_grow_anim(false); // new folder: window takes its size at once
     panel.set_page(0);
     panel.set_pinned(false);
     render(panel, app);
+    plat::perf(|| format!("open: +render {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0));
     let s = panel.window().scale_factor();
     let (w, h) = panel_size(panel);
     panel.window().set_size(PhysicalSize::new(w as u32, h as u32));
@@ -1163,12 +1256,13 @@ fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f
     let start = std::time::Instant::now();
     let (a, p) = (app.clone(), panel.as_weak());
     let t = slint::Timer::default();
-    t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+    t.start(slint::TimerMode::Repeated, plat::FRAME, move || {
         let Some(p) = p.upgrade() else { return };
         if a.borrow().anim.is_none() {
             return; // stopped
         }
         let k = (start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
+        plat::perf(|| format!("anim k={k:.3}"));
         // open: ease-out (fast start, soft landing); close: ease-in
         let e = if opening { 1.0 - (1.0 - k).powi(3) } else { k * k };
         let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
@@ -1182,6 +1276,7 @@ fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f
             if opening {
                 plat::set_view(p.window(), None);
                 p.set_reveal(1.0);
+                p.set_grow_anim(true);
             } else {
                 finish_close(&p, &a);
             }
@@ -1205,6 +1300,7 @@ fn close(panel: &Panel, app: &Shared) {
             RECT { left: cx - 40, top: cy - 40, right: cx + 40, bottom: cy + 40 }
         });
         st.anim.take(); // an unfinished open: fold from where it is now
+        panel.set_grow_anim(false);
         (POINT { x: cur.left, y: cur.top }, cur, to)
     };
     // home = content corner: if open was cut short, content corner is not the window corner
@@ -1242,7 +1338,6 @@ fn finish_close(panel: &Panel, app: &Shared) {
     st.groups = None;
     st.unfolded = None;
     reset_preview(&mut st);
-    st.icons.clear(); // free icon memory while hidden
     drop(st);
     hide_hint();
     // closed window that is not the tiles' one (was pinned): gone for good
@@ -1277,6 +1372,7 @@ fn render(panel: &Panel, app: &Shared) {
     let icon_px = px(48.0, icon_scale(panel.window()));
     st.ids.clear();
     st.id_group.clear();
+    let mut missing = Vec::new();
     let mut groups = Vec::new();
     for (gi, (g, r)) in f.groups.iter().zip(&rects).enumerate() {
         let mut slots = Vec::new();
@@ -1284,7 +1380,11 @@ fn render(panel: &Panel, app: &Shared) {
             let id = st.ids.len() as i32;
             st.ids.push(path.clone());
             st.id_group.push(gi);
-            let icon = st.icons.entry(path.clone()).or_insert_with(|| win::icon(path, icon_px).unwrap_or_default()).clone();
+            // not loaded yet: empty now (Slot fades it in), patched by patch_icons when it lands
+            let icon = icons::get(path, icon_px).unwrap_or_else(|| {
+                missing.push(path.clone());
+                Image::default()
+            });
             slots.push(SlotData { name: model::name_of(path).into(), icon, id, k: k as i32 });
         }
         let (tint, colored) = model::tint(&f.group_tint(gi));
@@ -1306,6 +1406,7 @@ fn render(panel: &Panel, app: &Shared) {
             items: ModelRc::new(VecModel::from(slots)),
         });
     }
+    icons::want(missing, icon_px, true);
     panel.set_folder_name(f.name.clone().into());
     let (c, on) = model::tint(&f.tint());
     panel.set_folder_tint(c);

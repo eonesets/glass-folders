@@ -450,22 +450,30 @@ pub fn extent(r: &[GRect]) -> (i32, i32) {
 }
 
 /// Near-square size that fits n items, width capped.
-pub fn auto_size(n: usize, maxw: u32) -> (u32, u32) {
+/// Auto group size (cols, rows): near-square, at most maxh rows (the rest = "+N", unfold shows all).
+pub fn auto_size(n: usize, maxw: u32, maxh: u32) -> (u32, u32) {
     let n = n.max(1) as f64;
     let w = (n.sqrt().ceil() as u32).clamp(1, maxw.max(1));
-    let h = ((n / w as f64).ceil() as u32).max(1);
+    let h = ((n / w as f64).ceil() as u32).clamp(1, maxh.max(1));
     (w, h)
 }
+
+/// Auto rows cap: many groups -> short plates side by side, so a big folder opens screen-sized
+/// (was: 130 items -> 5 groups stacked, panel 2280 px tall, past the screen).
+const AUTO_ROWS: u32 = 3;
+const AUTO_ROWS_ONE: u32 = 7; // single group (only loose shortcuts)
+const AUTO_COLS_MAX: u32 = 12;
 
 /// Rects of all groups: saved place/size, else auto size + first free spot.
 pub fn layout(f: &Folder, gravity: i32) -> Vec<GRect> {
     let total: usize = f.groups.iter().map(|g| g.items.len().max(1)).sum();
-    let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, 8)) as i32;
+    let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, AUTO_COLS_MAX)) as i32;
+    let maxh = if f.groups.len() > 1 { AUTO_ROWS } else { AUTO_ROWS_ONE };
     let mut rects = Vec::new();
     let mut placed = Vec::new(); // groups with saved place
     for (i, g) in f.groups.iter().enumerate() {
         let c = f.cfg.groups.get(&g.name);
-        let (mut aw, mut ah) = auto_size(g.items.len(), cols as u32);
+        let (mut aw, mut ah) = auto_size(g.items.len(), cols as u32, maxh);
         if f.groups.len() == 1 && aw < 3 {
             // single group fills the min 3-cell panel width -> even edges
             aw = 3;

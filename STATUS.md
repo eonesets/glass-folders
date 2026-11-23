@@ -2,7 +2,7 @@
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v0.8 + Threads promo)
+Updated: 2026-11-23 (v0.8.0 public release)
 Progress: 76%
 
 ## Done
@@ -71,6 +71,8 @@ Progress: 76%
 
 - Promo (2026-11-23): Threads thread draft + 5 demo GIFs/MP4 in promo/threads/ (tiles, open, groups, settings, pin).
   Dev env GF_DESKTOP=dir runs app on a demo folder (filmed with copies of Start-menu shortcuts, APPDATA redirected).
+
+- Public on GitHub (2026-11-23): README EN/RU with demo GIFs, MIT, release v0.8.0 (zip). Goal: stars.
 
 ## Next
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

@@ -1,5 +1,5 @@
 Кратко: что решили про приложение «стеклянные папки» на рабочем столе — ответы Тимы на вопросы и технический выбор.
-Дизайн-макеты: docs/mockups.html. Ярлыки на столе уже почищены (2026-11-22).
+Дизайн-макеты: docs/mockups.html. 
 
 # glass-folders — spec (decisions 2026-11-22)
 
@@ -12,7 +12,6 @@ Style: Windows 11 design language (Fluent): matte acrylic/mica glass, rectangula
 - Closed folder tile: user-resizable. Small = mini-grid preview. Large = icons launchable right from desktop.
 - Inside folder: icons only (no game covers).
 - Launch: single click; panel auto-closes after launch.
-- Loose shortcuts (Obsidian, VS Code, Antigravity, AI Hub): separate glass tiles on desktop.
 - Theme: follow Windows light/dark.
 - Groups inside folder: rectangular blocks (e.g. Strategies, Shooters). Folder has grid (e.g. 4x5 or larger); group spans WxH cells, resizable by drag.
 - Grid auto-fits app count so edges stay even (no ragged last row).
@@ -22,7 +21,6 @@ Style: Windows 11 design language (Fluent): matte acrylic/mica glass, rectangula
 - Style: variant A "Mica" chosen. B/C dropped.
 - Inside folder: phone-like. Every slot = square cell, one app per cell, icon fixed square. Group w x h = exactly w*h slots. Never stretch icons/slots. Short names. Labels toggle.
 - Group too small -> last slot shows "+N".
-- Desktop loose shortcuts (Obsidian, VS Code, Antigravity, AI Hub) moved into real folder Desktop\Кодинг.
 
 ## Folder-based model (user idea, core principle)
 - Widget = a real folder on Desktop. New folder on desktop -> new widget automatically.
@@ -32,13 +30,6 @@ Style: Windows 11 design language (Fluent): matte acrylic/mica glass, rectangula
 - Install app -> picks up existing folders as widgets. No import step.
 - Watch Desktop with FileSystemWatcher: add/rename/delete folder or shortcut -> widget updates live.
 
-## Cleanup done 2026-11-22 (all to Recycle Bin)
-- 7 dead .lnk (Battlestate, Diablo IV, EA, CCleaner 7, Unreal Engine, Tor dup).
-- 23 uninstalled Steam/Epic .url (user chose delete all, incl. ones archived on Z:\games).
-- SOFT\фш Photoshop installer (13 GB). Photoshop itself not installed.
-- Fixed SOFT\Tor Browser.lnk -> SOFT\Tor Browser\Browser\firefox.exe.
-- Left: GAMES 27, SOFT 34 + SOFT\музыка 20 (all targets OK).
-- Possible dups to ask: VALORANT x2, Spore + SPORE Collection, FL Studio 2024 + 21, NVIDIA + NVIDIA App.
 
 ## v3 decisions (2026-11-22)
 - No color strip. Color = click the color dot (group header / folder title) -> small popover with 10 colors.

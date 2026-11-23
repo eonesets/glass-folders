@@ -6,6 +6,10 @@ Windows desktop app: each Desktop folder -> glass tile on the desktop; click -> 
 Rust + Slint 1.x, software renderer, own Win32 platform layer. State/progress: STATUS.md. Spec: docs/SPEC.md.
 Rule: when files / key functions / props change, update this map in the same commit. Read only the code the task touches.
 
+## Repo (public, github.com/eonesets/glass-folders)
+- README.md (EN) + README.ru.md, LICENSE (MIT), docs/media/*.gif = README demos. promo/ is gitignored (local social drafts).
+- Release: zip of glass-folders.exe + LICENSE.txt -> `gh release create vX.Y.Z`. Bump app/Cargo.toml version.
+
 ## Files (app/)
 - `ui/app.slint` — ALL UI. Only draws; geometry comes from Rust.
   - Small controls on top: Dot, CapButton, Switch, Seg, Card, RowText, SwitchRow, Hairline, SectionTitle.

@@ -5,7 +5,7 @@
 // Chain: app -> `--guard-start PID` (launcher, exits at once) -> `--guard PID`. The launcher exits, so the guard
 // is not in the app's process tree ("End process tree" / taskkill /T leave it alive).
 // Guard: waits for PID to end. Clean exit cleared settings.homes -> nothing to do. Else, unless a newer app
-// instance holds the main mutex (it repairs on its own start), restores homes from settings and clears them.
+// instance (same desktop + settings) holds the main mutex (it repairs on its own start), restores homes from settings and clears them.
 // Not covered: killing both processes at once (taskkill /IM glass-folders.exe /F) -> next start repairs.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
-use windows::core::w;
+use windows::core::HSTRING;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::Threading::{CreateMutexW, OpenMutexW, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE, SYNCHRONIZATION_SYNCHRONIZE};
@@ -24,17 +24,27 @@ const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
+/// Instance marker name: per desktop folder + settings place (APPDATA). A dev/test run on a demo desktop
+/// must not count as "the app is running" for the user's real one, and the other way round.
+fn mutex_name() -> HSTRING {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new(); // fixed keys: same in app and guard
+    std::env::var("APPDATA").unwrap_or_default().to_lowercase().hash(&mut h);
+    win::desktop_dir().to_string_lossy().to_lowercase().hash(&mut h);
+    HSTRING::from(format!("Local\\GlassFolders.Main.{:016x}", h.finish()))
+}
+
 /// App instance marker: held for the whole run (never closed), gone when the process ends.
 pub fn mark_running() {
     unsafe {
         // handle deliberately never closed (HANDLE is Copy: dropping it closes nothing)
-        let _ = CreateMutexW(None, false, w!("Local\\GlassFolders.Main"));
+        let _ = CreateMutexW(None, false, &mutex_name());
     }
 }
 
 fn app_running() -> bool {
     unsafe {
-        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\GlassFolders.Main")) {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &mutex_name()) {
             Ok(h) => {
                 let _ = CloseHandle(h);
                 true

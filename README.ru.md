@@ -2,6 +2,8 @@
 
 [English](README.md) · Русский
 
+[![Latest release](https://img.shields.io/github/v/release/eonesets/glass-folders)](../../releases/latest) [![Downloads](https://img.shields.io/github/downloads/eonesets/glass-folders/total)](../../releases)
+
 Папки как на телефоне, только для рабочего стола Windows.
 Каждая папка на рабочем столе становится стеклянной плиткой с иконками приложений. Нажимаешь на неё, и открывается окно, где ярлыки разложены по группам.
 

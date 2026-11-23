@@ -2,6 +2,8 @@
 
 English · [Русский](README.ru.md)
 
+[![Latest release](https://img.shields.io/github/v/release/eonesets/glass-folders)](../../releases/latest) [![Downloads](https://img.shields.io/github/downloads/eonesets/glass-folders/total)](../../releases)
+
 Phone-style folders for the Windows desktop.
 Every folder on your desktop becomes a glass tile with app icons. Click it, and a panel opens with your shortcuts sorted into groups.
 

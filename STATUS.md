@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.8: кнопка «закрепить» (папка висит открытой на столе, плитка прячется), подсказка с названием ярлыка при наведении, размер иконок в настройках, «+N» на плитке без своей подсветки.
-Ждём: проверка пользователем.
+Кратко: приложение «стеклянные папки» для рабочего стола. Готовим 1.0: большие папки открываются мгновенно, анимации плавные, окно папки по размеру иконок, меню по ПКМ (переименовать, значок, удалить, удалить программу), ярлык можно вытащить на стол или в другую папку. Ветка claude/animations-performance-v1-3ed962, не слита.
+Ждём: проверка пользователем на своём столе.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v0.9.0 release: English UI + language switch, EN/RU README GIFs)
-Progress: 76%
+Updated: 2026-11-23 (1.0: hug-size panel, hint fix, shortcut menu, drag out, guard restores folders on kill)
+Progress: 90%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -76,8 +76,33 @@ Progress: 76%
   Settings labels reworded, one-line rows; Settings title aligned with header buttons.
   README GIFs re-recorded per language: docs/media/en, docs/media/ru (old Russian-only GIFs removed).
 - Public on GitHub (2026-11-23): README EN/RU with demo GIFs, MIT, release v0.8.0 (zip). Goal: stars.
+- 1.0 polish (2026-11-23 night, branch claude/animations-performance-v1-3ed962):
+  - Big folder open: 3.9 s -> 24 ms (icons.rs: 4 loader threads + cache + background prefetch; icons fade in).
+  - Big folder fits the screen: auto group height max 3 rows, up to 12 cols (was 2280 px tall).
+  - Name hint: no empty glass strip under it (WM_GETMINMAXINFO min 1x1).
+  - Frame pacing: loop paced by DwmFlush while animating -> even 120 fps (was 50-60 uneven).
+  - Open / close: panel zooms out of the tile (whole content scaled, fades), lands back softly; no grey flash
+    (panel always NC-active, DWM transitions off).
+  - Window size glides (drag room, unfold, settings); settings page swap without double exposure.
+  - Dropped shortcut glides from cursor into its slot; hover / press fades; dragged tile goes over neighbours;
+    tile "+N" on a soft squircle.
+  - Verified: screen recordings 120 fps (ffmpeg ddagrab) of 11 scenarios on a demo desktop, frame analysis.
+  - Gemini (Antigravity, Neon) motion/UI review: docs/review-2026-11-23-gemini.md. RAM private ~12.6 MB (icon cache).
+
+- Headless UI tests (2026-11-23): env GF_SCRIPT=scenario runs the app with invisible click-through windows,
+  events go straight to Slint (virtual cursor, real mouse untouched), shots/frames from the DIB to PNG, exit 0/1.
+  tests/ui/run.ps1 (demo desktop + own APPDATA in %TEMP%), scenarios open-close, drag-item, hover-hint: all PASS.
+  tests/ui/idle.ps1 = guard for rare real-input checks (abort if user idle < 120 s).
 
 ## Next
+- 1.0: user check on the real desktop, then merge branch + bump version + release.
+  Not checked on the real screen yet (headless tests only): native menu look (dark), rename box focus, PickIconDlg,
+  uninstaller run, drop onto the real desktop (icon placed at drop point), Fly icon + tile highlight while dragging.
+- Guard: killing app AND guard together (taskkill /IM glass-folders.exe /F) still leaves folders hidden until next start.
+  Task Manager shows 2 glass-folders.exe while folders are hidden (app + guard, guard ~1 MB, 0 CPU).
+- Shortcut rename: renamed item re-sorts by name (keeps place only if the group has a saved order).
+- From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
+  header, tooltip fade, unfolded rows fade-in, row hysteresis on tile resize.
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
 - Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them).
 - New folder on Desktop while running: no tile until restart. "Show hidden files" on -> tiled folders show dimmed.
@@ -95,6 +120,7 @@ GitHub (private): https://github.com/eonesets/glass-folders, branch main.
 ## Run
 `app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
 Build: `cargo build --release` in app/.
+UI tests (no real mouse): `powershell -File tests/ui/run.ps1` (GF_SCRIPT, GF_OUT, GF_OFFSCREEN, GF_TIMEOUT). See CLAUDE.md.
 
 - v0.7 (2026-11-22): launch from tile.
   - Launch counts per item file name in .glassfolder.json "uses" (panel + tile launches).

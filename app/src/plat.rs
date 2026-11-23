@@ -7,6 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use slint::platform::{
 use slint::{EventLoopError, LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, PlatformError};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -28,6 +30,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+// ---------- dev perf log: env GF_PERF=file -> timings (paint ms, open steps) ----------
+
+thread_local! {
+    static PERF: Option<RefCell<std::fs::File>> =
+        std::env::var("GF_PERF").ok().and_then(|p| std::fs::File::create(p).ok()).map(RefCell::new);
+    static T0: Instant = Instant::now();
+}
+
+/// One line "t_ms text" to the GF_PERF file (no-op without it).
+pub fn perf(msg: impl FnOnce() -> String) {
+    PERF.with(|p| {
+        if let Some(f) = p {
+            use std::io::Write;
+            let t = T0.with(|t| t.elapsed().as_secs_f64() * 1000.0);
+            let _ = writeln!(f.borrow_mut(), "{t:9.1} {}", msg());
+        }
+    });
+}
 
 // ---------- pixel type = DIB layout (premultiplied BGRA) ----------
 
@@ -102,9 +123,10 @@ pub struct GfWindow {
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
     surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
-    /// Animation: window shows only part of its content. (home = where content's top-left is on screen,
-    /// shown rect). Slint keeps its full size; paint + mouse are offset.
-    view: Cell<Option<(POINT, RECT)>>,
+    /// Open / close animation: whole content scaled into this screen rect, faded (0..1).
+    /// Slint keeps its full size (no relayout per frame); paint + mouse are scaled.
+    zview: Cell<Option<(RECT, f32)>>,
+    zdib: RefCell<Option<Dib>>, // scaled frame
     glide: RefCell<Option<slint::Timer>>,
 }
 
@@ -163,6 +185,9 @@ pub fn snap_pos(x: i32, y: i32, s: f32) -> (i32, i32) {
     (snap(x, wa.left, CELL_W), snap(y, wa.top, CELL_H))
 }
 const DRAG_START: i32 = 4; // px before press becomes drag (else it is a click)
+/// Interval for timers that step an animation: "every frame". The event loop runs one pass per screen
+/// refresh while such a timer is due (DwmFlush), so each pass = one new frame, evenly spaced.
+pub const FRAME: Duration = Duration::from_millis(1);
 const GLIDE_MS: f32 = 130.0; // tile settles onto the grid after release
 
 thread_local! {
@@ -193,8 +218,16 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
         let hwnd = g.hwnd.get();
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let n = if kind != Kind::Panel { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
+            let n = if kind != Kind::Panel || offscreen() { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, n);
+            if kind == Kind::Hint {
+                // Hint: plain popup. A thick frame makes Windows keep the window >= ~39px tall whatever
+                // WM_GETMINMAXINFO says -> the 28px label got a second, empty glass strip under it.
+                // No frame = no system backdrop: the label paints its own (near-opaque) background.
+                let st = GetWindowLongPtrW(hwnd, GWL_STYLE) & !((WS_CAPTION.0 | WS_THICKFRAME.0) as isize);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, st);
+                let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
         }
     }
 }
@@ -234,9 +267,8 @@ pub fn set_on_moved(window: &slint::Window, f: impl Fn(RECT) + 'static) {
 /// Panel: header was pressed -> following mouse moves drag the window (same code as tile move).
 pub fn start_move(window: &slint::Window) {
     let Some(g) = find(window) else { return };
-    let mut d = Drag { resize: false, cursor: POINT::default(), rect: RECT::default(), moved: false };
+    let mut d = Drag { resize: false, cursor: cursor_pos(), rect: RECT::default(), moved: false };
     unsafe {
-        let _ = GetCursorPos(&mut d.cursor);
         let _ = GetWindowRect(g.hwnd.get(), &mut d.rect);
     }
     g.drag.set(Some(d));
@@ -246,30 +278,90 @@ pub fn set_snap(on: bool) {
     SNAP.with(|s| s.set(on));
 }
 
-/// Animation frame: window shows `shown` (screen rect) of its content, whose top-left sits at `home`.
-/// None = normal (window = content at home). Content size is untouched (no relayout per frame).
-pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
+/// Animation frame: the whole content scaled into screen rect `r` (same aspect -> uniform scale),
+/// faded by `fade` 0..1. Content size is untouched (no relayout per frame).
+pub fn set_zoom_view(window: &slint::Window, r: RECT, fade: f32) {
     let Some(g) = find(window) else { return };
-    let was = g.view.replace(v);
+    g.zview.set(Some((r, fade.clamp(0.0, 1.0))));
     let hwnd = g.hwnd.get();
-    let (x, y, w, h) = match (v, was) {
-        (Some((_, r)), _) => (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)),
-        (None, Some((home, _))) => {
-            let PhysicalSize { width, height } = g.size.get();
-            (home.x, home.y, width as i32, height as i32)
-        }
-        (None, None) => return,
-    };
+    let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
     unsafe {
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        let _ = InvalidateRect(Some(hwnd), None, false);
-        let _ = UpdateWindow(hwnd); // paint now: no frame with stale content
+        // frame ready before the window changes, then move + blit in one go (no WM_PAINT round trip,
+        // no copy of old bits): DWM gets new geometry and new content together
+        let sdc = GetDC(None);
+        let ok = g.draw(sdc) && g.zoom_into(sdc, w as u32, h as u32);
+        let _ = ReleaseDC(None, sdc);
+        // DWM may show one frame between move and blit: shrinking -> new (smaller) picture first, growing ->
+        // bigger window first. Either way that frame has a bit of empty glass, never cut-off content.
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut cur);
+        let shrink = w < cur.right - cur.left;
+        if ok && shrink {
+            g.blit();
+        }
+        let _ = SetWindowPos(hwnd, None, r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
+        if ok {
+            if !shrink {
+                g.blit();
+            }
+            let _ = ValidateRect(Some(hwnd), None);
+        } else {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 }
 
-/// Where the content's top-left is while an animation frame is shown.
-pub fn view_home(window: &slint::Window) -> Option<POINT> {
-    find(window)?.view.get().map(|(h, _)| h)
+/// Animation over: window = content at full size again, top-left at `home` (None = stay, e.g. hidden).
+pub fn end_zoom_view(window: &slint::Window, home: Option<POINT>) {
+    let Some(g) = find(window) else { return };
+    if g.zview.take().is_none() {
+        return;
+    }
+    g.zdib.borrow_mut().take();
+    if let Some(p) = home {
+        let PhysicalSize { width, height } = g.size.get();
+        let hwnd = g.hwnd.get();
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, p.x, p.y, width as i32, height as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+/// Open / close animation frame being shown (window is not at its full size)?
+pub fn zoom_view_on(window: &slint::Window) -> bool {
+    find(window).is_some_and(|g| g.zview.get().is_some())
+}
+
+/// Bilinear scale of premultiplied pixels, times `fade` (premultiplied: all channels scale).
+fn scale_pixels(src: &[Bgra], sw: usize, sh: usize, dst: &mut [Bgra], dw: usize, dh: usize, fade: f32) {
+    let f = (fade * 256.0).round() as u32;
+    let xs: Vec<(usize, usize, u32)> = (0..dw)
+        .map(|x| {
+            let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+            let x0 = (fx as usize).min(sw - 1);
+            let x1 = (x0 + 1).min(sw - 1);
+            (x0, x1, ((fx - x0 as f32) * 256.0) as u32)
+        })
+        .collect();
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+        let y0 = (fy as usize).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = ((fy - y0 as f32) * 256.0) as u32;
+        let (r0, r1) = (&src[y0 * sw..y0 * sw + sw], &src[y1 * sw..y1 * sw + sw]);
+        for (o, &(x0, x1, tx)) in dst[y * dw..y * dw + dw].iter_mut().zip(&xs) {
+            let (a, b, c, d) = (r0[x0], r0[x1], r1[x0], r1[x1]);
+            let mix = |p: u8, q: u8, s: u8, t: u8| -> u8 {
+                let top = p as u32 * (256 - tx) + q as u32 * tx;
+                let bot = s as u32 * (256 - tx) + t as u32 * tx;
+                let v = (top * (256 - ty) + bot * ty) >> 16;
+                ((v * f) >> 8) as u8
+            };
+            *o = Bgra { b: mix(a.b, b.b, c.b, d.b), g: mix(a.g, b.g, c.g, d.g), r: mix(a.r, b.r, c.r, d.r), a: mix(a.a, b.a, c.a, d.a) };
+        }
+    }
 }
 
 /// Screen rect of a window (physical px).
@@ -277,14 +369,13 @@ pub fn view_home(window: &slint::Window) -> Option<POINT> {
 /// an element that itself moves with the drag drifts.
 pub fn cursor_logical(window: &slint::Window) -> Option<(f32, f32)> {
     let g = find(window)?;
-    let mut c = POINT::default();
+    let mut c = cursor_pos();
     unsafe {
-        let _ = GetCursorPos(&mut c);
         let _ = ScreenToClient(g.hwnd.get(), &mut c);
     }
-    let (ox, oy) = g.offset();
+    let (x, y) = g.unzoom(c.x as f32, c.y as f32);
     let s = g.scale.get();
-    Some(((c.x + ox) as f32 / s, (c.y + oy) as f32 / s))
+    Some((x / s, y / s))
 }
 
 pub fn rect_of(window: &slint::Window) -> Option<RECT> {
@@ -294,6 +385,49 @@ pub fn rect_of(window: &slint::Window) -> Option<RECT> {
         let _ = GetWindowRect(g.hwnd.get(), &mut r);
     }
     Some(r)
+}
+
+/// Free desktop (icon layer / wallpaper) under screen point p, not some app window.
+/// Script mode (virtual cursor): always (the real screen is not part of the test).
+pub fn desktop_at(p: POINT) -> bool {
+    if VCURSOR.with(|v| v.get()).is_some() {
+        return true;
+    }
+    unsafe {
+        let w = WindowFromPoint(p);
+        if w.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(w, GA_ROOT);
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(root, &mut buf) as usize;
+        let class = String::from_utf16_lossy(&buf[..n]);
+        class == "Progman" || class == "WorkerW"
+    }
+}
+
+thread_local! {
+    static ON_QUIT: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
+}
+
+/// App-wide clean quit (close request from outside, session end). Called at most once.
+pub fn set_on_quit(f: impl Fn() + 'static) {
+    ON_QUIT.with(|q| *q.borrow_mut() = Some(Rc::new(f)));
+}
+
+fn quit_now() {
+    if let Some(f) = ON_QUIT.with(|q| q.borrow_mut().take()) {
+        f();
+    }
+}
+
+/// Bring window to the foreground (panel back after a dialog / rename box).
+pub fn activate(window: &slint::Window) {
+    if let Some(g) = find(window) {
+        unsafe {
+            let _ = SetForegroundWindow(g.hwnd.get());
+        }
+    }
 }
 
 pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
@@ -323,7 +457,8 @@ impl GfWindow {
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
             surrogate: Cell::new(0),
-            view: Cell::new(None),
+            zview: Cell::new(None),
+            zdib: RefCell::new(None),
             glide: RefCell::new(None),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
@@ -340,16 +475,36 @@ impl GfWindow {
         let x = (lp.0 & 0xffff) as i16 as f32;
         let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
         let s = self.scale.get();
-        let (ox, oy) = self.offset();
-        LogicalPosition::new((x + ox as f32) / s, (y + oy as f32) / s)
+        let (x, y) = self.unzoom(x, y);
+        LogicalPosition::new(x / s, y / s)
     }
 
-    /// Content px hidden left/above the shown part (animation), else 0.
-    fn offset(&self) -> (i32, i32) {
-        match self.view.get() {
-            Some((home, r)) => (r.left - home.x, r.top - home.y),
-            None => (0, 0),
+    /// Client px -> content px (differs only while the open / close animation scales the content).
+    fn unzoom(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.zview.get() {
+            Some((r, _)) => {
+                let k = (r.right - r.left).max(1) as f32 / self.size.get().width.max(1) as f32;
+                (x / k, y / k)
+            }
+            None => (x, y),
         }
+    }
+
+    /// Scale the rendered content into the w x h animation frame (zdib). False = no pixels.
+    unsafe fn zoom_into(&self, ref_dc: HDC, w: u32, h: u32) -> bool {
+        let Some((_, fade)) = self.zview.get() else { return false };
+        let PhysicalSize { width: sw, height: sh } = self.size.get();
+        let dib = self.dib.borrow();
+        let Some(src) = dib.as_ref() else { return false };
+        let mut z = self.zdib.borrow_mut();
+        if z.as_ref().map(|d| (d.w, d.h)) != Some((w, h)) {
+            *z = make_dib(ref_dc, w, h);
+        }
+        let Some(d) = z.as_ref() else { return false };
+        let s = std::slice::from_raw_parts(src.bits, (sw * sh) as usize);
+        let o = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
+        scale_pixels(s, sw as usize, sh as usize, o, w as usize, h as usize, fade);
+        true
     }
 
     /// Ease the window to rect `to` (screen px), then report the final rect (tile settles onto grid).
@@ -361,7 +516,7 @@ impl GfWindow {
         let start = Instant::now();
         let weak = Rc::downgrade(self);
         let t = slint::Timer::default();
-        t.start(slint::TimerMode::Repeated, Duration::from_millis(8), move || {
+        t.start(slint::TimerMode::Repeated, FRAME, move || {
             let Some(g) = weak.upgrade() else { return };
             if g.glide.borrow().is_none() {
                 return; // finished
@@ -388,6 +543,51 @@ impl GfWindow {
         *self.glide.borrow_mut() = Some(t);
     }
 
+    fn mouse_move(&self, p: LogicalPosition) {
+        if self.drag_to() {
+            return;
+        }
+        self.window.dispatch_event(WindowEvent::PointerMoved { position: p });
+    }
+
+    fn mouse_down(&self, p: LogicalPosition, button: PointerEventButton) {
+        if button == PointerEventButton::Left && self.kind.get() == Kind::Tile {
+            self.glide.borrow_mut().take();
+            let mut d = Drag { resize: self.in_grip(p), cursor: cursor_pos(), rect: RECT::default(), moved: false };
+            unsafe {
+                let _ = GetWindowRect(self.hwnd.get(), &mut d.rect);
+            }
+            self.drag.set(Some(d));
+        }
+        self.window.dispatch_event(WindowEvent::PointerPressed { position: p, button });
+    }
+
+    /// `drag` = taken by the caller (wndproc must take it before ReleaseCapture clears it).
+    fn mouse_up(self: &Rc<Self>, p: LogicalPosition, button: PointerEventButton, drag: Option<Drag>) {
+        if drag.is_some_and(|d| d.moved) {
+            // drag ended: release outside -> TouchArea gives no click
+            self.window.dispatch_event(WindowEvent::PointerReleased {
+                position: LogicalPosition::new(-1.0, -1.0),
+                button: PointerEventButton::Left,
+            });
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(self.hwnd.get(), &mut r);
+            }
+            if self.kind.get() == Kind::Tile {
+                // land: size on whole cells, place on grid (setting) -> short glide there
+                let s = self.scale.get();
+                let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
+                let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
+                self.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
+            } else if let Some(f) = self.on_moved.borrow().clone() {
+                f(r);
+            }
+            return;
+        }
+        self.window.dispatch_event(WindowEvent::PointerReleased { position: p, button });
+    }
+
     fn in_grip(&self, p: LogicalPosition) -> bool {
         let s = self.scale.get();
         let PhysicalSize { width: w, height: h } = self.size.get();
@@ -397,13 +597,23 @@ impl GfWindow {
     /// Tile drag step. Returns true while a real drag (not a click) is going on.
     fn drag_to(&self) -> bool {
         let Some(mut d) = self.drag.get() else { return false };
-        let mut c = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut c);
-        }
+        let c = cursor_pos();
         let (dx, dy) = (c.x - d.cursor.x, c.y - d.cursor.y);
         if !d.moved && dx.abs() <= DRAG_START && dy.abs() <= DRAG_START {
             return false;
+        }
+        if !d.moved && self.kind.get() == Kind::Tile {
+            // dragged tile goes over its neighbours (was: slid under them): the others step to the bottom
+            let me = self.hwnd.get();
+            ALL.with(|v| {
+                for o in v.borrow().iter().filter_map(|w| w.upgrade()) {
+                    if o.kind.get() == Kind::Tile && o.hwnd.get() != me {
+                        unsafe {
+                            let _ = SetWindowPos(o.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+            });
         }
         d.moved = true;
         self.drag.set(Some(d));
@@ -436,7 +646,7 @@ impl GfWindow {
             return;
         }
         self.size.set(PhysicalSize::new(w, h));
-        if self.view.get().is_none() {
+        if self.zview.get().is_none() {
             unsafe {
                 let _ = SetWindowPos(self.hwnd.get(), None, 0, 0, w as i32, h as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -457,22 +667,52 @@ impl GfWindow {
         let buf = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
         buf.fill(Bgra::default());
         self.renderer.render(buf, w as usize);
+        REC.with(|r| {
+            let mut r = r.borrow_mut();
+            let Some(rec) = r.as_mut().filter(|r| r.hwnd == self.hwnd.get().0 as isize && Instant::now() < r.until) else { return };
+            // whole content (zoomed open/close frames are scaled copies of it, not recorded)
+            let (ox, oy, fw, fh) = (0u32, 0u32, w, h);
+            let (fw, fh) = (fw.min(w.saturating_sub(ox)), fh.min(h.saturating_sub(oy)));
+            if fw > 0 && fh > 0 {
+                rec.frames.push((fw, fh, rgba(buf, w, ox, oy, fw, fh)));
+            }
+        });
         true
     }
 
     /// WM_PAINT + BitBlt. Panel: DWM reads alpha via the hidden extended frame.
     /// Tile: content is opaque (own blurred wallpaper), DWM rounds the corners.
+    /// Copy the rendered DIB to the window now (shown part only while animating).
+    unsafe fn blit(&self) {
+        let hwnd = self.hwnd.get();
+        let hdc = GetDC(Some(hwnd));
+        self.blit_to(hdc);
+        let _ = ReleaseDC(Some(hwnd), hdc);
+    }
+
+    /// Rendered frame -> window DC: the scaled animation frame while zoomed, else the content.
+    unsafe fn blit_to(&self, hdc: HDC) {
+        let zoomed = self.zview.get().is_some();
+        let src = if zoomed { self.zdib.borrow() } else { self.dib.borrow() };
+        if let Some(d) = src.as_ref() {
+            let _ = BitBlt(hdc, 0, 0, d.w as i32, d.h as i32, Some(d.dc), 0, 0, SRCCOPY);
+        }
+    }
+
     fn paint(&self) {
         let hwnd = self.hwnd.get();
         let PhysicalSize { width: w, height: h } = self.size.get();
         let mut ps = PAINTSTRUCT::default();
         unsafe {
             let hdc = BeginPaint(hwnd, &mut ps);
+            let t = Instant::now();
             if self.draw(hdc) {
-                if let Some(d) = self.dib.borrow().as_ref() {
-                    let (ox, oy) = self.offset();
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
+                let k = self.kind.get() as u8;
+                perf(|| format!("paint k{k} {w}x{h} {:.2}ms", t.elapsed().as_secs_f64() * 1000.0));
+                if let Some((r, _)) = self.zview.get() {
+                    self.zoom_into(hdc, (r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
                 }
+                self.blit_to(hdc);
             }
             let _ = EndPaint(hwnd, &ps);
         }
@@ -519,7 +759,18 @@ impl WindowAdapter for GfWindow {
                     SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
                     return Ok(());
                 }
+                if offscreen() {
+                    // headless test: never take focus from the user; Slint still sees an active window
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    self.window.dispatch_event(WindowEvent::WindowActiveChanged(true));
+                    return Ok(());
+                }
                 let tile = self.kind.get() == Kind::Tile || self.pinned.get();
+                if !tile {
+                    // look active from the first frame: real activation lands a few frames later, until then
+                    // DWM drew the inactive flat grey instead of acrylic (grey flash at the start of open)
+                    SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                }
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
                     let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -531,6 +782,7 @@ impl WindowAdapter for GfWindow {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 // free pixel memory while hidden
                 self.dib.borrow_mut().take();
+                self.zdib.borrow_mut().take();
             }
         }
         Ok(())
@@ -588,8 +840,10 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
             ..Default::default()
         };
         RegisterClassExW(&wc); // fails harmlessly after the first time
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+        // headless test: layered alpha 0 + click-through = invisible, mouse goes to the user's windows
+        let ex = if offscreen() { WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE } else { WS_EX_TOOLWINDOW };
+        let hwnd = CreateWindowExW(
+            ex,
             CLASS,
             w!("Glass Folders"),
             // Thick frame = DWM treats it as a framed window -> per-pixel alpha + backdrop work.
@@ -604,7 +858,11 @@ fn create_hwnd() -> Result<HWND, PlatformError> {
             Some(inst.into()),
             None,
         )
-        .map_err(|e| PlatformError::Other(e.to_string()))
+        .map_err(|e| PlatformError::Other(e.to_string()))?;
+        if offscreen() {
+            let _ = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), 0, LWA_ALPHA);
+        }
+        Ok(hwnd)
     }
 }
 
@@ -652,10 +910,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = TrackMouseEvent(&mut t);
                 g.tracking.set(true);
             }
-            if g.drag_to() {
-                return LRESULT(0);
-            }
-            g.window.dispatch_event(WindowEvent::PointerMoved { position: g.logical(lp) });
+            g.mouse_move(g.logical(lp));
             return LRESULT(0);
         }
         WM_MOUSELEAVE => {
@@ -665,44 +920,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             SetCapture(hwnd);
-            if msg == WM_LBUTTONDOWN && g.kind.get() == Kind::Tile {
-                g.glide.borrow_mut().take();
-                let mut d = Drag { resize: g.in_grip(g.logical(lp)), cursor: POINT::default(), rect: RECT::default(), moved: false };
-                let _ = GetCursorPos(&mut d.cursor);
-                let _ = GetWindowRect(hwnd, &mut d.rect);
-                g.drag.set(Some(d));
-            }
-            g.window.dispatch_event(WindowEvent::PointerPressed { position: g.logical(lp), button: btn(msg) });
+            g.mouse_down(g.logical(lp), btn(msg));
             return LRESULT(0);
         }
         WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
             // take drag first: ReleaseCapture sends WM_CAPTURECHANGED, which clears it
             let drag = if msg == WM_LBUTTONUP { g.drag.take() } else { None };
             let _ = ReleaseCapture();
-            {
-                if let Some(d) = drag {
-                    if d.moved {
-                        // drag ended: release outside -> TouchArea gives no click
-                        g.window.dispatch_event(WindowEvent::PointerReleased {
-                            position: LogicalPosition::new(-1.0, -1.0),
-                            button: PointerEventButton::Left,
-                        });
-                        let mut r = RECT::default();
-                        let _ = GetWindowRect(hwnd, &mut r);
-                        if g.kind.get() == Kind::Tile {
-                            // land: size on whole cells, place on grid (setting) -> short glide there
-                            let s = g.scale.get();
-                            let (w, h) = snap_size(r.right - r.left, r.bottom - r.top, s);
-                            let (x, y) = if SNAP.with(|v| v.get()) { snap_pos(r.left, r.top, s) } else { (r.left, r.top) };
-                            g.glide_to(RECT { left: x, top: y, right: x + w, bottom: y + h });
-                        } else if let Some(f) = g.on_moved.borrow().clone() {
-                            f(r);
-                        }
-                        return LRESULT(0);
-                    }
-                }
-            }
-            g.window.dispatch_event(WindowEvent::PointerReleased { position: g.logical(lp), button: btn(msg) });
+            g.mouse_up(g.logical(lp), btn(msg), drag);
             return LRESULT(0);
         }
         // Keys: special keys from WM_KEYDOWN/UP, typed text from WM_CHAR (TranslateMessage).
@@ -752,7 +977,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE if g.kind.get() != Kind::Panel => return LRESULT(MA_NOACTIVATE as isize),
         // Tile / hint / pinned panel: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
         // lParam -1: DefWindowProc skips NC repaint. Focus/foreground untouched.
-        WM_NCACTIVATE if g.kind.get() != Kind::Panel || g.pinned.get() => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
+        // always NC-active: live acrylic. Panel too: it closes on focus loss, and its fold-back ran on the
+        // inactive flat grey backdrop (grey box at the end of close).
+        WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));
@@ -789,9 +1016,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             g.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
         }
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        // Thick frame -> Windows clamps size to a min track size (~136x39); this lifts the width part
+        // (open animation starts at the tile's real size). Height stays >= ~39 on framed windows: Hint has no frame.
+        WM_GETMINMAXINFO => {
+            let mm = &mut *(lp.0 as *mut MINMAXINFO);
+            mm.ptMinTrackSize = POINT { x: 1, y: 1 };
+            return LRESULT(0);
+        }
         WM_NCHITTEST if g.kind.get() == Kind::Hint => return LRESULT(-1), // HTTRANSPARENT: mouse goes to the window below
         WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
-        WM_CLOSE => return LRESULT(0),
+        // Alt+F4 on a folder window: ignored (Esc / X close it). Close request to any other window of ours =
+        // taskkill without /F, Task Manager "End task": quit cleanly (folders back).
+        WM_CLOSE => {
+            if g.kind.get() != Kind::Panel {
+                quit_now();
+            }
+            return LRESULT(0);
+        }
+        WM_QUERYENDSESSION => return LRESULT(1),
+        // log off / shut down: the process may be killed right after this returns -> restore now
+        WM_ENDSESSION if wp.0 != 0 => {
+            quit_now();
+            return LRESULT(0);
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wp, lp)
@@ -867,20 +1114,25 @@ impl Platform for GfPlatform {
             if self.quit.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            // Animations running -> ~60 fps; else sleep until next timer or input (idle = 0 CPU).
+            // Animation running (Slint's own, or a frame timer of ours): one pass per screen refresh,
+            // paced by DwmFlush (waits for the next composition). Was: a 16 ms wait / 8 ms timers on the
+            // ~15.6 ms system tick -> 50-60 fps on a 120 Hz screen with uneven steps (judder).
+            // Else sleep until the next timer or input (idle = 0 CPU).
             let animating = ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).any(|g| g.window.has_active_animations()));
             if animating {
                 ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).for_each(|g| g.request_redraw()));
             }
-            let timeout = if animating {
-                16
+            let next = slint::platform::duration_until_next_timer_update();
+            let paced = animating || next.is_some_and(|d| d <= Duration::from_millis(12));
+            let timeout = if paced {
+                0
             } else {
-                slint::platform::duration_until_next_timer_update()
-                    .map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32)
-                    .unwrap_or(u32::MAX) // INFINITE
+                next.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(u32::MAX) // INFINITE
             };
             unsafe {
-                MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                if timeout > 0 {
+                    MsgWaitForMultipleObjects(None, false, timeout, QS_ALLINPUT);
+                }
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
                         return Ok(());
@@ -888,7 +1140,156 @@ impl Platform for GfPlatform {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+                if paced {
+                    let _ = DwmFlush();
+                }
             }
         }
     }
+}
+// ---------- headless test hooks (GF_SCRIPT) ----------
+// Script events go straight to Slint (dispatch_event); the real cursor is never read or moved.
+// Drag code reads cursor_pos(): in script mode = virtual cursor set by inject().
+
+thread_local! {
+    static OFFSCREEN: Cell<bool> = const { Cell::new(false) };
+    static VCURSOR: Cell<Option<POINT>> = const { Cell::new(None) };
+    static REC: RefCell<Option<Rec>> = const { RefCell::new(None) };
+}
+
+struct Rec {
+    hwnd: isize,
+    until: Instant,
+    frames: Vec<(u32, u32, Vec<u8>)>,
+}
+
+thread_local! {
+    /// Script mode: answer for the next native popup menu (no modal menu loop in tests).
+    static MENU_PICK: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Script: the next shortcut menu picks item `id` without showing.
+pub fn set_menu_pick(id: u32) {
+    MENU_PICK.with(|v| v.set(Some(id)));
+}
+
+/// Scripted pick (taken once); in script mode with none queued = dismissed. None = show the real menu.
+pub fn take_menu_pick() -> Option<u32> {
+    let p = MENU_PICK.with(|v| v.take());
+    if p.is_some() || VCURSOR.with(|v| v.get()).is_some() { Some(p.unwrap_or(0)) } else { None }
+}
+
+/// Windows invisible + click-through + never activated. Call before the first window is made.
+pub fn set_offscreen(on: bool) {
+    OFFSCREEN.with(|v| v.set(on));
+}
+
+fn offscreen() -> bool {
+    OFFSCREEN.with(|v| v.get())
+}
+
+/// Script mode: cursor_pos() = virtual cursor (starts far away), real cursor never read.
+pub fn set_virtual_cursor() {
+    VCURSOR.with(|v| v.set(Some(POINT { x: -30000, y: -30000 })));
+}
+
+/// Cursor on screen (physical px): real, or virtual in script mode.
+pub fn cursor_pos() -> POINT {
+    VCURSOR.with(|v| v.get()).unwrap_or_else(|| {
+        let mut c = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut c);
+        }
+        c
+    })
+}
+
+#[derive(Clone, Copy)]
+pub enum Ptr {
+    Move,
+    Down(PointerEventButton),
+    Up(PointerEventButton),
+    Leave,
+}
+
+/// Scripted pointer event at content coords (logical px) of a window. Same path as the real mouse,
+/// minus SetCapture / TrackMouseEvent. Returns false if the window is unknown.
+pub fn inject(window: &slint::Window, ev: Ptr, x: f32, y: f32) -> bool {
+    let Some(g) = find(window) else { return false };
+    let s = g.scale.get();
+    let mut pt = POINT { x: (x * s).round() as i32, y: (y * s).round() as i32 };
+    unsafe {
+        let _ = ClientToScreen(g.hwnd.get(), &mut pt);
+    }
+    VCURSOR.with(|v| v.set(Some(pt)));
+    let p = LogicalPosition::new(x, y);
+    match ev {
+        Ptr::Move => g.mouse_move(p),
+        Ptr::Down(b) => g.mouse_down(p, b),
+        Ptr::Up(b) => {
+            let d = if b == PointerEventButton::Left { g.drag.take() } else { None };
+            g.mouse_up(p, b, d)
+        }
+        Ptr::Leave => g.window.dispatch_event(WindowEvent::PointerExited),
+    }
+    true
+}
+
+pub fn is_shown(window: &slint::Window) -> bool {
+    find(window).is_some_and(|g| unsafe { IsWindowVisible(g.hwnd.get()).as_bool() })
+}
+
+/// Render the window now and save its whole content as PNG (straight RGBA). Returns (w, h).
+pub fn shot(window: &slint::Window, path: &Path) -> Result<(u32, u32), String> {
+    let g = find(window).ok_or("unknown window")?;
+    if !unsafe { IsWindowVisible(g.hwnd.get()).as_bool() } {
+        return Err("window hidden".into());
+    }
+    let ok = unsafe {
+        let dc = GetDC(None);
+        let ok = g.draw(dc);
+        ReleaseDC(None, dc);
+        ok
+    };
+    let dib = g.dib.borrow();
+    let d = dib.as_ref().filter(|_| ok).ok_or("no pixels")?;
+    let buf = unsafe { std::slice::from_raw_parts(d.bits, (d.w * d.h) as usize) };
+    save_png(path, d.w, d.h, &rgba(buf, d.w, 0, 0, d.w, d.h))?;
+    Ok((d.w, d.h))
+}
+
+/// Start keeping every frame this window renders for `ms` (animation check).
+pub fn record(window: &slint::Window, ms: u64) -> bool {
+    let Some(g) = find(window) else { return false };
+    REC.with(|r| {
+        *r.borrow_mut() = Some(Rec { hwnd: g.hwnd.get().0 as isize, until: Instant::now() + Duration::from_millis(ms), frames: Vec::new() })
+    });
+    true
+}
+
+/// Frames kept by record(): (w, h, straight RGBA).
+pub fn take_frames() -> Vec<(u32, u32, Vec<u8>)> {
+    REC.with(|r| r.borrow_mut().take()).map(|r| r.frames).unwrap_or_default()
+}
+
+/// Premultiplied BGRA sub-rect -> straight RGBA bytes.
+fn rgba(buf: &[Bgra], stride: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in y..y + h {
+        let from = (row * stride + x) as usize;
+        for p in &buf[from..from + w as usize] {
+            let un = |c: u8| if p.a == 0 { 0 } else { ((c as u32 * 255 + p.a as u32 / 2) / p.a as u32).min(255) as u8 };
+            out.extend_from_slice(&[un(p.r), un(p.g), un(p.b), p.a]);
+        }
+    }
+    out
+}
+
+pub fn save_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut wr = enc.write_header().map_err(|e| e.to_string())?;
+    wr.write_image_data(rgba).map_err(|e| e.to_string())
 }

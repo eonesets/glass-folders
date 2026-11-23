@@ -55,6 +55,7 @@ component CapButton inherits Rectangle {
     width: 46px;
     height: 36px;
     background: ta.pressed ? (danger ? #c42b1ce0 : (dark ? #ffffff10 : #0000000a)) : ta.has-hover ? (danger ? #c42b1c : (dark ? #ffffff18 : #0000000f)) : transparent;
+    animate background { duration: 90ms; }
     Text {
         text: glyph;
         font-family: "Segoe Fluent Icons";
@@ -236,6 +237,7 @@ component Slot inherits Rectangle {
     callback drag-end(length, length);
     callback drag-cancel();
     callback hover(bool); // pointer rests on it (not pressed, not dragged): name hint
+    callback menu(); // right click: shortcut menu (Rust, native popup)
     property <bool> dragging;
     property <bool> hovered: ta.has-hover && !ta.pressed && !dragging && more == 0;
     changed hovered => { root.hover(hovered); }
@@ -243,7 +245,9 @@ component Slot inherits Rectangle {
     height: 76px;
     border-radius: 6px;
     opacity: lifted;
+    animate opacity { duration: 120ms; }
     background: dragging ? transparent : ta.pressed ? (dark ? #ffffff24 : #00000018) : ta.has-hover ? (dark ? #ffffff14 : #0000000c) : transparent;
+    animate background { duration: 100ms; }
 
     if more == 0: Image {
         source: d.icon;
@@ -296,6 +300,9 @@ component Slot inherits Rectangle {
             }
         }
         pointer-event(e) => {
+            if (!dragging && more == 0 && d.id >= 0 && e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                root.menu();
+            }
             if (dragging && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
                 dragging = false;
                 root.drag-end(self.mouse-x, self.mouse-y);
@@ -367,6 +374,7 @@ export component Panel inherits Window {
     callback toggle-pin();
     callback hover(int, length, length, length, length); // slot id (-1 = none) + its rect, window coords
     callback launch(int);
+    callback item-menu(int); // right click on a shortcut (slot id)
     callback open-group(int); // "+N" / fold slot: unfold the group / fold it back
     callback pick-color(int, color);
     callback clear-color(int);
@@ -403,6 +411,13 @@ export component Panel inherits Window {
     in-out property <length> lift-y;
     in-out property <length> lift-w;
     in-out property <length> lift-h;
+    // landing: released shortcut glides from the cursor into its slot (Rust sets the target)
+    in-out property <bool> land-on;
+    in-out property <bool> land-go; // false while placed at the cursor (no glide), true = glide to target
+    in-out property <int> land-id: -1; // slot hidden while its icon is in flight
+    in-out property <image> land-icon;
+    in-out property <length> land-x;
+    in-out property <length> land-y;
 
     property <length> pad: 16px;
     property <length> top: 48px;
@@ -416,11 +431,14 @@ export component Panel inherits Window {
     property <color> fg: dark ? #ffffff : #1b1b1b;
     property <color> accent: dark ? #60cdff : #005fb8;
     // settings page needs room: panel grows while it is shown
-    out property <length> min-w: page == 1 ? 372px : 0px;
+    // folder page: hugs its groups, but the header keeps 3 buttons + a drag strip (buttons slide left with the edge)
+    out property <length> min-w: page == 1 ? 372px : 168px;
     property <length> settings-h: 802px;
 
+    in property <bool> grow-anim; // window size glides (groups make room, unfold, settings); off while opening
     width: max(grid-w + 2 * pad, min-w);
     height: page == 1 ? max(grid-h + top + pad, settings-h) : grid-h + top + pad;
+    animate width, height { duration: grow-anim ? 170ms : 0ms; easing: ease-out; }
 
     // below header, inside window
     pure function inside(x: length, y: length) -> bool {
@@ -429,6 +447,16 @@ export component Panel inherits Window {
 
     public function focus-keys() {
         fs.focus();
+    }
+
+    // dragged shortcut let go: its icon stays at the cursor until Rust says where to glide
+    function start-landing(id: int) {
+        land-go = false;
+        land-x = drag-x;
+        land-y = drag-y;
+        land-icon = drag-icon;
+        land-id = id;
+        land-on = true;
     }
 
     // group starts moving / resizing: drawn from where it is now
@@ -508,6 +536,7 @@ export component Panel inherits Window {
             y: page == 0 ? 12px : 0px; // settings title: centered with back arrow / gear (36px buttons)
             height: page == 0 ? 24px : 36px;
             width: parent.width - self.x - 142px;
+            opacity: self.width > 36px ? 1 : 0; // narrow window: dot only, no "..." stub
             text: page == 0 ? folder-name : (root.en ? "Settings" : "Настройки");
             font-size: page == 0 ? 16px : 14px;
             font-weight: 600;
@@ -544,10 +573,11 @@ export component Panel inherits Window {
         }
 
         // ---------- folder page ----------
+        // page switch: one page fades out fast, the other comes in after it (no double-exposure mix)
         Rectangle {
             opacity: page == 0 ? 1 : 0;
             visible: self.opacity > 0.01;
-            animate opacity { duration: 140ms; }
+            animate opacity { duration: page == 0 ? 160ms : 90ms; delay: page == 0 ? 60ms : 0ms; easing: ease-out; }
 
             // plate of the new group, appears under the dragged item over empty space
             if ghost-on: Rectangle {
@@ -588,6 +618,7 @@ export component Panel inherits Window {
                 background: hot ? accent.with-alpha(0.2) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
                 border-width: hot || lifting ? 2px : 1px;
                 border-color: hot || lifting ? accent : g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
+                animate background, border-color { duration: 120ms; }
                 drop-shadow-blur: lifting ? 14px : 0px;
                 drop-shadow-color: #00000040;
 
@@ -715,8 +746,9 @@ export component Panel inherits Window {
                     labels: root.labels;
                     en: root.en;
                     dark: root.dark;
-                    lifted: me ? (hot ? 0.3 : 0) : 1;
+                    lifted: me ? (hot ? 0.3 : 0) : root.land-on && root.land-id == s.id ? 0 : 1;
                     hover(on) => { root.hover(on ? s.id : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                    menu => { root.item-menu(s.id); }
                     clicked => {
                         if (self.more > 0) {
                             root.open-group(g.idx); // unfold in place
@@ -738,11 +770,13 @@ export component Panel inherits Window {
                     drag-end(mx, my) => {
                         root.drag-x = gr.x + self.x + mx;
                         root.drag-y = gr.y + self.y + my;
+                        root.start-landing(s.id);
                         root.item-drop(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
                         root.drag-id = -1;
                         root.drag-group = -1;
                     }
                     drag-cancel => {
+                        root.start-landing(s.id);
                         root.drag-id = -1;
                         root.drag-group = -1;
                         root.drag-cancel();
@@ -858,6 +892,15 @@ export component Panel inherits Window {
                 }
             }
 
+            // released icon gliding into its slot
+            if land-on: Image {
+                source: land-icon;
+                x: land-x - 24px;
+                y: land-y - 24px;
+                width: 48px;
+                height: 48px;
+                animate x, y { duration: land-go ? 180ms : 0ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
+            }
             // ghost of dragged icon follows cursor
             if drag-id >= 0: Image {
                 source: drag-icon;
@@ -874,8 +917,13 @@ export component Panel inherits Window {
         if page == 1: Rectangle {
             property <length> cw: parent.width - 2 * pad; // card width
             opacity: 0;
-            init => { self.opacity = 1; }
-            animate opacity { duration: 160ms; }
+            y: 10px;
+            init => {
+                self.opacity = 1;
+                self.y = 0;
+            }
+            animate opacity { duration: 180ms; delay: 70ms; easing: ease-out; }
+            animate y { duration: 240ms; delay: 70ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
 
             SectionTitle {
                 x: pad + 2px;
@@ -1149,8 +1197,10 @@ export component Tile inherits Window {
     in property <image> backdrop; // fallback only (GF_FAKE_GLASS): frosted wallpaper copy
     in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
     in property <bool> named: true; // name strip under icons; off = square cells, even edges
+    in property <bool> drop-hot; // a shortcut dragged out of a folder window is over this tile
     callback open();
     callback launch(int); // icon index -> run that file
+    callback item-menu(int); // right click on an icon: shortcut menu
     callback hover(int, length, length, length, length); // icon index (-1 = none) + its rect: name hint
 
     // size comes from Rust, snapped to whole cells (plat.rs tile_size: w = cols*48+12, h = rows*42+30 or rows*48+12)
@@ -1173,10 +1223,11 @@ export component Tile inherits Window {
         background: (dark ? #202020 : #f3f3f3).with-alpha(glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0);
     }
     Rectangle {
-        background: colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
+        background: drop-hot ? (dark ? #ffffff2c : #ffffff70) : colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
+        animate background, border-color { duration: 150ms; }
         border-radius: 8px;
-        border-width: 1px;
-        border-color: colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
+        border-width: drop-hot ? 2px : 1px;
+        border-color: drop-hot ? (dark ? #60cdff : #005fb8) : colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
     }
     if named: Text {
         x: 8px;
@@ -1203,6 +1254,7 @@ export component Tile inherits Window {
             height: 42px;
             border-radius: 6px;
             background: it.pressed ? (dark ? #ffffff30 : #00000020) : it.has-hover ? (dark ? #ffffff1c : #ffffff70) : transparent;
+            animate background { duration: 100ms; }
             Image {
                 x: 4px;
                 y: 3px;
@@ -1213,11 +1265,25 @@ export component Tile inherits Window {
             it := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.launch(i); }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                        root.item-menu(i);
+                    }
+                }
             }
             property <bool> hovered: it.has-hover && !it.pressed;
             changed hovered => { root.hover(hovered ? i : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
         }
-        // "+N": part of the tile itself (no own plate): hover lights the whole tile, drag moves it
+        // "+N": part of the tile itself (no hover of its own): hover lights the whole tile, drag moves it.
+        // Soft squircle behind it = reads as a cell, like the panel's "+N" slot.
+        if over: Rectangle {
+            x: grid-x + mod(cap - 1, cols) * 48px + 2px;
+            y: pad-top + floor((cap - 1) / cols) * cell-h + 2px;
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            background: dark ? #ffffff14 : #0000000d;
+        }
         if over: Text {
             x: grid-x + mod(cap - 1, cols) * 48px - 4px;
             y: pad-top + floor((cap - 1) / cols) * cell-h - 3px;
@@ -1252,7 +1318,7 @@ export component Hint inherits Window {
     out property <length> pw: min(t.preferred-width, 320px) + 20px; // Rust sizes the window from it
     Rectangle {
         border-radius: 6px;
-        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.92);
+        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.97); // own window, no glass behind it
         border-width: 1px;
         border-color: dark ? #ffffff24 : #00000018;
     }
@@ -1266,5 +1332,66 @@ export component Hint inherits Window {
         vertical-alignment: center;
         horizontal-alignment: center;
         color: dark ? #ffffff : #1b1b1b;
+    }
+}
+
+// Rename box: small glass field at the shortcut. Enter = rename, Esc / click away = cancel (Rust).
+export component Ask inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folders rename";
+    in property <bool> dark;
+    in-out property <string> text;
+    callback done(bool, string); // ok, typed text
+    width: 280px;
+    height: 44px;
+    public function start() {
+        ed.focus();
+        ed.select-all();
+    }
+    Rectangle {
+        border-radius: 8px;
+        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.98);
+        border-width: 1px;
+        border-color: dark ? #ffffff30 : #00000020;
+    }
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.done(false, "");
+                return accept;
+            }
+            return reject;
+        }
+        ed := TextInput {
+            x: 12px;
+            y: 0;
+            width: parent.width - 24px;
+            height: parent.height;
+            text <=> root.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            single-line: true;
+            color: dark ? #ffffff : #1b1b1b;
+            selection-background-color: dark ? #60cdff80 : #005fb860;
+            accepted => { root.done(true, self.text); }
+        }
+    }
+}
+
+// Shortcut dragged out of a folder window: its icon follows the cursor (own topmost click-through window).
+export component Fly inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folders drag";
+    in property <image> pic;
+    in property <float> fade: 1;
+    Image {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        source: pic;
+        opacity: 0.9 * fade;
     }
 }

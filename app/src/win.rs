@@ -64,6 +64,9 @@ pub fn glass(hwnd: HWND, dark: bool) {
     unsafe {
         let d: i32 = dark as i32;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as _, 4);
+        // our own grow / fold animation only: DWM's show/hide transition ran on top of it
+        let off: i32 = 1;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as _, 4);
         let c = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &c as *const _ as _, 4);
         let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
@@ -75,6 +78,60 @@ pub fn glass(hwnd: HWND, dark: bool) {
         // No caption color = no band.
         let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &none as *const _ as _, 4);
+    }
+}
+
+/// Frameless popup with per-pixel alpha and no system backdrop (name hint): DWM blends the DIB's
+/// alpha, nothing drawn behind it.
+pub fn clear(hwnd: HWND) {
+    unsafe {
+        let off: i32 = 1;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as _, 4);
+        let c = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &c as *const _ as _, 4);
+        let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+        let b = DWMSBT_NONE;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const _ as _, 4);
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE: no caption band if it ever gets a frame
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &none as *const _ as _, 4);
+    }
+}
+
+/// Native popup menu at the cursor, owned by `owner`. Items: (id, text, enabled); id 0 = separator.
+/// Returns the picked id, 0 = dismissed. Menu colors follow the app theme (uxtheme SetPreferredAppMode).
+pub fn popup_menu(owner: HWND, items: &[(u32, String, bool)], dark: bool) -> u32 {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        // undocumented but stable since 1903: ordinal 135 SetPreferredAppMode(2 dark / 3 light), 136 FlushMenuThemes
+        if let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) {
+            if let Some(f) = GetProcAddress(ux, windows::core::PCSTR(135 as *const u8)) {
+                let set: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+                set(if dark { 2 } else { 3 });
+            }
+            if let Some(f) = GetProcAddress(ux, windows::core::PCSTR(136 as *const u8)) {
+                let flush: extern "system" fn() = std::mem::transmute(f);
+                flush();
+            }
+        }
+        let Ok(m) = CreatePopupMenu() else { return 0 };
+        for (id, text, on) in items {
+            if *id == 0 {
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+            } else {
+                let t = HSTRING::from(text.as_str());
+                let f = if *on { MF_STRING } else { MF_STRING | MF_GRAYED };
+                let _ = AppendMenuW(m, f, *id as usize, &t);
+            }
+        }
+        let mut p = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut p);
+        // owner must be foreground, else the menu does not close on a click elsewhere
+        let _ = SetForegroundWindow(owner);
+        let r = TrackPopupMenuEx(m, (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY).0, p.x, p.y, owner, None);
+        let _ = PostMessageW(Some(owner), WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+        let _ = DestroyMenu(m);
+        r.0 as u32
     }
 }
 
@@ -210,18 +267,19 @@ pub fn work_area() -> RECT {
 // ---------- icons and launch ----------
 
 /// Shell icon of a file/shortcut as straight-alpha RGBA image.
-pub fn icon(path: &Path, px: i32) -> Option<Image> {
+/// Shell icon as RGBA pixels. Thread-safe (needs COM on the calling thread): icons.rs runs it on workers.
+pub fn icon_pixels(path: &Path, px: i32) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
     unsafe {
         let p = HSTRING::from(path.as_os_str());
         let f: IShellItemImageFactory = SHCreateItemFromParsingName(&p, None).ok()?;
         let hb = f.GetImage(SIZE { cx: px, cy: px }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
-        let img = bitmap_to_image(hb);
+        let img = bitmap_to_pixels(hb);
         let _ = DeleteObject(hb.into());
         img
     }
 }
 
-unsafe fn bitmap_to_image(hb: HBITMAP) -> Option<Image> {
+unsafe fn bitmap_to_pixels(hb: HBITMAP) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
     let mut bm = BITMAP::default();
     if GetObjectW(hb.into(), std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as _)) == 0 {
         return None;
@@ -259,7 +317,7 @@ unsafe fn bitmap_to_image(hb: HBITMAP) -> Option<Image> {
     }
     let mut pb = SharedPixelBuffer::<Rgba8Pixel>::new(w as u32, h as u32);
     pb.make_mut_bytes().copy_from_slice(&buf);
-    Some(Image::from_rgba8(pb))
+    Some(pb)
 }
 
 pub fn open(path: &Path) {

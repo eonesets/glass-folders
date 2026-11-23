@@ -145,6 +145,11 @@ fn place(to: &HashMap<PathBuf, POINT>) -> usize {
 }
 
 
+/// Put one desktop icon at screen point `at` (its top-left). False = Explorer does not list it (yet).
+pub fn place_icon(path: &Path, at: POINT) -> bool {
+    place(&HashMap::from([(path.to_path_buf(), at)])) == 1
+}
+
 thread_local! {
     /// Folders we hid -> home spots of their icons (screen px).
     static HOME: RefCell<HashMap<PathBuf, POINT>> = RefCell::new(HashMap::new());

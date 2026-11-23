@@ -1,0 +1,25 @@
+# Кратко: ПКМ по ярлыку -> «Переименовать» -> ввод имени -> Enter: файл переименован; ПКМ -> «Удалить ярлык»: файл в корзине.
+#settings {"lang":0,"labels":false}
+open Work
+wait 500
+menu 2
+rclick 68 105
+wait 100
+shown ask
+target ask
+type zeta
+key Return
+wait 100
+hidden ask
+exists Work/Docs/zeta.bat
+missing Work/Docs/alpha.bat
+target panel
+shown panel
+shot renamed
+menu 4
+rclick 68 105
+wait 100
+# zeta sorts after beta: first slot is beta now
+missing Work/Docs/beta.bat
+exists Work/Docs/zeta.bat
+shot deleted

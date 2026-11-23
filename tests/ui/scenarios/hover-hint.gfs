@@ -1,0 +1,19 @@
+# Кратко: навести на ярлык alpha -> через 400 мс появляется подсказка с именем; увести -> подсказка прячется.
+# names under icons off: else the app shows no hint (by design)
+#settings {"lang":0,"labels":false}
+open Work
+wait 500
+move 68 105
+wait 100
+hidden hint
+wait 600
+shown hint
+fits hint
+fits panel
+shot panel_hover
+target hint
+shot hint
+target panel
+move 200 30
+wait 100
+hidden hint

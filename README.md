@@ -29,10 +29,16 @@ A plain folder icon tells you nothing until you open it. On a phone, four small 
 
 ![Pin](docs/media/en/pin.gif)
 
+**Right-click a shortcut** (in a folder or on a tile) to rename it, change its icon, delete it, or uninstall the whole app. Uninstall finds the app's own uninstaller and asks first.
+
+**Drag shortcuts out.** Drop a shortcut on another folder's tile to move it there, or on the free desktop to put it back on the desktop.
+
+**Smooth and fast.** Folders open instantly, even with hundreds of shortcuts. Animations follow your screen's refresh rate.
+
 ## Your files stay yours
 
 There is no database. A tile is a real folder on your desktop, a group is a real subfolder inside it. Layout and colors are kept in a small hidden `.glassfolder.json` in each folder.
-Close the app and you have the same plain folders as before.
+Close the app and you have the same plain folders as before. This holds even if the app crashes or is ended in Task Manager: a tiny helper process puts the folders back.
 
 ## Install
 

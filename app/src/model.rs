@@ -94,6 +94,27 @@ pub fn bump_use(root: &Path, item: &Path) {
     let _ = save_cfg(root, &cfg);
 }
 
+/// Shortcut renamed / gone: its launch count and place in its group follow the new name (None = forget).
+pub fn rekey_item(root: &Path, old: &str, new: Option<&str>) {
+    let mut cfg = load_cfg(root);
+    if let Some(n) = cfg.uses.remove(old) {
+        if let Some(new) = new {
+            cfg.uses.insert(new.to_string(), n);
+        }
+    }
+    for g in cfg.groups.values_mut() {
+        if let Some(i) = g.items.iter().position(|k| k == old) {
+            match new {
+                Some(new) => g.items[i] = new.to_string(),
+                None => {
+                    g.items.remove(i);
+                }
+            }
+        }
+    }
+    let _ = save_cfg(root, &cfg);
+}
+
 fn is_hidden(p: &Path) -> bool {
     fs::metadata(p)
         .map(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
@@ -450,29 +471,35 @@ pub fn extent(r: &[GRect]) -> (i32, i32) {
 }
 
 /// Near-square size that fits n items, width capped.
-pub fn auto_size(n: usize, maxw: u32) -> (u32, u32) {
+/// Auto group size (cols, rows): near-square, at most maxh rows (the rest = "+N", unfold shows all).
+pub fn auto_size(n: usize, maxw: u32, maxh: u32) -> (u32, u32) {
     let n = n.max(1) as f64;
     let w = (n.sqrt().ceil() as u32).clamp(1, maxw.max(1));
-    let h = ((n / w as f64).ceil() as u32).max(1);
+    let h = ((n / w as f64).ceil() as u32).clamp(1, maxh.max(1));
     (w, h)
 }
+
+/// Auto rows cap: many groups -> short plates side by side, so a big folder opens screen-sized
+/// (was: 130 items -> 5 groups stacked, panel 2280 px tall, past the screen).
+const AUTO_ROWS: u32 = 3;
+const AUTO_ROWS_ONE: u32 = 7; // single group (only loose shortcuts)
+const AUTO_COLS_MAX: u32 = 12;
 
 /// Rects of all groups: saved place/size, else auto size + first free spot.
 pub fn layout(f: &Folder, gravity: i32) -> Vec<GRect> {
     let total: usize = f.groups.iter().map(|g| g.items.len().max(1)).sum();
-    let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, 8)) as i32;
+    let cols = f.cfg.cols.unwrap_or_else(|| ((total as f64 * 1.6).sqrt().round() as u32).clamp(4, AUTO_COLS_MAX)) as i32;
+    let maxh = if f.groups.len() > 1 { AUTO_ROWS } else { AUTO_ROWS_ONE };
     let mut rects = Vec::new();
     let mut placed = Vec::new(); // groups with saved place
     for (i, g) in f.groups.iter().enumerate() {
         let c = f.cfg.groups.get(&g.name);
-        let (mut aw, mut ah) = auto_size(g.items.len(), cols as u32);
-        if f.groups.len() == 1 && aw < 3 {
-            // single group fills the min 3-cell panel width -> even edges
-            aw = 3;
-            ah = g.items.len().max(1).div_ceil(3) as u32;
-        }
-        let w = c.and_then(|c| c.w).unwrap_or(aw).max(1) as i32;
-        let h = c.and_then(|c| c.h).unwrap_or(ah).max(1) as i32;
+        // panel hugs its groups: no padding to a minimum width
+        let (aw, ah) = auto_size(g.items.len(), cols as u32, maxh);
+        // saved size never wider / taller than its items need (old builds padded to 3 cols -> empty cells)
+        let n = g.items.len().max(1) as u32;
+        let w = c.and_then(|c| c.w).unwrap_or(aw).clamp(1, n) as i32;
+        let h = c.and_then(|c| c.h).unwrap_or(ah).clamp(1, n.div_ceil(w as u32)) as i32;
         let pos = c.and_then(|c| c.x.zip(c.y));
         let (x, y) = pos.unwrap_or((-1, -1));
         if pos.is_some() {
@@ -543,11 +570,12 @@ pub fn settle(r: &mut [GRect], gravity: i32) {
     }
 }
 
-/// Panel grid size in px for rects (+ extra free cols / half-rows), min 3 columns wide.
+/// Panel grid size in px for rects (+ extra free cols / half-rows). No minimum: the window hugs the
+/// groups (header buttons keep it >= PANEL_MIN_W, see app.slint).
 pub fn grid_px(r: &[GRect], extra_c: i32, extra_r: i32) -> (f32, f32) {
     let (c, h) = extent(r);
-    let c = (c + extra_c).max(3);
-    let h = (h + extra_r).max(3);
+    let c = (c + extra_c).max(1);
+    let h = (h + extra_r).max(3); // smallest group: 1 slot row = 3 half-rows
     (c as f32 * PITCH - GAP, h as f32 * ROW - GAP)
 }
 

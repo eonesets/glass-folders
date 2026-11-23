@@ -201,7 +201,10 @@ impl Config {
 
 // ---------- file ops (drag in panel) ----------
 
-pub const NEW_GROUP: &str = "Новая группа";
+/// Name of a freshly created group folder, in the UI language.
+pub fn new_group_name(en: bool) -> &'static str {
+    if en { "New group" } else { "Новая группа" }
+}
 
 /// "name" for n = 1, else "name (n)" + optional extension.
 fn numbered(stem: &str, ext: Option<&str>, n: u32) -> String {
@@ -251,10 +254,10 @@ fn move_unique(src: &Path, dir: &Path, stem: &str, ext: Option<&str>, ok: impl F
     Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free name"))
 }
 
-/// Create empty subfolder "Новая группа" (or " (2)"...) in `root`. Returns its name.
-pub fn create_group(root: &Path) -> std::io::Result<String> {
+/// Create empty subfolder "New group" / "Новая группа" (or " (2)"...) in `root`. Returns its name.
+pub fn create_group(root: &Path, en: bool) -> std::io::Result<String> {
     for n in 1..1000 {
-        let name = numbered(NEW_GROUP, None, n);
+        let name = numbered(new_group_name(en), None, n);
         if name == LOOSE {
             continue;
         }
@@ -312,6 +315,8 @@ pub struct Settings {
     pub homes: BTreeMap<String, [i32; 2]>,
     /// icon size: 0 small, 1 medium, 2 large = zoom of panels and tiles (ZOOM)
     pub isize: i32,
+    /// UI language: 0 Russian, 1 English. Default: Windows UI language (Russian -> 0, else 1).
+    pub lang: i32,
 }
 
 /// Window zoom per icon size setting.
@@ -325,7 +330,19 @@ impl Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, ptitle: true, tnames: true, homes: BTreeMap::new(), isize: 1 }
+        Settings { labels: true, names: true, dots: true, glass: 1, gravity: 1, snap: true, ptitle: true, tnames: true, homes: BTreeMap::new(), isize: 1, lang: sys_lang() }
+    }
+}
+
+/// Windows UI language -> 0 Russian, 1 English (anything not Russian).
+fn sys_lang() -> i32 {
+    let id = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
+    if id & 0x3ff == 0x19 { 0 } else { 1 } // 0x19 = LANG_RUSSIAN
+}
+
+impl Settings {
+    pub fn en(&self) -> bool {
+        self.lang == 1
     }
 }
 

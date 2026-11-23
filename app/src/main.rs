@@ -529,6 +529,7 @@ fn push_settings(panel: &Panel, set: &model::Settings) {
     panel.set_ptitle(set.ptitle);
     panel.set_tnames(set.tnames);
     panel.set_isize(set.isize);
+    panel.set_en(set.en());
 }
 
 /// One setting changed in the settings page (any folder window): applies to all windows + tiles.
@@ -548,6 +549,7 @@ fn set_opt(key: &str, v: i32) {
             "glass" => s.glass = v.clamp(0, 2),
             "snap" => (s.snap, snap_now) = (on, on),
             "isize" => (s.isize, rezoom) = (v.clamp(0, 2), v.clamp(0, 2) != s.isize),
+            "lang" => s.lang = v.clamp(0, 1),
             _ => return,
         }
         model::save_settings(&s);
@@ -973,7 +975,7 @@ fn drop_item(panel: &Panel, app: &Shared, id: i32) {
                 let src_dir = f.groups[sg].dir.clone();
                 let (dst, k, new_name) = match target {
                     Target::Group(t, k) => (f.groups[t].dir.clone(), k, None),
-                    _ => match model::create_group(&root) {
+                    _ => match model::create_group(&root, g().set.borrow().en()) {
                         Ok(n) => (root.join(&n), 0, Some(n)),
                         Err(e) => {
                             eprintln!("glass-folders: create group in {}: {e}", root.display());

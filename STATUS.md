@@ -2,7 +2,7 @@
 Ждём: проверка пользователем.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v0.8.0 public release)
+Updated: 2026-11-23 (English UI + language switch, EN/RU README GIFs)
 Progress: 76%
 
 ## Done
@@ -72,6 +72,9 @@ Progress: 76%
 - Promo (2026-11-23): Threads thread draft + 5 demo GIFs/MP4 in promo/threads/ (tiles, open, groups, settings, pin).
   Dev env GF_DESKTOP=dir runs app on a demo folder (filmed with copies of Start-menu shortcuts, APPDATA redirected).
 
+- English UI (2026-11-23): settings lang 0 ru / 1 en, default from Windows UI language, "Language" seg in settings.
+  Settings labels reworded, one-line rows; Settings title aligned with header buttons.
+  README GIFs re-recorded per language: docs/media/en, docs/media/ru (old Russian-only GIFs removed).
 - Public on GitHub (2026-11-23): README EN/RU with demo GIFs, MIT, release v0.8.0 (zip). Goal: stars.
 
 ## Next

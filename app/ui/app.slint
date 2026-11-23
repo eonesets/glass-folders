@@ -229,6 +229,7 @@ component Slot inherits Rectangle {
     in property <bool> labels;
     in property <bool> dark;
     in property <float> lifted: 1; // opacity: dragged item = faint placeholder / hidden
+    in property <bool> en; // English UI
     in property <int> more; // > 0: this slot shows "+N" instead of its icon; < 0: "fold back" slot
     callback clicked;
     callback drag-move(length, length);
@@ -268,7 +269,7 @@ component Slot inherits Rectangle {
     }
     Text {
         visible: labels;
-        text: more > 0 ? "ещё" : more < 0 ? "свернуть" : d.name;
+        text: more > 0 ? (en ? "more" : "ещё") : more < 0 ? (en ? "fold" : "свернуть") : d.name;
         x: 3px;
         y: 57px;
         width: parent.width - 6px;
@@ -362,6 +363,7 @@ export component Panel inherits Window {
 
     in property <bool> pinned; // pinned open on the desktop (tile hidden)
     in property <int> isize: 1; // icon size 0..2 (settings page)
+    in property <bool> en; // UI language: true = English, false = Russian
     callback toggle-pin();
     callback hover(int, length, length, length, length); // slot id (-1 = none) + its rect, window coords
     callback launch(int);
@@ -415,7 +417,7 @@ export component Panel inherits Window {
     property <color> accent: dark ? #60cdff : #005fb8;
     // settings page needs room: panel grows while it is shown
     out property <length> min-w: page == 1 ? 372px : 0px;
-    property <length> settings-h: 726px;
+    property <length> settings-h: 802px;
 
     width: max(grid-w + 2 * pad, min-w);
     height: page == 1 ? max(grid-h + top + pad, settings-h) : grid-h + top + pad;
@@ -503,10 +505,10 @@ export component Panel inherits Window {
         Text {
             visible: page == 1 || ptitle;
             x: page == 0 ? pad + 26px : 50px;
-            y: 12px;
-            height: 24px;
+            y: page == 0 ? 12px : 0px; // settings title: centered with back arrow / gear (36px buttons)
+            height: page == 0 ? 24px : 36px;
             width: parent.width - self.x - 142px;
-            text: page == 0 ? folder-name : "Настройки";
+            text: page == 0 ? folder-name : (root.en ? "Settings" : "Настройки");
             font-size: page == 0 ? 16px : 14px;
             font-weight: 600;
             overflow: elide;
@@ -562,7 +564,7 @@ export component Panel inherits Window {
                     x: 10px;
                     y: 7px;
                     width: parent.width - 16px;
-                    text: "Новая группа";
+                    text: (root.en ? "New group" : "Новая группа");
                     font-size: 11px;
                     font-weight: 600;
                     overflow: elide;
@@ -613,7 +615,7 @@ export component Panel inherits Window {
                     y: 5px;
                     height: 20px;
                     width: parent.width - self.x - 4px;
-                    text: g.name;
+                    text: g.fixed ? (root.en ? "Misc" : "Разное") : g.name;
                     font-size: 12px;
                     font-weight: 600;
                     overflow: elide;
@@ -711,6 +713,7 @@ export component Panel inherits Window {
                     more: !me && n-eff > cap && e == cap - 1 ? n-eff - cap + 1 : 0;
                     d: s;
                     labels: root.labels;
+                    en: root.en;
                     dark: root.dark;
                     lifted: me ? (hot ? 0.3 : 0) : 1;
                     hover(on) => { root.hover(on ? s.id : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
@@ -754,6 +757,7 @@ export component Panel inherits Window {
                     d: { name: "", id: -1, k: -1 };
                     more: -1;
                     labels: root.labels;
+                    en: root.en;
                     dark: root.dark;
                     clicked => { root.open-group(g.idx); }
                 }
@@ -876,19 +880,19 @@ export component Panel inherits Window {
             SectionTitle {
                 x: pad + 2px;
                 y: top;
-                text: "Папка";
+                text: (root.en ? "Folder" : "Папка");
                 dark: root.dark;
             }
             Card {
                 x: pad;
                 y: top + 24px;
                 width: cw;
-                height: 44px + 52px + 52px;
+                height: 3 * 44px;
                 dark: root.dark;
                 SwitchRow {
                     y: 0;
                     height: 44px;
-                    label: "Название в окне папки";
+                    label: (root.en ? "Folder window title" : "Название окна папки");
                     on: root.ptitle;
                     dark: root.dark;
                     accent: root.accent;
@@ -896,21 +900,19 @@ export component Panel inherits Window {
                 }
                 SwitchRow {
                     y: 44px;
-                    height: 52px;
+                    height: 44px;
                     line: true;
-                    label: "Название под плиткой";
-                    hint: root.tnames ? "Подпись на рабочем столе" : "Плитка без подписи, ровная";
+                    label: (root.en ? "Name on desktop" : "Название на рабочем столе");
                     on: root.tnames;
                     dark: root.dark;
                     accent: root.accent;
                     toggled => { root.set-opt("tnames", root.tnames ? 0 : 1); }
                 }
                 SwitchRow {
-                    y: 96px;
-                    height: 52px;
+                    y: 88px;
+                    height: 44px;
                     line: true;
-                    label: "Плитки по сетке";
-                    hint: root.snap ? "Встают ровно по клеткам" : "Стоят там, где отпустили";
+                    label: (root.en ? "Snap to grid" : "Привязка к сетке");
                     on: root.snap;
                     dark: root.dark;
                     accent: root.accent;
@@ -920,20 +922,20 @@ export component Panel inherits Window {
 
             SectionTitle {
                 x: pad + 2px;
-                y: top + 188px;
-                text: "Группы внутри";
+                y: top + 172px;
+                text: (root.en ? "Folder subgroups" : "Подгруппы папки");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 212px;
+                y: top + 196px;
                 width: cw;
                 height: 3 * 44px + 84px;
                 dark: root.dark;
                 SwitchRow {
                     y: 0;
                     height: 44px;
-                    label: "Названия групп";
+                    label: (root.en ? "Subgroup names" : "Названия подгрупп");
                     on: root.names;
                     dark: root.dark;
                     accent: root.accent;
@@ -943,7 +945,7 @@ export component Panel inherits Window {
                     y: 44px;
                     height: 44px;
                     line: true;
-                    label: "Цветные метки";
+                    label: (root.en ? "Color tags" : "Цветовые метки");
                     on: root.dots;
                     dark: root.dark;
                     accent: root.accent;
@@ -953,7 +955,7 @@ export component Panel inherits Window {
                     y: 88px;
                     height: 44px;
                     line: true;
-                    label: "Подписи под ярлыками";
+                    label: (root.en ? "Shortcut labels" : "Подписи под ярлыками");
                     on: root.labels;
                     dark: root.dark;
                     accent: root.accent;
@@ -969,14 +971,14 @@ export component Panel inherits Window {
                 RowText {
                     y: 132px;
                     height: 40px;
-                    label: "Притяжение групп к углу";
+                    label: (root.en ? "Pull groups to corner" : "Притяжение групп к углу");
                     dark: root.dark;
                 }
                 Seg {
                     x: 12px;
                     y: 132px + 40px;
                     seg-w: (parent.width - 28px) / 3;
-                    items: ["Нет", "Влево", "Вправо"];
+                    items: root.en ? ["None", "Left", "Right"] : ["Нет", "Влево", "Вправо"];
                     sel: root.gravity;
                     dark: root.dark;
                     pick(i) => { root.set-opt("gravity", i); }
@@ -985,13 +987,13 @@ export component Panel inherits Window {
 
             SectionTitle {
                 x: pad + 2px;
-                y: top + 444px;
-                text: "Стекло";
+                y: top + 428px;
+                text: (root.en ? "Glass" : "Стекло");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 468px;
+                y: top + 452px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -999,7 +1001,7 @@ export component Panel inherits Window {
                     x: 12px;
                     y: 12px;
                     seg-w: (parent.width - 28px) / 3;
-                    items: ["Плотное", "Среднее", "Прозрачное"];
+                    items: root.en ? ["Dense", "Medium", "Clear"] : ["Плотное", "Среднее", "Прозрачное"];
                     sel: root.glass;
                     dark: root.dark;
                     pick(i) => { root.set-opt("glass", i); }
@@ -1009,13 +1011,13 @@ export component Panel inherits Window {
             // icon size = zoom of folder windows and desktop tiles (model::ZOOM)
             SectionTitle {
                 x: pad + 2px;
-                y: top + 536px;
-                text: "Размер иконок";
+                y: top + 520px;
+                text: (root.en ? "Icon size" : "Размер иконок");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 560px;
+                y: top + 544px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -1023,17 +1025,41 @@ export component Panel inherits Window {
                     x: 12px;
                     y: 12px;
                     seg-w: (parent.width - 28px) / 3;
-                    items: ["Мелкие", "Средние", "Крупные"];
+                    items: root.en ? ["Small", "Medium", "Large"] : ["Мелкие", "Средние", "Крупные"];
                     sel: root.isize;
                     dark: root.dark;
                     pick(i) => { root.set-opt("isize", i); }
                 }
             }
 
+            // UI language (labels stay bilingual-neutral: each in its own language)
+            SectionTitle {
+                x: pad + 2px;
+                y: top + 612px;
+                text: (root.en ? "Language" : "Язык");
+                dark: root.dark;
+            }
+            Card {
+                x: pad;
+                y: top + 636px;
+                width: cw;
+                height: 52px;
+                dark: root.dark;
+                Seg {
+                    x: 12px;
+                    y: 12px;
+                    seg-w: (parent.width - 28px) / 2;
+                    items: ["Русский", "English"];
+                    sel: root.en ? 1 : 0;
+                    dark: root.dark;
+                    pick(i) => { root.set-opt("lang", i); }
+                }
+            }
+
             // quit: quiet text button, red only on hover
             qb := Rectangle {
                 x: pad;
-                y: top + 628px;
+                y: top + 704px;
                 width: 180px;
                 height: 34px;
                 border-radius: 6px;
@@ -1051,7 +1077,7 @@ export component Panel inherits Window {
                     x: 36px;
                     height: parent.height;
                     vertical-alignment: center;
-                    text: "Закрыть программу";
+                    text: (root.en ? "Quit app" : "Закрыть программу");
                     font-size: 13px;
                     color: qt.has-hover ? (dark ? #ff99a4 : #c42b1c) : (dark ? #ffffffb0 : #1b1b1bb0);
                 }

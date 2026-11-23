@@ -18,7 +18,7 @@ use windows::Win32::System::WindowsProgramming::{
 };
 use windows::Win32::UI::Shell::{
     FileOperation, IFileOperation, IShellItem, IShellLinkW, PickIconDlg, SHChangeNotify,
-    SHCreateItemFromParsingName, ShellExecuteW, ShellLink, FILEOPERATION_FLAGS, FOF_ALLOWUNDO,
+    SHCreateItemFromParsingName, ShellExecuteW, ShellLink, FOF_ALLOWUNDO,
     FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHCNE_UPDATEITEM, SHCNF_PATHW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -33,9 +33,7 @@ pub fn recycle(path: &Path) -> bool {
     let res: windows::core::Result<()> = unsafe {
         (|| {
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-            let flags = FILEOPERATION_FLAGS(
-                FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
-            );
+            let flags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
             op.SetOperationFlags(flags)?;
             let p = HSTRING::from(path.as_os_str());
             let item: IShellItem = SHCreateItemFromParsingName(&p, None)?;
@@ -133,7 +131,7 @@ fn pick_icon_lnk(owner: HWND, path: &Path) -> bool {
             }
 
             let hwnd = (!owner.is_invalid()).then_some(owner);
-            if PickIconDlg(hwnd, PWSTR(buf.as_mut_ptr()), buf.len() as u32, &mut idx) == 0 {
+            if PickIconDlg(hwnd, &mut buf, Some(&mut idx)) == 0 {
                 return Ok(false);
             }
 
@@ -175,7 +173,7 @@ fn pick_icon_url(owner: HWND, path: &Path) -> bool {
         let mut idx = wide_to_string(&idx_buf).trim().parse::<i32>().unwrap_or(0);
 
         let hwnd = (!owner.is_invalid()).then_some(owner);
-        if PickIconDlg(hwnd, PWSTR(buf.as_mut_ptr()), buf.len() as u32, &mut idx) == 0 {
+        if PickIconDlg(hwnd, &mut buf, Some(&mut idx)) == 0 {
             return false;
         }
 

@@ -2,8 +2,8 @@
 Ждём: проверка пользователем на своём столе.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (1.0 polish: perf + motion, branch claude/animations-performance-v1-3ed962)
-Progress: 82%
+Updated: 2026-11-23 (1.0 polish + headless UI tests GF_SCRIPT, tests/ui/run.ps1)
+Progress: 84%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -89,6 +89,11 @@ Progress: 82%
   - Verified: screen recordings 120 fps (ffmpeg ddagrab) of 11 scenarios on a demo desktop, frame analysis.
   - Gemini (Antigravity, Neon) motion/UI review: docs/review-2026-11-23-gemini.md. RAM private ~12.6 MB (icon cache).
 
+- Headless UI tests (2026-11-23): env GF_SCRIPT=scenario runs the app with invisible click-through windows,
+  events go straight to Slint (virtual cursor, real mouse untouched), shots/frames from the DIB to PNG, exit 0/1.
+  tests/ui/run.ps1 (demo desktop + own APPDATA in %TEMP%), scenarios open-close, drag-item, hover-hint: all PASS.
+  tests/ui/idle.ps1 = guard for rare real-input checks (abort if user idle < 120 s).
+
 ## Next
 - 1.0: user check on the real desktop, then merge branch + bump version + release.
 - From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
@@ -110,6 +115,7 @@ GitHub (private): https://github.com/eonesets/glass-folders, branch main.
 ## Run
 `app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
 Build: `cargo build --release` in app/.
+UI tests (no real mouse): `powershell -File tests/ui/run.ps1` (GF_SCRIPT, GF_OUT, GF_OFFSCREEN, GF_TIMEOUT). See CLAUDE.md.
 
 - v0.7 (2026-11-22): launch from tile.
   - Launch counts per item file name in .glassfolder.json "uses" (panel + tile launches).

@@ -55,6 +55,7 @@ component CapButton inherits Rectangle {
     width: 46px;
     height: 36px;
     background: ta.pressed ? (danger ? #c42b1ce0 : (dark ? #ffffff10 : #0000000a)) : ta.has-hover ? (danger ? #c42b1c : (dark ? #ffffff18 : #0000000f)) : transparent;
+    animate background { duration: 90ms; }
     Text {
         text: glyph;
         font-family: "Segoe Fluent Icons";
@@ -243,7 +244,9 @@ component Slot inherits Rectangle {
     height: 76px;
     border-radius: 6px;
     opacity: lifted;
+    animate opacity { duration: 120ms; }
     background: dragging ? transparent : ta.pressed ? (dark ? #ffffff24 : #00000018) : ta.has-hover ? (dark ? #ffffff14 : #0000000c) : transparent;
+    animate background { duration: 100ms; }
 
     if more == 0: Image {
         source: d.icon;
@@ -403,6 +406,13 @@ export component Panel inherits Window {
     in-out property <length> lift-y;
     in-out property <length> lift-w;
     in-out property <length> lift-h;
+    // landing: released shortcut glides from the cursor into its slot (Rust sets the target)
+    in-out property <bool> land-on;
+    in-out property <bool> land-go; // false while placed at the cursor (no glide), true = glide to target
+    in-out property <int> land-id: -1; // slot hidden while its icon is in flight
+    in-out property <image> land-icon;
+    in-out property <length> land-x;
+    in-out property <length> land-y;
 
     property <length> pad: 16px;
     property <length> top: 48px;
@@ -431,6 +441,16 @@ export component Panel inherits Window {
 
     public function focus-keys() {
         fs.focus();
+    }
+
+    // dragged shortcut let go: its icon stays at the cursor until Rust says where to glide
+    function start-landing(id: int) {
+        land-go = false;
+        land-x = drag-x;
+        land-y = drag-y;
+        land-icon = drag-icon;
+        land-id = id;
+        land-on = true;
     }
 
     // group starts moving / resizing: drawn from where it is now
@@ -591,6 +611,7 @@ export component Panel inherits Window {
                 background: hot ? accent.with-alpha(0.2) : g.colored ? g.tint.with-alpha(dark ? 0.16 : 0.14) : (dark ? #ffffff0c : #ffffff38);
                 border-width: hot || lifting ? 2px : 1px;
                 border-color: hot || lifting ? accent : g.colored ? g.tint.with-alpha(0.32) : (dark ? #ffffff1c : #ffffff70);
+                animate background, border-color { duration: 120ms; }
                 drop-shadow-blur: lifting ? 14px : 0px;
                 drop-shadow-color: #00000040;
 
@@ -718,7 +739,7 @@ export component Panel inherits Window {
                     labels: root.labels;
                     en: root.en;
                     dark: root.dark;
-                    lifted: me ? (hot ? 0.3 : 0) : 1;
+                    lifted: me ? (hot ? 0.3 : 0) : root.land-on && root.land-id == s.id ? 0 : 1;
                     hover(on) => { root.hover(on ? s.id : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
                     clicked => {
                         if (self.more > 0) {
@@ -741,11 +762,13 @@ export component Panel inherits Window {
                     drag-end(mx, my) => {
                         root.drag-x = gr.x + self.x + mx;
                         root.drag-y = gr.y + self.y + my;
+                        root.start-landing(s.id);
                         root.item-drop(s.id, root.drag-x - pad, root.drag-y - top, root.inside(root.drag-x, root.drag-y));
                         root.drag-id = -1;
                         root.drag-group = -1;
                     }
                     drag-cancel => {
+                        root.start-landing(s.id);
                         root.drag-id = -1;
                         root.drag-group = -1;
                         root.drag-cancel();
@@ -861,6 +884,15 @@ export component Panel inherits Window {
                 }
             }
 
+            // released icon gliding into its slot
+            if land-on: Image {
+                source: land-icon;
+                x: land-x - 24px;
+                y: land-y - 24px;
+                width: 48px;
+                height: 48px;
+                animate x, y { duration: land-go ? 180ms : 0ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
+            }
             // ghost of dragged icon follows cursor
             if drag-id >= 0: Image {
                 source: drag-icon;
@@ -1182,6 +1214,7 @@ export component Tile inherits Window {
     }
     Rectangle {
         background: colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
+        animate background { duration: 150ms; }
         border-radius: 8px;
         border-width: 1px;
         border-color: colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
@@ -1211,6 +1244,7 @@ export component Tile inherits Window {
             height: 42px;
             border-radius: 6px;
             background: it.pressed ? (dark ? #ffffff30 : #00000020) : it.has-hover ? (dark ? #ffffff1c : #ffffff70) : transparent;
+            animate background { duration: 100ms; }
             Image {
                 x: 4px;
                 y: 3px;

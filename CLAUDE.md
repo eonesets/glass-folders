@@ -17,6 +17,7 @@ Rule: when files / key functions / props change, update this map in the same com
   - `Grip` — edge strip of a group plate = move handle.
   - `Panel` — folder window. page 0 = groups, page 1 = settings. Props from Rust: groups, grid-w/h, settings
     (labels names dots ptitle tnames gravity glass snap), drop-target/index, ghost-*, lift-* (dragged group, free px).
+    grow-anim = window size glides (off while opening). land-* = released shortcut glides cursor -> slot (Rust main.rs land()).
     Callbacks -> Rust: launch, open-group (unfold/fold "+N"), item-drag/drop, group-drag/drop, set-opt(key,int), rename-group, quit.
     Header: gear, pin (toggle-pin, `pinned`), X. `hover(id, rect)` -> name hint. `isize` = icon size seg.
     `en` = UI language (all strings inline `en ? "EN" : "RU"`; Slot gets it too). Settings page "lang" seg. Loose group shown as Misc/Разное via `g.fixed`.
@@ -34,6 +35,8 @@ Rule: when files / key functions / props change, update this map in the same com
     Launch (panel or tile) -> model::bump_use.
   - render: model::layout + unfold, updates existing VecModel rows in place (plates animate).
   - open_folder / animate / close / finish_close: panel grows out of tile and folds back (plat::set_view).
+- `src/icons.rs` — shell icons on 4 worker threads + cache (path, px) -> Image. get() = cache only, want() queues
+  (urgent first), on_ready -> main.rs icons_ready patches panel slots / waiting tiles in place. prefetch_icons at start.
 - `src/model.rs` — data, no UI. Folder scan, per-folder cfg `.glassfolder.json` (tile rect, group x/y/w/h/color/items order),
   launch counts `uses` (top_items, bump_use), app Settings (lang 0 ru / 1 en, default = Windows UI lang) (%APPDATA%/glass-folders/settings.json), panel grid: GRect (cols 84px PITCH, half-rows 42px ROW,
   h = 2*rows + header), resolve (push overlaps down), settle (gravity), layout, grid_px. Unit tests at bottom.
@@ -41,6 +44,8 @@ Rule: when files / key functions / props change, update this map in the same com
   (free follow, glide to cells on release), tile cell math (tile_cells/tile_size/snap_pos, TILE_NAMED, SNAP),
   set_view (show part of panel = open animation), cursor_logical. Kind Panel/Tile/Hint; set_zoom (scale = dpi*zoom);
   set_pinned (pinned panel: bottom z, live glass; WM_TILES_DOWN keeps tiles under it).
+  Event loop: while animating, one pass per screen refresh (DwmFlush); animation timers use plat::FRAME.
+  WM_GETMINMAXINFO min 1x1 (else Windows clamps small windows: hint strip, open anim start size). GF_PERF=file = timing log.
 - `src/desk.rs` — Explorer desktop: icon positions (IShellWindows/IFolderView), hide tiled folders via
   FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
 - `src/win.rs` — misc Win32: acrylic glass, dark mode, work area, shell icons, ShellExecute open, wallpaper blur fallback.

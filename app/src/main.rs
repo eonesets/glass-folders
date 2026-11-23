@@ -344,7 +344,8 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
             let (a, p) = (a.clone(), p.clone());
             slint::Timer::single_shot(Duration::ZERO, move || {
                 if let Some(p) = p.upgrade() {
-                    drop_item(&p, &a, id);
+                    let to = drop_item(&p, &a, id);
+                    land(&p, &a, to);
                 }
             });
         });
@@ -377,6 +378,9 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
             if let Some(p) = p.upgrade() {
                 reset_preview(&mut a.borrow_mut());
                 show_preview(&p, &a.borrow(), false);
+                // a shortcut was let go outside: back to its slot
+                let back = if p.get_land_on() { a.borrow().ids.get(p.get_land_id().max(0) as usize).cloned() } else { None };
+                land(&p, &a, back);
             }
         });
     }
@@ -1037,21 +1041,23 @@ fn names(items: &[PathBuf]) -> Vec<String> {
 
 /// Drop dragged shortcut: reorder in its group, move file into another group (real fs move),
 /// or create a new group folder where the plate is. Any fs error: logged, item stays.
-fn drop_item(panel: &Panel, app: &Shared, id: i32) {
-    let (root, created) = {
+/// Drop a dragged shortcut. Returns the file where it ended up (for the landing glide), None = gone.
+fn drop_item(panel: &Panel, app: &Shared, id: i32) -> Option<PathBuf> {
+    let (root, created, landed) = {
         let mut st = app.borrow_mut();
         let target = st.target;
         let st = &mut *st;
         if target == Target::None {
             reset_preview(st);
             show_preview(panel, st, false);
-            return;
+            return st.ids.get(id as usize).cloned(); // back to its own slot
         }
-        let (Some(f), Some(src), Some(&sg)) = (st.folder.as_ref(), st.ids.get(id as usize), st.id_group.get(id as usize)) else { return };
+        let (Some(f), Some(src), Some(&sg)) = (st.folder.as_ref(), st.ids.get(id as usize), st.id_group.get(id as usize)) else { return None };
         let root = f.dir.clone();
         let src_name = model::file_name(src).unwrap_or_default();
         let mut cfg = model::load_cfg(&root); // fresh from disk: tile rect may have changed since open
         let mut created = None;
+        let mut landed = src.clone();
         match target {
             Target::Group(t, k) if t == sg => {
                 let mut order = names(&f.groups[t].items);
@@ -1068,7 +1074,7 @@ fn drop_item(panel: &Panel, app: &Shared, id: i32) {
                         Ok(n) => (root.join(&n), 0, Some(n)),
                         Err(e) => {
                             eprintln!("glass-folders: create group in {}: {e}", root.display());
-                            return;
+                            return None;
                         }
                     },
                 };
@@ -1079,9 +1085,10 @@ fn drop_item(panel: &Panel, app: &Shared, id: i32) {
                         if new_name.is_some() {
                             model::remove_if_empty(&dst);
                         }
-                        return;
+                        return None;
                     }
                 };
+                landed = moved.clone();
                 keep_places(&mut cfg, f, &st.prev);
                 // target order: new name at drop place
                 if let Target::Group(t, _) = target {
@@ -1109,7 +1116,7 @@ fn drop_item(panel: &Panel, app: &Shared, id: i32) {
         if let Err(e) = model::save_cfg(&root, &cfg) {
             eprintln!("glass-folders: save config in {}: {e}", root.display());
         }
-        (root, created)
+        (root, created, landed)
     };
     rescan(panel, app, &root);
     if let Some(n) = created {
@@ -1118,6 +1125,49 @@ fn drop_item(panel: &Panel, app: &Shared, id: i32) {
             panel.set_rename_idx(i as i32);
         }
     }
+    Some(landed)
+}
+
+/// Released shortcut glides from the cursor into its slot (Slint put land-* at the cursor;
+/// here: target point + the slot kept hidden meanwhile). path None = no landing.
+fn land(panel: &Panel, app: &Shared, path: Option<PathBuf>) {
+    const LAND_MS: u64 = 190;
+    let spot = path.and_then(|path| {
+        let st = app.borrow();
+        let f = st.folder.as_ref()?;
+        let id = st.ids.iter().position(|p| *p == path)?;
+        let gi = *st.id_group.get(id)?;
+        let items = &f.groups.get(gi)?.items;
+        let r = *st.base.get(gi)?;
+        let mut k = items.iter().position(|p| *p == path)? as i32;
+        let cap = r.w * r.rows();
+        let mut hide = id as i32;
+        if st.unfolded != Some(gi) && items.len() as i32 > cap && k >= cap - 1 {
+            k = cap - 1; // behind "+N": fly into that slot, it stays as is
+            hide = -1;
+        }
+        let [gx, gy, _, _] = r.px();
+        let icon_top = if g().set.borrow().labels { 6.0 } else { 14.0 };
+        let x = 16.0 + gx + (k % r.w) as f32 * PITCH + 38.0;
+        let y = 48.0 + gy + st.head() + (k / r.w) as f32 * PITCH + icon_top + 24.0;
+        Some((hide, x, y))
+    });
+    let Some((hide, x, y)) = spot else {
+        panel.set_land_on(false);
+        return;
+    };
+    panel.set_land_id(hide);
+    panel.set_land_go(true);
+    panel.set_land_x(x);
+    panel.set_land_y(y);
+    let p = panel.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(LAND_MS), move || {
+        if let Some(p) = p.upgrade() {
+            p.set_land_on(false);
+            p.set_land_go(false);
+            p.set_land_id(-1);
+        }
+    });
 }
 
 /// Group moved / resized: save all shown places (others may have made room) + new size.

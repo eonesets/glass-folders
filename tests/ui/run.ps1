@@ -21,6 +21,10 @@ function New-Fixture($dir) {
     foreach ($d in 'Docs', 'Tools') { New-Item -ItemType Directory -Force (Join-Path $w $d) | Out-Null }
     # items = shortcut types only (model::is_item); .bat that do nothing, in case one is ever launched
     foreach ($f in 'Docs\alpha.bat', 'Docs\beta.bat', 'Tools\gamma.bat', 'notes.bat') { 'rem test' | Set-Content (Join-Path $w $f) }
+    # second folder: drop target for shortcuts dragged out of Work
+    $m = Join-Path $dir 'Games'
+    New-Item -ItemType Directory -Force $m | Out-Null
+    'rem test' | Set-Content (Join-Path $m 'chess.bat')
 }
 
 $fail = 0

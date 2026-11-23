@@ -21,7 +21,11 @@ Rule: when files / key functions / props change, update this map in the same com
     Callbacks -> Rust: launch, open-group (unfold/fold "+N"), item-drag/drop, group-drag/drop, set-opt(key,int), rename-group, quit.
     Header: gear, pin (toggle-pin, `pinned`), X. `hover(id, rect)` -> name hint. `isize` = icon size seg.
     `en` = UI language (all strings inline `en ? "EN" : "RU"`; Slot gets it too). Settings page "lang" seg. Loose group shown as Misc/Разное via `g.fixed`.
-  - `Hint` — name hint window (text, pw = width for Rust).
+  - `Hint` — name hint window (text, pw = width for Rust). Frameless popup (plat set_kind Hint strips thick frame: framed
+    windows stay >= ~39px tall -> empty strip under the label), no backdrop (win::clear).
+  - `Ask` — rename box (TextInput, done(ok, text)). `Fly` — icon following a shortcut dragged out of its window (Kind Hint).
+  - Slot / Tile icon right click -> item-menu(id / index). Tile `drop-hot` = shortcut from another folder is over it.
+  - Panel min-w 168px on the folder page: window hugs its groups (no 3-col min), header buttons slide left.
   - `Tile` — desktop tile. `named` = name strip (else square 48px cells). icons = most launched first;
     icon click -> launch(i); last cell "+N" (total > cells), empty space -> open.
 - `src/main.rs` — app glue. `Global` via `g()` (settings, tiles, tile_items, panels, hint): app-wide.
@@ -31,6 +35,11 @@ Rule: when files / key functions / props change, update this map in the same com
   - startup: make_tiles -> desk::hide_folders. quit/panic -> give_back_icons.
   - set_opt (settings page), push_settings.
   - drag: item_drag / group_drag (preview, uses plat::cursor_logical for groups) -> show_preview; drop_item / drop_group (fs moves, cfg save) -> rescan -> render.
+    Out of the window: outside_target (other tile / other pinned panel / plat::desktop_at) -> App.out, set_hot, fly_at;
+    release -> drop_out (move_into, uses follow, Desktop: desk::place_icon at drop point, retried until Explorer lists it).
+  - shortcut menu: item_menu(Owner Panel|Tile) -> win::popup_menu (native, themed) -> open / ask_rename / shell::pick_icon /
+    shell::recycle / shell::uninstaller+confirm+run_uninstall (none found -> Windows apps settings). g().modal keeps the panel
+    open while a menu / dialog is up. model::rekey_item moves launch count + group order to the new name.
   - tiles: tile_icons (top_items -> icons, returns paths) -> App.tile_items; refresh_tile after launch / rescan.
     Launch (panel or tile) -> model::bump_use.
   - render: model::layout + unfold, updates existing VecModel rows in place (plates animate).
@@ -53,7 +62,11 @@ Rule: when files / key functions / props change, update this map in the same com
   plat::inject/shot/record. Ends app with exit code 0/1, writes OUT/log.txt.
 - `src/desk.rs` — Explorer desktop: icon positions (IShellWindows/IFolderView), hide tiled folders via
   FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
-- `src/win.rs` — misc Win32: acrylic glass, dark mode, work area, shell icons, ShellExecute open, wallpaper blur fallback.
+- `src/win.rs` — misc Win32: acrylic glass, clear (frameless alpha popup), popup_menu, dark mode, work area, shell icons,
+  ShellExecute open, wallpaper blur fallback.
+- `src/shell.rs` — shortcut actions: recycle (IFileOperation, undo-able), rename (keeps ext), pick_icon (PickIconDlg, .lnk/.url),
+  uninstaller (registry Uninstall keys: DisplayIcon == target, else longest InstallLocation; never Windows dir / nameless keys),
+  run_uninstall, confirm. Dev: `glass-folders.exe --uninstall-info OUT FILE...` writes matches, runs nothing.
 
 ## Build / run / check
 - Build: `cd app; cargo build --release`. Running exe locks the file: stop THAT exe first (killed run is safe:

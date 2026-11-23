@@ -54,6 +54,7 @@ struct App {
     prev: Vec<GRect>,
     ghost: Option<GRect>,
     target: Target,
+    out: Option<Out>, // dragged shortcut is outside the window, over this target
     grab: Option<(f32, f32)>, // group move: cursor offset from group corner
     lift: [f32; 4],           // moved / resized group as drawn under the cursor (grid px)
     groups: Option<Rc<VecModel<GroupData>>>,
@@ -83,6 +84,8 @@ struct Global {
     hint_timer: RefCell<Option<slint::Timer>>,
     hint_on: Cell<bool>,
     ask: RefCell<Option<Ask>>,
+    fly: RefCell<Option<Fly>>,           // icon following a shortcut dragged out of its window
+    fly_anim: RefCell<Option<slint::Timer>>,
     /// shortcut menu / rename box / system dialog open: folder window stays open while it is inactive
     modal: Cell<bool>,
 }
@@ -184,6 +187,12 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     *g().ask.borrow_mut() = Some(ask);
+    let fly = Fly::new()?;
+    plat::set_kind(fly.window(), plat::Kind::Hint); // topmost, click-through, never focused
+    if let Some(h) = plat::hwnd_of(fly.window()) {
+        win::clear(h);
+    }
+    *g().fly.borrow_mut() = Some(fly);
 
     let first = make_panel()?;
     g().panels.borrow_mut().push(first);
@@ -398,6 +407,19 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_item_drag(move |id, x, y, inside| {
             if let Some(p) = p.upgrade() {
+                // outside the window: another folder / the desktop, icon follows the cursor
+                let (root, path) = {
+                    let st = a.borrow();
+                    (st.folder.as_ref().map(|f| f.dir.clone()), st.ids.get(id as usize).cloned())
+                };
+                let out = if inside { None } else { root.as_deref().and_then(outside_target) };
+                set_hot(match &out {
+                    Some(Out::Folder(d)) => Some(d.as_path()),
+                    _ => None,
+                });
+                let icon = path.filter(|_| !inside).map(|f| icons::get(&f, px(48.0, icon_scale(p.window()))).unwrap_or_default());
+                fly_at(icon);
+                a.borrow_mut().out = out;
                 item_drag(&mut a.borrow_mut(), id, x, y, inside);
                 show_preview(&p, &a.borrow(), true);
             }
@@ -410,6 +432,16 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
             let (a, p) = (a.clone(), p.clone());
             slint::Timer::single_shot(Duration::ZERO, move || {
                 if let Some(p) = p.upgrade() {
+                    set_hot(None);
+                    let out = a.borrow_mut().out.take();
+                    if let Some(out) = out {
+                        reset_preview(&mut a.borrow_mut());
+                        show_preview(&p, &a.borrow(), false);
+                        p.set_land_on(false);
+                        drop_out(&p, &a, id, out);
+                        return;
+                    }
+                    fly_at(None);
                     let to = drop_item(&p, &a, id);
                     land(&p, &a, to);
                 }
@@ -442,6 +474,9 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_drag_cancel(move || {
             if let Some(p) = p.upgrade() {
+                set_hot(None);
+                fly_at(None);
+                a.borrow_mut().out = None;
                 reset_preview(&mut a.borrow_mut());
                 show_preview(&p, &a.borrow(), false);
                 // a shortcut was let go outside: back to its slot
@@ -590,6 +625,168 @@ fn hide_hint() {
     if g().hint_on.replace(false) {
         if let Some(h) = g().hint.borrow().as_ref() {
             let _ = h.hide();
+        }
+    }
+}
+
+// ---------- shortcut dragged out of its folder window ----------
+
+/// Where a shortcut dragged outside its window goes on release.
+#[derive(Clone, PartialEq, Debug)]
+enum Out {
+    /// another folder (its tile or its pinned window): into that folder's loose items
+    Folder(PathBuf),
+    /// free desktop: file moves to the Desktop, icon at this screen point
+    Desktop(POINT),
+}
+
+fn in_rect(r: &RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+/// Drop target under the cursor for a shortcut from folder `root`. Own tile / other apps' windows = none.
+fn outside_target(root: &Path) -> Option<Out> {
+    let c = plat::cursor_pos();
+    for (d, t) in g().tiles.borrow().iter() {
+        if plat::is_shown(t.window()) && plat::rect_of(t.window()).is_some_and(|r| in_rect(&r, c)) {
+            return (d != root).then(|| Out::Folder(d.clone()));
+        }
+    }
+    for (p, a) in all_panels() {
+        let dir = a.borrow().folder.as_ref().map(|f| f.dir.clone());
+        let Some(dir) = dir else { continue };
+        if plat::is_shown(p.window()) && plat::rect_of(p.window()).is_some_and(|r| in_rect(&r, c)) {
+            return (dir != root).then_some(Out::Folder(dir));
+        }
+    }
+    plat::desktop_at(c).then_some(Out::Desktop(c))
+}
+
+/// Tile under a dragged shortcut lights up (None = none lit).
+fn set_hot(dir: Option<&Path>) {
+    for (d, t) in g().tiles.borrow().iter() {
+        t.set_drop_hot(dir == Some(d.as_path()));
+    }
+}
+
+/// Icon that follows the cursor outside the folder window (None = hide).
+fn fly_at(icon: Option<Image>) {
+    let fly = g().fly.borrow();
+    let Some(fly) = fly.as_ref() else { return };
+    let Some(icon) = icon else {
+        g().fly_anim.borrow_mut().take();
+        let _ = fly.hide();
+        return;
+    };
+    let s = fly.window().scale_factor();
+    let c = plat::cursor_pos();
+    let half = px(28.0, s);
+    fly.set_pic(icon);
+    fly.set_fade(1.0);
+    fly.window().set_size(PhysicalSize::new((half * 2) as u32, (half * 2) as u32));
+    fly.window().set_position(PhysicalPosition::new(c.x - half, c.y - half));
+    if !plat::is_shown(fly.window()) {
+        let _ = fly.show();
+    }
+}
+
+/// Flying icon glides into a tile and fades (drop onto another folder).
+fn fly_into(to: RECT) {
+    const MS: f32 = 170.0;
+    let fly = g().fly.borrow();
+    let Some(fly) = fly.as_ref() else { return };
+    let Some(from) = plat::rect_of(fly.window()) else { return };
+    let (fx, fy) = (from.left as f32, from.top as f32);
+    let half = (from.right - from.left) as f32 / 2.0;
+    let (tx, ty) = ((to.left + to.right) as f32 / 2.0 - half, (to.top + to.bottom) as f32 / 2.0 - half);
+    let start = std::time::Instant::now();
+    let t = slint::Timer::default();
+    t.start(slint::TimerMode::Repeated, plat::FRAME, move || {
+        let k = (start.elapsed().as_secs_f32() * 1000.0 / MS).min(1.0);
+        let e = 1.0 - (1.0 - k).powi(3);
+        let fly = g().fly.borrow();
+        let Some(fly) = fly.as_ref() else { return };
+        fly.window().set_position(PhysicalPosition::new((fx + (tx - fx) * e) as i32, (fy + (ty - fy) * e) as i32));
+        fly.set_fade(1.0 - e * 0.85);
+        if k >= 1.0 {
+            let _ = fly.hide();
+            if let Some(t) = g().fly_anim.borrow_mut().take() {
+                slint::Timer::single_shot(Duration::ZERO, move || drop(t));
+            }
+        }
+    });
+    *g().fly_anim.borrow_mut() = Some(t);
+}
+
+/// Released outside the window over a target: move the file there. Source folder forgets it
+/// (order, emptied group); its launch count goes along to the other folder.
+fn drop_out(panel: &Panel, app: &Shared, id: i32, out: Out) {
+    let (root, src, sg_dir, sname) = {
+        let st = app.borrow();
+        let (Some(f), Some(src), Some(&sg)) = (st.folder.as_ref(), st.ids.get(id as usize), st.id_group.get(id as usize)) else { return };
+        (f.dir.clone(), src.clone(), f.groups[sg].dir.clone(), f.groups[sg].name.clone())
+    };
+    let dst = match &out {
+        Out::Folder(d) => d.clone(),
+        Out::Desktop(_) => win::desktop_dir(),
+    };
+    let moved = match model::move_into(&src, &dst) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("glass-folders: move {} -> {}: {e}", src.display(), dst.display());
+            fly_at(None);
+            return;
+        }
+    };
+    let name = model::file_name(&src).unwrap_or_default();
+    let mut cfg = model::load_cfg(&root);
+    let uses = cfg.uses.remove(&name);
+    if let Some(gc) = cfg.groups.get_mut(&sname) {
+        gc.items.retain(|n| *n != name);
+    }
+    if sg_dir != root && model::remove_if_empty(&sg_dir) {
+        cfg.forget_group(&sname);
+    }
+    let _ = model::save_cfg(&root, &cfg);
+    if let (Out::Folder(d), Some(n)) = (&out, uses) {
+        let mut c = model::load_cfg(d);
+        *c.uses.entry(model::file_name(&moved).unwrap_or_default()).or_insert(0) += n;
+        let _ = model::save_cfg(d, &c);
+    }
+    rescan(panel, app, &root);
+    match out {
+        Out::Folder(d) => {
+            refresh_tile(&d);
+            // the other folder may be open (pinned): show it there too
+            for (p, a) in all_panels() {
+                if a.borrow().folder.as_ref().is_some_and(|f| f.dir == d) {
+                    rescan(&p, &a, &d);
+                }
+            }
+            let tile = g().tiles.borrow().iter().find(|(x, _)| *x == d).and_then(|(_, t)| plat::is_shown(t.window()).then(|| plat::rect_of(t.window())).flatten());
+            match tile {
+                Some(r) => fly_into(r),
+                None => fly_at(None),
+            }
+        }
+        Out::Desktop(pt) => {
+            fly_at(None);
+            // Explorer sees the new file a bit later: put its icon where it was dropped once it shows up
+            let s = panel.window().scale_factor();
+            let at = POINT { x: pt.x - px(38.0, s), y: pt.y - px(24.0, s) };
+            let tries = Rc::new(Cell::new(0));
+            let t = slint::Timer::default();
+            let tm = Rc::new(RefCell::new(None::<slint::Timer>));
+            let tm2 = tm.clone();
+            t.start(slint::TimerMode::Repeated, Duration::from_millis(120), move || {
+                tries.set(tries.get() + 1);
+                if desk::place_icon(&moved, at) || tries.get() > 20 {
+                    if let Some(t) = tm2.borrow_mut().take() {
+                        slint::Timer::single_shot(Duration::ZERO, move || drop(t));
+                    }
+                }
+            });
+            *tm.borrow_mut() = Some(t);
         }
     }
 }

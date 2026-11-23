@@ -387,6 +387,25 @@ pub fn rect_of(window: &slint::Window) -> Option<RECT> {
     Some(r)
 }
 
+/// Free desktop (icon layer / wallpaper) under screen point p, not some app window.
+/// Script mode (virtual cursor): always (the real screen is not part of the test).
+pub fn desktop_at(p: POINT) -> bool {
+    if VCURSOR.with(|v| v.get()).is_some() {
+        return true;
+    }
+    unsafe {
+        let w = WindowFromPoint(p);
+        if w.is_invalid() {
+            return false;
+        }
+        let root = GetAncestor(w, GA_ROOT);
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(root, &mut buf) as usize;
+        let class = String::from_utf16_lossy(&buf[..n]);
+        class == "Progman" || class == "WorkerW"
+    }
+}
+
 /// Bring window to the foreground (panel back after a dialog / rename box).
 pub fn activate(window: &slint::Window) {
     if let Some(g) = find(window) {

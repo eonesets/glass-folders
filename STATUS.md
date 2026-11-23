@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. Готовим 1.0: большие папки открываются мгновенно, все анимации плавные (120 Гц), окно «вылетает» из плитки, ярлык долетает на место. Ветка claude/animations-performance-v1-3ed962, не слита.
+Кратко: приложение «стеклянные папки» для рабочего стола. Готовим 1.0: большие папки открываются мгновенно, анимации плавные, окно папки по размеру иконок, меню по ПКМ (переименовать, значок, удалить, удалить программу), ярлык можно вытащить на стол или в другую папку. Ветка claude/animations-performance-v1-3ed962, не слита.
 Ждём: проверка пользователем на своём столе.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (1.0 polish + headless UI tests GF_SCRIPT, tests/ui/run.ps1)
-Progress: 84%
+Updated: 2026-11-23 (1.0: hug-size panel, hint fix, shortcut menu, drag out; headless UI tests)
+Progress: 88%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -96,6 +96,9 @@ Progress: 84%
 
 ## Next
 - 1.0: user check on the real desktop, then merge branch + bump version + release.
+  Not checked on the real screen yet (headless tests only): native menu look (dark), rename box focus, PickIconDlg,
+  uninstaller run, drop onto the real desktop (icon placed at drop point), Fly icon + tile highlight while dragging.
+- Shortcut rename: renamed item re-sorts by name (keeps place only if the group has a saved order).
 - From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
   header, tooltip fade, unfolded rows fade-in, row hysteresis on tile resize.
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).

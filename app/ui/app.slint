@@ -1197,6 +1197,7 @@ export component Tile inherits Window {
     in property <image> backdrop; // fallback only (GF_FAKE_GLASS): frosted wallpaper copy
     in property <int> glass: 1; // 0 dense .. 2 clear, same as Panel
     in property <bool> named: true; // name strip under icons; off = square cells, even edges
+    in property <bool> drop-hot; // a shortcut dragged out of a folder window is over this tile
     callback open();
     callback launch(int); // icon index -> run that file
     callback item-menu(int); // right click on an icon: shortcut menu
@@ -1222,11 +1223,11 @@ export component Tile inherits Window {
         background: (dark ? #202020 : #f3f3f3).with-alpha(glass == 0 ? 0.40 : glass == 1 ? 0.16 : 0.0);
     }
     Rectangle {
-        background: colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
-        animate background { duration: 150ms; }
+        background: drop-hot ? (dark ? #ffffff2c : #ffffff70) : colored ? tint.with-alpha(ta.has-hover ? 0.22 : 0.12) : (ta.has-hover ? (dark ? #ffffff14 : #ffffff40) : transparent);
+        animate background, border-color { duration: 150ms; }
         border-radius: 8px;
-        border-width: 1px;
-        border-color: colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
+        border-width: drop-hot ? 2px : 1px;
+        border-color: drop-hot ? (dark ? #60cdff : #005fb8) : colored ? tint.with-alpha(0.7) : (dark ? #ffffff30 : #ffffff90);
     }
     if named: Text {
         x: 8px;
@@ -1375,5 +1376,22 @@ export component Ask inherits Window {
             selection-background-color: dark ? #60cdff80 : #005fb860;
             accepted => { root.done(true, self.text); }
         }
+    }
+}
+
+// Shortcut dragged out of a folder window: its icon follows the cursor (own topmost click-through window).
+export component Fly inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folders drag";
+    in property <image> pic;
+    in property <float> fade: 1;
+    Image {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        source: pic;
+        opacity: 0.9 * fade;
     }
 }

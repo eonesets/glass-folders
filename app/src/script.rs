@@ -13,6 +13,7 @@
 //   shown T | hidden T                fail unless window T (panel/hint/tile NAME) is visible / hidden
 //   exists REL | missing REL          fail unless path REL (relative to desktop dir) exists / not
 //   log TEXT
+//   dragto x y tile NAME              drag from (x, y) onto the center of tile NAME (drop out of the window)
 //   menu N                            next shortcut menu (right click) picks item N: 1 open, 2 rename,
 //                                     3 icon, 4 delete, 5 uninstall (0 = dismiss). Target ask = rename box.
 //   fits T                            fail unless window T's real OS size == its drawn size
@@ -56,6 +57,7 @@ enum Cmd {
     Log(String),
     Fits(String),
     Menu(u32),
+    DragTo(f32, f32, String),
 }
 
 impl std::fmt::Debug for Ptr {
@@ -138,6 +140,13 @@ fn parse(text: &str) -> Result<Vec<(usize, String, Cmd)>, String> {
             "exists" | "missing" => push(Cmd::Exists(rest.into(), word == "exists")),
             "log" => push(Cmd::Log(rest.into())),
             "fits" => push(Cmd::Fits(rest.into())),
+            "dragto" => {
+                // dragto x y tile NAME: press at (x, y) of the target window, drag onto that tile's center
+                let mut a = rest.splitn(3, ' ');
+                let x = num(a.next()).map_err(err)?;
+                let y = num(a.next()).map_err(err)?;
+                push(Cmd::DragTo(x, y, a.next().unwrap_or("").trim().to_string()));
+            }
             "menu" => push(Cmd::Menu(num(Some(rest)).map_err(err)? as u32)),
             _ => return Err(err("unknown command".into())),
         }
@@ -151,6 +160,7 @@ fn with_window<R>(t: &str, f: impl FnOnce(&slint::Window) -> R) -> Result<R, Str
     match t.split_once(' ').map_or((t, ""), |(a, b)| (a, b.trim())) {
         ("panel", _) => crate::main_panel().map(|(p, _)| f(p.window())).ok_or_else(|| "no panel".into()),
         ("hint", _) => g.hint.borrow().as_ref().map(|h| f(h.window())).ok_or_else(|| "no hint".into()),
+        ("fly", _) => g.fly.borrow().as_ref().map(|h| f(h.window())).ok_or_else(|| "no fly".into()),
         ("ask", _) => g.ask.borrow().as_ref().map(|h| f(h.window())).ok_or_else(|| "no rename box".into()),
         ("tile", name) => {
             let tiles = g.tiles.borrow();
@@ -247,6 +257,25 @@ fn exec(r: &mut Run, c: &Cmd) -> Result<u64, String> {
         }
         Cmd::Log(t) => r.note(&format!("  {t}")),
         Cmd::Menu(id) => plat::set_menu_pick(*id),
+        Cmd::DragTo(x, y, to) => {
+            // end point = center of window `to`, in target window coords (both have real screen rects)
+            let dst = with_window(to, |w| plat::rect_of(w))?.ok_or("no window")?;
+            let (src, s) = with_window(&r.target, |w| (plat::rect_of(w), w.scale_factor()))?;
+            let src = src.ok_or("no window")?;
+            let ex = ((dst.left + dst.right) as f32 / 2.0 - src.left as f32) / s;
+            let ey = ((dst.top + dst.bottom) as f32 / 2.0 - src.top as f32) / s;
+            let (x, y) = (*x, *y);
+            let mut steps = vec![(Ptr::Move, x, y), (Ptr::Down(PointerEventButton::Left), x, y)];
+            for i in 1..=12 {
+                let t = i as f32 / 12.0;
+                steps.push((Ptr::Move, x + (ex - x) * t, y + (ey - y) * t));
+            }
+            steps.push((Ptr::Up(PointerEventButton::Left), ex, ey));
+            for (ev, px, py) in steps {
+                with_window(&r.target, |w| plat::inject(w, ev, px, py))?;
+            }
+            r.at = (ex, ey);
+        }
         Cmd::Fits(t) => {
             // real OS window size == what Slint draws (a framed window kept >= ~39px tall: empty strip)
             let (real, drawn) = with_window(t, |w| (plat::rect_of(w), w.size()))?;

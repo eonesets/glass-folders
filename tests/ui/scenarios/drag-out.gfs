@@ -1,0 +1,20 @@
+# Кратко: ярлык тащат из окна папки на плитку другой папки -> файл переезжает туда; потом другой ярлык — на свободный стол -> файл на рабочем столе.
+#settings {"lang":0,"labels":false}
+open Work
+wait 500
+shot before
+# alpha (Docs, first slot) onto the Games tile
+dragto 68 105 tile Games
+wait 300
+missing Work/Docs/alpha.bat
+exists Games/alpha.bat
+hidden fly
+shot after_tile
+# beta (now first in Docs) far left of the window: free desktop (script mode = desktop)
+target panel
+drag 68 105 -400 60
+wait 200
+missing Work/Docs/beta.bat
+exists beta.bat
+hidden fly
+shot after_desk

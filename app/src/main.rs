@@ -9,6 +9,7 @@ mod desk;
 mod icons;
 mod model;
 mod plat;
+mod guard;
 mod script;
 mod shell;
 mod win;
@@ -127,6 +128,10 @@ fn all_panels() -> Vec<(Panel, Shared)> {
 fn main() -> Result<(), slint::PlatformError> {
     // dev: --uninstall-info OUT FILE... = which uninstaller the shortcut menu would run (no UI, nothing run)
     let args: Vec<String> = std::env::args().collect();
+    // guard process (see guard.rs): no UI at all
+    if guard::handle_args(&args) {
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--uninstall-info") && args.len() > 2 {
         win::com_init();
         let rep: String = args[3..]
@@ -143,6 +148,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let script = std::env::var("GF_SCRIPT").ok().map(PathBuf::from);
     if script.is_some() {
         plat::set_virtual_cursor();
+    } else {
+        guard::mark_running(); // a guard of a killed older run leaves the folders to us
     }
     plat::set_offscreen(match std::env::var("GF_OFFSCREEN").as_deref() {
         Ok("1") => true,
@@ -218,7 +225,14 @@ fn main() -> Result<(), slint::PlatformError> {
             model::save_settings(&s);
         }
         desk::hide_folders(homes);
+        // killed (Task Manager, crash): a separate small process puts the folders back at once
+        guard::start();
     }
+    // taskkill / Task Manager "End task" (WM_CLOSE to our windows), log off / shut down: folders back, then quit
+    plat::set_on_quit(|| {
+        give_back_icons();
+        let _ = slint::quit_event_loop();
+    });
 
     // pinned folders: open on the desktop again, where they were left
     let pins: Vec<(PathBuf, [i32; 2])> =
@@ -1188,6 +1202,9 @@ fn make_tiles(desktop: &Path, killed: &HashMap<PathBuf, POINT>) -> Result<HashMa
         taken.push(RECT { left: x, top: y, right: x + w, bottom: y + h });
         if let Some(p) = native.get(&dir) {
             homes.insert(dir.clone(), *p);
+        } else if std::env::var("GF_DESKTOP").is_ok() {
+            // dev demo desktop: Explorer does not show it, still hide/restore it (tests/ui/guard.ps1)
+            homes.insert(dir.clone(), POINT::default());
         }
         t.window().set_size(PhysicalSize::new(w as u32, h as u32));
         t.window().set_position(PhysicalPosition::new(x, y));

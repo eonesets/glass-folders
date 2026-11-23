@@ -406,6 +406,21 @@ pub fn desktop_at(p: POINT) -> bool {
     }
 }
 
+thread_local! {
+    static ON_QUIT: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
+}
+
+/// App-wide clean quit (close request from outside, session end). Called at most once.
+pub fn set_on_quit(f: impl Fn() + 'static) {
+    ON_QUIT.with(|q| *q.borrow_mut() = Some(Rc::new(f)));
+}
+
+fn quit_now() {
+    if let Some(f) = ON_QUIT.with(|q| q.borrow_mut().take()) {
+        f();
+    }
+}
+
 /// Bring window to the foreground (panel back after a dialog / rename box).
 pub fn activate(window: &slint::Window) {
     if let Some(g) = find(window) {
@@ -1010,7 +1025,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_NCHITTEST if g.kind.get() == Kind::Hint => return LRESULT(-1), // HTTRANSPARENT: mouse goes to the window below
         WM_NCHITTEST => return LRESULT(1), // HTCLIENT: no resize borders
-        WM_CLOSE => return LRESULT(0),
+        // Alt+F4 on a folder window: ignored (Esc / X close it). Close request to any other window of ours =
+        // taskkill without /F, Task Manager "End task": quit cleanly (folders back).
+        WM_CLOSE => {
+            if g.kind.get() != Kind::Panel {
+                quit_now();
+            }
+            return LRESULT(0);
+        }
+        WM_QUERYENDSESSION => return LRESULT(1),
+        // log off / shut down: the process may be killed right after this returns -> restore now
+        WM_ENDSESSION if wp.0 != 0 => {
+            quit_now();
+            return LRESULT(0);
+        }
         _ => {}
     }
     DefWindowProcW(hwnd, msg, wp, lp)

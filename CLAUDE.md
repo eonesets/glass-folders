@@ -64,6 +64,10 @@ Rule: when files / key functions / props change, update this map in the same com
   FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
 - `src/win.rs` — misc Win32: acrylic glass, clear (frameless alpha popup), popup_menu, dark mode, work area, shell icons,
   ShellExecute open, wallpaper blur fallback.
+- `src/guard.rs` — folders back when the app is killed: after hide_folders, `--guard-start PID` -> `--guard PID` (launcher exits,
+  so the guard is outside the process tree) waits for PID, restores settings.homes unless a newer instance holds the
+  mutex Local\GlassFolders.Main. Clean quit clears homes -> guard does nothing. plat WM_CLOSE (non-panel) / WM_ENDSESSION
+  -> set_on_quit (give_back_icons). Test: `powershell -File tests/ui/guard.ps1` (hard kill, tree kill, close request).
 - `src/shell.rs` — shortcut actions: recycle (IFileOperation, undo-able), rename (keeps ext), pick_icon (PickIconDlg, .lnk/.url),
   uninstaller (registry Uninstall keys: DisplayIcon == target, else longest InstallLocation; never Windows dir / nameless keys),
   run_uninstall, confirm. Dev: `glass-folders.exe --uninstall-info OUT FILE...` writes matches, runs nothing.

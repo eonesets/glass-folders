@@ -2,8 +2,8 @@
 Ждём: проверка пользователем на своём столе.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (1.0: hug-size panel, hint fix, shortcut menu, drag out; headless UI tests)
-Progress: 88%
+Updated: 2026-11-23 (1.0: hug-size panel, hint fix, shortcut menu, drag out, guard restores folders on kill)
+Progress: 90%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -98,6 +98,8 @@ Progress: 88%
 - 1.0: user check on the real desktop, then merge branch + bump version + release.
   Not checked on the real screen yet (headless tests only): native menu look (dark), rename box focus, PickIconDlg,
   uninstaller run, drop onto the real desktop (icon placed at drop point), Fly icon + tile highlight while dragging.
+- Guard: killing app AND guard together (taskkill /IM glass-folders.exe /F) still leaves folders hidden until next start.
+  Task Manager shows 2 glass-folders.exe while folders are hidden (app + guard, guard ~1 MB, 0 CPU).
 - Shortcut rename: renamed item re-sorts by name (keeps place only if the group has a saved order).
 - From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
   header, tooltip fade, unfolded rows fade-in, row hysteresis on tile resize.

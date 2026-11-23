@@ -122,9 +122,10 @@ pub struct GfWindow {
     drag: Cell<Option<Drag>>,
     on_moved: RefCell<Option<Rc<dyn Fn(RECT)>>>,
     surrogate: Cell<u16>, // WM_CHAR high surrogate waiting for its pair
-    /// Animation: window shows only part of its content. (home = where content's top-left is on screen,
-    /// shown rect). Slint keeps its full size; paint + mouse are offset.
-    view: Cell<Option<(POINT, RECT)>>,
+    /// Open / close animation: whole content scaled into this screen rect, faded (0..1).
+    /// Slint keeps its full size (no relayout per frame); paint + mouse are scaled.
+    zview: Cell<Option<(RECT, f32)>>,
+    zdib: RefCell<Option<Dib>>, // scaled frame
     glide: RefCell<Option<slint::Timer>>,
 }
 
@@ -269,29 +270,32 @@ pub fn set_snap(on: bool) {
     SNAP.with(|s| s.set(on));
 }
 
-/// Animation frame: window shows `shown` (screen rect) of its content, whose top-left sits at `home`.
-/// None = normal (window = content at home). Content size is untouched (no relayout per frame).
-pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
+/// Animation frame: the whole content scaled into screen rect `r` (same aspect -> uniform scale),
+/// faded by `fade` 0..1. Content size is untouched (no relayout per frame).
+pub fn set_zoom_view(window: &slint::Window, r: RECT, fade: f32) {
     let Some(g) = find(window) else { return };
-    let was = g.view.replace(v);
+    g.zview.set(Some((r, fade.clamp(0.0, 1.0))));
     let hwnd = g.hwnd.get();
-    let (x, y, w, h) = match (v, was) {
-        (Some((_, r)), _) => (r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)),
-        (None, Some((home, _))) => {
-            let PhysicalSize { width, height } = g.size.get();
-            (home.x, home.y, width as i32, height as i32)
-        }
-        (None, None) => return,
-    };
+    let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
     unsafe {
         // frame ready before the window changes, then move + blit in one go (no WM_PAINT round trip,
         // no copy of old bits): DWM gets new geometry and new content together
         let sdc = GetDC(None);
-        let ok = g.draw(sdc);
+        let ok = g.draw(sdc) && g.zoom_into(sdc, w as u32, h as u32);
         let _ = ReleaseDC(None, sdc);
-        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
-        if ok {
+        // DWM may show one frame between move and blit: shrinking -> new (smaller) picture first, growing ->
+        // bigger window first. Either way that frame has a bit of empty glass, never cut-off content.
+        let mut cur = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut cur);
+        let shrink = w < cur.right - cur.left;
+        if ok && shrink {
             g.blit();
+        }
+        let _ = SetWindowPos(hwnd, None, r.left, r.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_NOREDRAW);
+        if ok {
+            if !shrink {
+                g.blit();
+            }
             let _ = ValidateRect(Some(hwnd), None);
         } else {
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -299,9 +303,57 @@ pub fn set_view(window: &slint::Window, v: Option<(POINT, RECT)>) {
     }
 }
 
-/// Where the content's top-left is while an animation frame is shown.
-pub fn view_home(window: &slint::Window) -> Option<POINT> {
-    find(window)?.view.get().map(|(h, _)| h)
+/// Animation over: window = content at full size again, top-left at `home` (None = stay, e.g. hidden).
+pub fn end_zoom_view(window: &slint::Window, home: Option<POINT>) {
+    let Some(g) = find(window) else { return };
+    if g.zview.take().is_none() {
+        return;
+    }
+    g.zdib.borrow_mut().take();
+    if let Some(p) = home {
+        let PhysicalSize { width, height } = g.size.get();
+        let hwnd = g.hwnd.get();
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, p.x, p.y, width as i32, height as i32, SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+/// Open / close animation frame being shown (window is not at its full size)?
+pub fn zoom_view_on(window: &slint::Window) -> bool {
+    find(window).is_some_and(|g| g.zview.get().is_some())
+}
+
+/// Bilinear scale of premultiplied pixels, times `fade` (premultiplied: all channels scale).
+fn scale_pixels(src: &[Bgra], sw: usize, sh: usize, dst: &mut [Bgra], dw: usize, dh: usize, fade: f32) {
+    let f = (fade * 256.0).round() as u32;
+    let xs: Vec<(usize, usize, u32)> = (0..dw)
+        .map(|x| {
+            let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+            let x0 = (fx as usize).min(sw - 1);
+            let x1 = (x0 + 1).min(sw - 1);
+            (x0, x1, ((fx - x0 as f32) * 256.0) as u32)
+        })
+        .collect();
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+        let y0 = (fy as usize).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = ((fy - y0 as f32) * 256.0) as u32;
+        let (r0, r1) = (&src[y0 * sw..y0 * sw + sw], &src[y1 * sw..y1 * sw + sw]);
+        for (o, &(x0, x1, tx)) in dst[y * dw..y * dw + dw].iter_mut().zip(&xs) {
+            let (a, b, c, d) = (r0[x0], r0[x1], r1[x0], r1[x1]);
+            let mix = |p: u8, q: u8, s: u8, t: u8| -> u8 {
+                let top = p as u32 * (256 - tx) + q as u32 * tx;
+                let bot = s as u32 * (256 - tx) + t as u32 * tx;
+                let v = (top * (256 - ty) + bot * ty) >> 16;
+                ((v * f) >> 8) as u8
+            };
+            *o = Bgra { b: mix(a.b, b.b, c.b, d.b), g: mix(a.g, b.g, c.g, d.g), r: mix(a.r, b.r, c.r, d.r), a: mix(a.a, b.a, c.a, d.a) };
+        }
+    }
 }
 
 /// Screen rect of a window (physical px).
@@ -314,9 +366,9 @@ pub fn cursor_logical(window: &slint::Window) -> Option<(f32, f32)> {
         let _ = GetCursorPos(&mut c);
         let _ = ScreenToClient(g.hwnd.get(), &mut c);
     }
-    let (ox, oy) = g.offset();
+    let (x, y) = g.unzoom(c.x as f32, c.y as f32);
     let s = g.scale.get();
-    Some(((c.x + ox) as f32 / s, (c.y + oy) as f32 / s))
+    Some((x / s, y / s))
 }
 
 pub fn rect_of(window: &slint::Window) -> Option<RECT> {
@@ -355,7 +407,8 @@ impl GfWindow {
             drag: Cell::new(None),
             on_moved: RefCell::new(None),
             surrogate: Cell::new(0),
-            view: Cell::new(None),
+            zview: Cell::new(None),
+            zdib: RefCell::new(None),
             glide: RefCell::new(None),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
@@ -372,16 +425,36 @@ impl GfWindow {
         let x = (lp.0 & 0xffff) as i16 as f32;
         let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
         let s = self.scale.get();
-        let (ox, oy) = self.offset();
-        LogicalPosition::new((x + ox as f32) / s, (y + oy as f32) / s)
+        let (x, y) = self.unzoom(x, y);
+        LogicalPosition::new(x / s, y / s)
     }
 
-    /// Content px hidden left/above the shown part (animation), else 0.
-    fn offset(&self) -> (i32, i32) {
-        match self.view.get() {
-            Some((home, r)) => (r.left - home.x, r.top - home.y),
-            None => (0, 0),
+    /// Client px -> content px (differs only while the open / close animation scales the content).
+    fn unzoom(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.zview.get() {
+            Some((r, _)) => {
+                let k = (r.right - r.left).max(1) as f32 / self.size.get().width.max(1) as f32;
+                (x / k, y / k)
+            }
+            None => (x, y),
         }
+    }
+
+    /// Scale the rendered content into the w x h animation frame (zdib). False = no pixels.
+    unsafe fn zoom_into(&self, ref_dc: HDC, w: u32, h: u32) -> bool {
+        let Some((_, fade)) = self.zview.get() else { return false };
+        let PhysicalSize { width: sw, height: sh } = self.size.get();
+        let dib = self.dib.borrow();
+        let Some(src) = dib.as_ref() else { return false };
+        let mut z = self.zdib.borrow_mut();
+        if z.as_ref().map(|d| (d.w, d.h)) != Some((w, h)) {
+            *z = make_dib(ref_dc, w, h);
+        }
+        let Some(d) = z.as_ref() else { return false };
+        let s = std::slice::from_raw_parts(src.bits, (sw * sh) as usize);
+        let o = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
+        scale_pixels(s, sw as usize, sh as usize, o, w as usize, h as usize, fade);
+        true
     }
 
     /// Ease the window to rect `to` (screen px), then report the final rect (tile settles onto grid).
@@ -468,7 +541,7 @@ impl GfWindow {
             return;
         }
         self.size.set(PhysicalSize::new(w, h));
-        if self.view.get().is_none() {
+        if self.zview.get().is_none() {
             unsafe {
                 let _ = SetWindowPos(self.hwnd.get(), None, 0, 0, w as i32, h as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
@@ -497,12 +570,17 @@ impl GfWindow {
     /// Copy the rendered DIB to the window now (shown part only while animating).
     unsafe fn blit(&self) {
         let hwnd = self.hwnd.get();
-        let PhysicalSize { width: w, height: h } = self.size.get();
-        if let Some(d) = self.dib.borrow().as_ref() {
-            let (ox, oy) = self.offset();
-            let hdc = GetDC(Some(hwnd));
-            let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
-            let _ = ReleaseDC(Some(hwnd), hdc);
+        let hdc = GetDC(Some(hwnd));
+        self.blit_to(hdc);
+        let _ = ReleaseDC(Some(hwnd), hdc);
+    }
+
+    /// Rendered frame -> window DC: the scaled animation frame while zoomed, else the content.
+    unsafe fn blit_to(&self, hdc: HDC) {
+        let zoomed = self.zview.get().is_some();
+        let src = if zoomed { self.zdib.borrow() } else { self.dib.borrow() };
+        if let Some(d) = src.as_ref() {
+            let _ = BitBlt(hdc, 0, 0, d.w as i32, d.h as i32, Some(d.dc), 0, 0, SRCCOPY);
         }
     }
 
@@ -516,10 +594,10 @@ impl GfWindow {
             if self.draw(hdc) {
                 let k = self.kind.get() as u8;
                 perf(|| format!("paint k{k} {w}x{h} {:.2}ms", t.elapsed().as_secs_f64() * 1000.0));
-                if let Some(d) = self.dib.borrow().as_ref() {
-                    let (ox, oy) = self.offset();
-                    let _ = BitBlt(hdc, 0, 0, w as i32, h as i32, Some(d.dc), ox, oy, SRCCOPY);
+                if let Some((r, _)) = self.zview.get() {
+                    self.zoom_into(hdc, (r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
                 }
+                self.blit_to(hdc);
             }
             let _ = EndPaint(hwnd, &ps);
         }
@@ -567,6 +645,11 @@ impl WindowAdapter for GfWindow {
                     return Ok(());
                 }
                 let tile = self.kind.get() == Kind::Tile || self.pinned.get();
+                if !tile {
+                    // look active from the first frame: real activation lands a few frames later, until then
+                    // DWM drew the inactive flat grey instead of acrylic (grey flash at the start of open)
+                    SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+                }
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
                     let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -578,6 +661,7 @@ impl WindowAdapter for GfWindow {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 // free pixel memory while hidden
                 self.dib.borrow_mut().take();
+                self.zdib.borrow_mut().take();
             }
         }
         Ok(())
@@ -799,7 +883,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE if g.kind.get() != Kind::Panel => return LRESULT(MA_NOACTIVATE as isize),
         // Tile / hint / pinned panel: report NC "always active" -> DWM keeps the system backdrop live (else solid gray).
         // lParam -1: DefWindowProc skips NC repaint. Focus/foreground untouched.
-        WM_NCACTIVATE if g.kind.get() != Kind::Panel || g.pinned.get() => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
+        // always NC-active: live acrylic. Panel too: it closes on focus loss, and its fold-back ran on the
+        // inactive flat grey backdrop (grey box at the end of close).
+        WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), LPARAM(-1)),
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             g.window.dispatch_event(WindowEvent::WindowActiveChanged(active));

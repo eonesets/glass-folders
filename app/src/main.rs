@@ -21,8 +21,8 @@ use model::{GRect, GAP, HEAD, PITCH, ROW};
 use slint::{ComponentHandle, Image, Model, ModelRc, PhysicalPosition, PhysicalSize, VecModel};
 use windows::Win32::Foundation::{POINT, RECT};
 
-const OPEN_MS: f32 = 230.0; // panel grows out of the tile
-const CLOSE_MS: f32 = 150.0; // ... and folds back into it
+const OPEN_MS: f32 = 260.0; // panel zooms out of the tile
+const CLOSE_MS: f32 = 190.0; // ... and back into it
 const HINT_MS: u64 = 400; // pointer rests this long on a shortcut -> its name shows
 
 // Icons are requested at exact on-screen pixel size: big sizes make the shell add a frame around low-res icons.
@@ -55,9 +55,11 @@ struct App {
     grab: Option<(f32, f32)>, // group move: cursor offset from group corner
     lift: [f32; 4],           // moved / resized group as drawn under the cursor (grid px)
     groups: Option<Rc<VecModel<GroupData>>>,
-    // open / close animation of the panel
+    // open / close animation of the panel: openness 0 (= tile) .. 1 (= panel), and its two ends
     anim: Option<slint::Timer>,
     closing: bool,
+    open_p: f32,
+    geo: Option<(RECT, RECT)>, // (tile rect, panel rect), screen px
     // group unfolded by its "+N" slot (until folded back or panel closed)
     unfolded: Option<usize>,
     /// pinned open on the desktop: stays on focus loss / launch, its tile is hidden
@@ -483,7 +485,7 @@ fn hint_at(win: &slint::Window, text: Option<String>, x: f32, y: f32, w: f32, h:
     };
     let Some(r) = plat::rect_of(win) else { return };
     // panel still growing out of its tile: content corner is not the window corner
-    let o = plat::view_home(win).unwrap_or(POINT { x: r.left, y: r.top });
+    let o = POINT { x: r.left, y: r.top };
     let s = win.scale_factor();
     let item = RECT {
         left: o.x + px(x, s),
@@ -1292,18 +1294,45 @@ fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
     let (cx, cy) = ((from.left + from.right) / 2, (from.top + from.bottom) / 2);
     let x = (cx - w / 2).clamp(wa.left + m, (wa.right - w - m).max(wa.left + m));
     let y = (cy - h / 2).clamp(wa.top + m, (wa.bottom - h - m).max(wa.top + m));
-    let home = POINT { x, y };
     let to = RECT { left: x, top: y, right: x + w, bottom: y + h };
-    plat::set_view(panel.window(), Some((home, from)));
-    panel.set_reveal(0.0);
+    {
+        let mut st = app.borrow_mut();
+        st.geo = Some((from, to));
+        st.open_p = 0.0;
+    }
+    panel.set_reveal(1.0);
+    plat::set_zoom_view(panel.window(), zoom_rect(from, to, 0.0), 0.0);
     let _ = panel.show();
     panel.invoke_focus_keys();
-    animate(panel, app, home, from, to, OPEN_MS, true);
+    animate(panel, app, true);
 }
 
-/// Panel shows a growing / shrinking part of itself (from -> to), content fades with it.
-fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f32, opening: bool) {
+/// Window rect at openness p: the panel's own shape, scaled down onto the tile (p = 0) .. full size
+/// in its place (p = 1). Same aspect all the way -> content scales evenly, nothing is cut off.
+fn zoom_rect(tile: RECT, panel: RECT, p: f32) -> RECT {
+    let (pw, ph) = ((panel.right - panel.left) as f32, (panel.bottom - panel.top) as f32);
+    let (tw, th) = ((tile.right - tile.left) as f32, (tile.bottom - tile.top) as f32);
+    let s0 = (tw / pw).max(th / ph).clamp(0.15, 1.0);
+    let s = s0 + (1.0 - s0) * p;
+    let mid = |a: i32, b: i32| (a + b) as f32 / 2.0;
+    let cx = mid(tile.left, tile.right) + (mid(panel.left, panel.right) - mid(tile.left, tile.right)) * p;
+    let cy = mid(tile.top, tile.bottom) + (mid(panel.top, panel.bottom) - mid(tile.top, tile.bottom)) * p;
+    let (w, h) = ((pw * s).round() as i32, (ph * s).round() as i32);
+    let (l, t) = ((cx - w as f32 / 2.0).round() as i32, (cy - h as f32 / 2.0).round() as i32);
+    RECT { left: l, top: t, right: l + w, bottom: t + h }
+}
+
+/// Panel zooms out of its tile (opening) or back into it: openness glides to 1 / 0 from where it is
+/// (a close during the open turns around smoothly). Content fades in early, out late.
+fn animate(panel: &Panel, app: &Shared, opening: bool) {
     let start = std::time::Instant::now();
+    let (p0, geo) = {
+        let st = app.borrow();
+        (st.open_p, st.geo)
+    };
+    let Some((tile, full)) = geo else { return };
+    let target = if opening { 1.0 } else { 0.0 };
+    let ms = (if opening { OPEN_MS } else { CLOSE_MS }) * (target - p0 as f32).abs().max(0.2);
     let (a, p) = (app.clone(), panel.as_weak());
     let t = slint::Timer::default();
     t.start(slint::TimerMode::Repeated, plat::FRAME, move || {
@@ -1313,19 +1342,18 @@ fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f
         }
         let k = (start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
         plat::perf(|| format!("anim k={k:.3}"));
-        // open: ease-out (fast start, soft landing); close: ease-in
-        let e = if opening { 1.0 - (1.0 - k).powi(3) } else { k * k };
-        let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
-        let r = RECT { left: mix(from.left, to.left), top: mix(from.top, to.top), right: mix(from.right, to.right), bottom: mix(from.bottom, to.bottom) };
-        p.set_reveal(if opening { (k * 1.4).min(1.0) } else { 1.0 - k });
-        plat::set_view(p.window(), Some((home, r)));
+        // open: strong ease-out (quick start, long soft landing); close: smoothstep (lands on the tile
+        // softly; plain ease-in vanished at half size = pop)
+        let e = if opening { 1.0 - (1.0 - k).powi(4) } else { k * k * (3.0 - 2.0 * k) };
+        let o = p0 + (target - p0) * e;
+        a.borrow_mut().open_p = o;
+        plat::set_zoom_view(p.window(), zoom_rect(tile, full, o), (o / 0.55).min(1.0));
         if k >= 1.0 {
             if let Some(t) = a.borrow_mut().anim.take() {
                 slint::Timer::single_shot(Duration::ZERO, move || drop(t));
             }
             if opening {
-                plat::set_view(p.window(), None);
-                p.set_reveal(1.0);
+                plat::end_zoom_view(p.window(), Some(POINT { x: full.left, y: full.top }));
                 p.set_grow_anim(true);
             } else {
                 finish_close(&p, &a);
@@ -1337,25 +1365,28 @@ fn animate(panel: &Panel, app: &Shared, home: POINT, from: RECT, to: RECT, ms: f
 
 /// Start folding the panel back into its tile; hidden + cleared at the end.
 fn close(panel: &Panel, app: &Shared) {
-    let (home, from, to) = {
+    {
         let mut st = app.borrow_mut();
         if st.closing || st.folder.is_none() {
             return;
         }
         st.closing = true;
+        st.anim.take(); // an unfinished open: turns around from where it is
+        panel.set_grow_anim(false);
         let Some(cur) = plat::rect_of(panel.window()) else { return };
+        // fully open: the panel may have been moved / resized since -> fold from where it is now
+        let full = if plat::zoom_view_on(panel.window()) { st.geo.map(|g| g.1).unwrap_or(cur) } else { cur };
         let dir = st.folder.as_ref().map(|f| f.dir.clone()).unwrap_or_default();
-        let to = st.tile_rect(&dir).unwrap_or_else(|| {
-            let (cx, cy) = ((cur.left + cur.right) / 2, (cur.top + cur.bottom) / 2);
+        let tile = st.tile_rect(&dir).unwrap_or_else(|| {
+            let (cx, cy) = ((full.left + full.right) / 2, (full.top + full.bottom) / 2);
             RECT { left: cx - 40, top: cy - 40, right: cx + 40, bottom: cy + 40 }
         });
-        st.anim.take(); // an unfinished open: fold from where it is now
-        panel.set_grow_anim(false);
-        (POINT { x: cur.left, y: cur.top }, cur, to)
-    };
-    // home = content corner: if open was cut short, content corner is not the window corner
-    let home = plat::view_home(panel.window()).unwrap_or(home);
-    animate(panel, app, home, from, to, CLOSE_MS, false);
+        if !plat::zoom_view_on(panel.window()) {
+            st.open_p = 1.0;
+        }
+        st.geo = Some((tile, full));
+    }
+    animate(panel, app, false);
 }
 
 /// Hide panel and free everything (end of fold-back, or cut short by a new open).
@@ -1366,16 +1397,18 @@ fn finish_close(panel: &Panel, app: &Shared) {
         if !st.closing {
             if st.folder.is_some() {
                 // open still running: just land it
+                let home = st.geo.map(|g| POINT { x: g.1.left, y: g.1.top });
+                st.open_p = 1.0;
                 drop(st);
-                plat::set_view(panel.window(), None);
-                panel.set_reveal(1.0);
+                plat::end_zoom_view(panel.window(), home);
+                panel.set_grow_anim(true);
             }
             return;
         }
         st.closing = false;
     }
     let _ = panel.hide();
-    plat::set_view(panel.window(), None);
+    plat::end_zoom_view(panel.window(), None);
     panel.set_groups(ModelRc::default());
     panel.set_rename_idx(-1);
     panel.set_drop_target(-2);

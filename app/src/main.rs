@@ -9,6 +9,7 @@ mod desk;
 mod icons;
 mod model;
 mod plat;
+mod shell;
 mod win;
 
 use std::cell::{Cell, RefCell};

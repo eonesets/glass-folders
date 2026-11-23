@@ -387,6 +387,15 @@ pub fn rect_of(window: &slint::Window) -> Option<RECT> {
     Some(r)
 }
 
+/// Bring window to the foreground (panel back after a dialog / rename box).
+pub fn activate(window: &slint::Window) {
+    if let Some(g) = find(window) {
+        unsafe {
+            let _ = SetForegroundWindow(g.hwnd.get());
+        }
+    }
+}
+
 pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
     if let Some(g) = find(window) {
         *g.on_deactivate.borrow_mut() = Some(Rc::new(f));
@@ -1107,6 +1116,22 @@ struct Rec {
     frames: Vec<(u32, u32, Vec<u8>)>,
 }
 
+thread_local! {
+    /// Script mode: answer for the next native popup menu (no modal menu loop in tests).
+    static MENU_PICK: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+/// Script: the next shortcut menu picks item `id` without showing.
+pub fn set_menu_pick(id: u32) {
+    MENU_PICK.with(|v| v.set(Some(id)));
+}
+
+/// Scripted pick (taken once); in script mode with none queued = dismissed. None = show the real menu.
+pub fn take_menu_pick() -> Option<u32> {
+    let p = MENU_PICK.with(|v| v.take());
+    if p.is_some() || VCURSOR.with(|v| v.get()).is_some() { Some(p.unwrap_or(0)) } else { None }
+}
+
 /// Windows invisible + click-through + never activated. Call before the first window is made.
 pub fn set_offscreen(on: bool) {
     OFFSCREEN.with(|v| v.set(on));
@@ -1122,7 +1147,7 @@ pub fn set_virtual_cursor() {
 }
 
 /// Cursor on screen (physical px): real, or virtual in script mode.
-fn cursor_pos() -> POINT {
+pub fn cursor_pos() -> POINT {
     VCURSOR.with(|v| v.get()).unwrap_or_else(|| {
         let mut c = POINT::default();
         unsafe {

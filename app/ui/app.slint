@@ -237,6 +237,7 @@ component Slot inherits Rectangle {
     callback drag-end(length, length);
     callback drag-cancel();
     callback hover(bool); // pointer rests on it (not pressed, not dragged): name hint
+    callback menu(); // right click: shortcut menu (Rust, native popup)
     property <bool> dragging;
     property <bool> hovered: ta.has-hover && !ta.pressed && !dragging && more == 0;
     changed hovered => { root.hover(hovered); }
@@ -299,6 +300,9 @@ component Slot inherits Rectangle {
             }
         }
         pointer-event(e) => {
+            if (!dragging && more == 0 && d.id >= 0 && e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                root.menu();
+            }
             if (dragging && e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
                 dragging = false;
                 root.drag-end(self.mouse-x, self.mouse-y);
@@ -370,6 +374,7 @@ export component Panel inherits Window {
     callback toggle-pin();
     callback hover(int, length, length, length, length); // slot id (-1 = none) + its rect, window coords
     callback launch(int);
+    callback item-menu(int); // right click on a shortcut (slot id)
     callback open-group(int); // "+N" / fold slot: unfold the group / fold it back
     callback pick-color(int, color);
     callback clear-color(int);
@@ -743,6 +748,7 @@ export component Panel inherits Window {
                     dark: root.dark;
                     lifted: me ? (hot ? 0.3 : 0) : root.land-on && root.land-id == s.id ? 0 : 1;
                     hover(on) => { root.hover(on ? s.id : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
+                    menu => { root.item-menu(s.id); }
                     clicked => {
                         if (self.more > 0) {
                             root.open-group(g.idx); // unfold in place
@@ -1193,6 +1199,7 @@ export component Tile inherits Window {
     in property <bool> named: true; // name strip under icons; off = square cells, even edges
     callback open();
     callback launch(int); // icon index -> run that file
+    callback item-menu(int); // right click on an icon: shortcut menu
     callback hover(int, length, length, length, length); // icon index (-1 = none) + its rect: name hint
 
     // size comes from Rust, snapped to whole cells (plat.rs tile_size: w = cols*48+12, h = rows*42+30 or rows*48+12)
@@ -1257,6 +1264,11 @@ export component Tile inherits Window {
             it := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.launch(i); }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                        root.item-menu(i);
+                    }
+                }
             }
             property <bool> hovered: it.has-hover && !it.pressed;
             changed hovered => { root.hover(hovered ? i : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
@@ -1319,5 +1331,49 @@ export component Hint inherits Window {
         vertical-alignment: center;
         horizontal-alignment: center;
         color: dark ? #ffffff : #1b1b1b;
+    }
+}
+
+// Rename box: small glass field at the shortcut. Enter = rename, Esc / click away = cancel (Rust).
+export component Ask inherits Window {
+    no-frame: true;
+    background: transparent;
+    title: "Glass Folders rename";
+    in property <bool> dark;
+    in-out property <string> text;
+    callback done(bool, string); // ok, typed text
+    width: 280px;
+    height: 44px;
+    public function start() {
+        ed.focus();
+        ed.select-all();
+    }
+    Rectangle {
+        border-radius: 8px;
+        background: (dark ? #2c2c2c : #f9f9f9).with-alpha(0.98);
+        border-width: 1px;
+        border-color: dark ? #ffffff30 : #00000020;
+    }
+    FocusScope {
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.done(false, "");
+                return accept;
+            }
+            return reject;
+        }
+        ed := TextInput {
+            x: 12px;
+            y: 0;
+            width: parent.width - 24px;
+            height: parent.height;
+            text <=> root.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            single-line: true;
+            color: dark ? #ffffff : #1b1b1b;
+            selection-background-color: dark ? #60cdff80 : #005fb860;
+            accepted => { root.done(true, self.text); }
+        }
     }
 }

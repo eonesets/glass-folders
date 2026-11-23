@@ -213,13 +213,11 @@ pub fn uninstaller(path: &Path) -> Option<Uninstall> {
     };
 
     let target_norm = norm_path(&target.to_string_lossy());
-    if target_norm.is_empty() {
+    // Windows' own tools (System32 etc.): not uninstallable this way. Some keys there carry
+    // InstallLocation = System32, which matched every system tool to one unrelated uninstaller.
+    if target_norm.is_empty() || path_is_inside(&target_norm, &windows_dir()) {
         return None;
     }
-    let fallback_name = target
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
 
     let views: [(HKEY, REG_SAM_FLAGS); 3] = [
         (HKEY_LOCAL_MACHINE, KEY_READ | KEY_WOW64_64KEY),
@@ -277,10 +275,13 @@ pub fn uninstaller(path: &Path) -> Option<Uninstall> {
                 continue;
             }
 
-            let display_name = reg_string(hparent, &sub_name, w!("DisplayName"))
+            // no DisplayName = not in Windows' app list either (internal / leftover keys): skip
+            let Some(display_name) = reg_string(hparent, &sub_name, w!("DisplayName"))
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback_name.clone());
+            else {
+                continue;
+            };
 
             if let Some(icon) = reg_string(hparent, &sub_name, w!("DisplayIcon")) {
                 if clean_display_icon(&icon) == target_norm {
@@ -471,7 +472,15 @@ fn clean_display_icon(raw: &str) -> String {
 }
 
 /// True if `dir` (normalized, no trailing backslash) is a drive root or a top-level system folder.
+/// Normalized Windows directory (e.g. "c:\windows").
+fn windows_dir() -> String {
+    norm_path(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+}
+
 fn is_generic_dir(dir: &str) -> bool {
+    if *dir == windows_dir() || path_is_inside(dir, &windows_dir()) {
+        return true;
+    }
     let bytes = dir.as_bytes();
     if bytes.len() == 2 && bytes[1] == b':' {
         return true;

@@ -82,6 +82,9 @@ struct Global {
     hint: RefCell<Option<Hint>>,
     hint_timer: RefCell<Option<slint::Timer>>,
     hint_on: Cell<bool>,
+    ask: RefCell<Option<Ask>>,
+    /// shortcut menu / rename box / system dialog open: folder window stays open while it is inactive
+    modal: Cell<bool>,
 }
 
 thread_local! {
@@ -119,6 +122,20 @@ fn all_panels() -> Vec<(Panel, Shared)> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // dev: --uninstall-info OUT FILE... = which uninstaller the shortcut menu would run (no UI, nothing run)
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--uninstall-info") && args.len() > 2 {
+        win::com_init();
+        let rep: String = args[3..]
+            .iter()
+            .map(|f| match shell::uninstaller(Path::new(f)) {
+                Some(u) => format!("{f}\n  -> {} | {}\n", u.name, u.cmd),
+                None => format!("{f}\n  -> none\n"),
+            })
+            .collect();
+        let _ = std::fs::write(&args[2], rep);
+        return Ok(());
+    }
     // headless test (GF_SCRIPT): no real input, invisible windows, desktop icons untouched
     let script = std::env::var("GF_SCRIPT").ok().map(PathBuf::from);
     if script.is_some() {
@@ -153,6 +170,20 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     hint.set_dark(g().dark.get());
     *g().hint.borrow_mut() = Some(hint);
+    let ask = Ask::new()?;
+    if let Some(h) = plat::hwnd_of(ask.window()) {
+        win::clear(h);
+    }
+    ask.set_dark(g().dark.get());
+    {
+        let w = ask.as_weak();
+        plat::set_on_deactivate(ask.window(), move || {
+            if let Some(a) = w.upgrade() {
+                a.invoke_done(false, "".into()); // click away = cancel
+            }
+        });
+    }
+    *g().ask.borrow_mut() = Some(ask);
 
     let first = make_panel()?;
     g().panels.borrow_mut().push(first);
@@ -235,7 +266,7 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
         let (a, p) = (app.clone(), panel.as_weak());
         let stay = std::env::var("GF_STAY").is_ok(); // dev: keep panel open on focus loss
         plat::set_on_deactivate(panel.window(), move || {
-            if stay || a.borrow().pinned {
+            if stay || a.borrow().pinned || g().modal.get() {
                 return;
             }
             if let Some(p) = p.upgrade() {
@@ -278,6 +309,17 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
             if let Some(p) = p.upgrade() {
                 close(&p, &a);
             }
+        });
+    }
+    {
+        let (a, p) = (app.clone(), panel.as_weak());
+        panel.on_item_menu(move |id| {
+            let path = a.borrow().ids.get(id as usize).cloned();
+            let root = a.borrow().folder.as_ref().map(|f| f.dir.clone());
+            let (Some(path), Some(root)) = (path, root) else { return };
+            let o = Owner::Panel(p.clone(), a.clone(), id);
+            // deferred: the menu runs its own message loop, not inside the slot's event handler
+            slint::Timer::single_shot(Duration::ZERO, move || item_menu(o, path, root));
         });
     }
     {
@@ -552,6 +594,157 @@ fn hide_hint() {
     }
 }
 
+// ---------- shortcut menu (right click in a folder window or on a tile) ----------
+
+/// Where the menu was opened: folder window (slot id) or desktop tile (folder, icon index).
+#[derive(Clone)]
+enum Owner {
+    Panel(slint::Weak<Panel>, Shared, i32),
+    Tile(PathBuf, i32),
+}
+
+impl Owner {
+    fn hwnd(&self) -> Option<windows::Win32::Foundation::HWND> {
+        match self {
+            Owner::Panel(p, ..) => p.upgrade().and_then(|p| plat::hwnd_of(p.window())),
+            Owner::Tile(d, _) => g().tiles.borrow().iter().find(|(x, _)| x == d).and_then(|(_, t)| plat::hwnd_of(t.window())),
+        }
+    }
+    /// folder contents changed: panel re-reads it (and its tile), tile alone re-reads otherwise
+    fn refresh(&self, root: &Path) {
+        match self {
+            Owner::Panel(p, a, _) => {
+                if let Some(p) = p.upgrade() {
+                    rescan(&p, a, root);
+                }
+            }
+            Owner::Tile(..) => refresh_tile(root),
+        }
+    }
+    /// menu / dialog over: folder window takes focus back (so a click away closes it again)
+    fn done(&self) {
+        g().modal.set(false);
+        if let Owner::Panel(p, a, _) = self {
+            if let Some(p) = p.upgrade() {
+                let open = { let st = a.borrow(); !st.closing && st.folder.is_some() };
+                if open {
+                    plat::activate(p.window());
+                }
+            }
+        }
+    }
+}
+
+fn item_menu(o: Owner, path: PathBuf, root: PathBuf) {
+    hide_hint();
+    let Some(hwnd) = o.hwnd() else { return };
+    let en = g().set.borrow().en();
+    let t = |ru: &str, e: &str| if en { e.to_string() } else { ru.to_string() };
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let un = shell::uninstaller(&path);
+    let un_text = match &un {
+        Some(u) if en => format!("Uninstall {}…", u.name),
+        Some(u) => format!("Удалить программу {}…", u.name),
+        None => t("Удалить программу…", "Uninstall program…"),
+    };
+    let items = vec![
+        (1, t("Открыть", "Open"), true),
+        (2, t("Переименовать", "Rename"), true),
+        (3, t("Сменить значок…", "Change icon…"), ext == "lnk" || ext == "url"),
+        (0, String::new(), true),
+        (4, t("Удалить ярлык", "Delete shortcut"), true),
+        (5, un_text, true),
+    ];
+    g().modal.set(true);
+    let id = plat::take_menu_pick().unwrap_or_else(|| win::popup_menu(hwnd, &items, g().dark.get()));
+    let key = model::file_name(&path).unwrap_or_default();
+    match id {
+        1 => {
+            o.done();
+            match &o {
+                Owner::Panel(p, _, id) => {
+                    if let Some(p) = p.upgrade() {
+                        p.invoke_launch(*id);
+                    }
+                }
+                Owner::Tile(d, i) => {
+                    if let Some((_, t)) = g().tiles.borrow().iter().find(|(x, _)| x == d) {
+                        t.invoke_launch(*i);
+                    }
+                }
+            }
+            return;
+        }
+        2 => return ask_rename(o, path, root), // box closes -> done
+        3 => {
+            if shell::pick_icon(hwnd, &path) {
+                o.refresh(&root);
+            }
+        }
+        4 => {
+            if shell::recycle(&path) {
+                model::rekey_item(&root, &key, None);
+                o.refresh(&root);
+            }
+        }
+        5 => match un {
+            Some(u) => {
+                let (title, text) = if en {
+                    ("Uninstall program".to_string(), format!("Uninstall {}?\nIts own uninstaller will start.", u.name))
+                } else {
+                    ("Удаление программы".to_string(), format!("Удалить программу {}?\nЗапустится её собственный деинсталлятор.", u.name))
+                };
+                if shell::confirm(hwnd, &title, &text) {
+                    shell::run_uninstall(&u);
+                }
+            }
+            None => shell::open_apps_settings(), // not found in the registry: Windows' own app list
+        },
+        _ => {}
+    }
+    o.done();
+}
+
+/// Rename box at the cursor; Enter renames the file (extension kept), Esc / click away cancels.
+fn ask_rename(o: Owner, path: PathBuf, root: PathBuf) {
+    let ask = g().ask.borrow();
+    let Some(ask) = ask.as_ref() else { return o.done() };
+    ask.set_dark(g().dark.get());
+    ask.set_text(model::name_of(&path).into());
+    let s = ask.window().scale_factor();
+    let (w, h) = (px(280.0, s), px(44.0, s));
+    let c = plat::cursor_pos();
+    let wa = win::work_area();
+    let x = (c.x - w / 2).clamp(wa.left, (wa.right - w).max(wa.left));
+    let y = (c.y + px(12.0, s)).clamp(wa.top, (wa.bottom - h).max(wa.top));
+    ask.window().set_position(PhysicalPosition::new(x, y));
+    let open = Rc::new(Cell::new(true));
+    ask.on_done(move |ok, typed| {
+        if !open.replace(false) {
+            return; // Enter, then focus loss: once
+        }
+        let (o, path, root) = (o.clone(), path.clone(), root.clone());
+        // deferred: hiding the window from inside its own key handler
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(a) = g().ask.borrow().as_ref() {
+                let _ = a.hide();
+            }
+            if ok {
+                let old = model::file_name(&path).unwrap_or_default();
+                if let Some(np) = shell::rename(&path, &typed).filter(|np| *np != path) {
+                    model::rekey_item(&root, &old, model::file_name(&np).as_deref());
+                    o.refresh(&root);
+                }
+            }
+            o.done();
+        });
+    });
+    let _ = ask.show();
+    plat::activate(ask.window());
+    ask.invoke_start();
+}
+
+
 /// Folder icons back to their spots; nothing left to restore next start.
 fn give_back_icons() {
     desk::restore_folders(&HashMap::new());
@@ -754,6 +947,15 @@ fn make_tiles(desktop: &Path, killed: &HashMap<PathBuf, POINT>) -> Result<HashMa
         {
             // pointer rests on a tile icon: its name
             let (d, tw) = (dir.clone(), t.as_weak());
+            {
+                let d = dir.clone();
+                t.on_item_menu(move |i| {
+                    let path = g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize).cloned());
+                    let Some(path) = path else { return };
+                    let (o, d) = (Owner::Tile(d.clone(), i), d.clone());
+                    slint::Timer::single_shot(Duration::ZERO, move || item_menu(o, path, d));
+                });
+            }
             t.on_hover(move |i, x, y, w, h| {
                 let name = if i < 0 { None } else { g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize)).map(|f| model::name_of(f)) };
                 if let Some(t) = tw.upgrade() {

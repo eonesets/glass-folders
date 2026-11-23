@@ -93,6 +93,45 @@ pub fn clear(hwnd: HWND) {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
         let b = DWMSBT_NONE;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &b as *const _ as _, 4);
+        let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE: no caption band if it ever gets a frame
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &none as *const _ as _, 4);
+    }
+}
+
+/// Native popup menu at the cursor, owned by `owner`. Items: (id, text, enabled); id 0 = separator.
+/// Returns the picked id, 0 = dismissed. Menu colors follow the app theme (uxtheme SetPreferredAppMode).
+pub fn popup_menu(owner: HWND, items: &[(u32, String, bool)], dark: bool) -> u32 {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        // undocumented but stable since 1903: ordinal 135 SetPreferredAppMode(2 dark / 3 light), 136 FlushMenuThemes
+        if let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) {
+            if let Some(f) = GetProcAddress(ux, windows::core::PCSTR(135 as *const u8)) {
+                let set: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+                set(if dark { 2 } else { 3 });
+            }
+            if let Some(f) = GetProcAddress(ux, windows::core::PCSTR(136 as *const u8)) {
+                let flush: extern "system" fn() = std::mem::transmute(f);
+                flush();
+            }
+        }
+        let Ok(m) = CreatePopupMenu() else { return 0 };
+        for (id, text, on) in items {
+            if *id == 0 {
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
+            } else {
+                let t = HSTRING::from(text.as_str());
+                let f = if *on { MF_STRING } else { MF_STRING | MF_GRAYED };
+                let _ = AppendMenuW(m, f, *id as usize, &t);
+            }
+        }
+        let mut p = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut p);
+        // owner must be foreground, else the menu does not close on a click elsewhere
+        let _ = SetForegroundWindow(owner);
+        let r = TrackPopupMenuEx(m, (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY).0, p.x, p.y, owner, None);
+        let _ = PostMessageW(Some(owner), WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+        let _ = DestroyMenu(m);
+        r.0 as u32
     }
 }
 

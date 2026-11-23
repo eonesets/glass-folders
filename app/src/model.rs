@@ -94,6 +94,27 @@ pub fn bump_use(root: &Path, item: &Path) {
     let _ = save_cfg(root, &cfg);
 }
 
+/// Shortcut renamed / gone: its launch count and place in its group follow the new name (None = forget).
+pub fn rekey_item(root: &Path, old: &str, new: Option<&str>) {
+    let mut cfg = load_cfg(root);
+    if let Some(n) = cfg.uses.remove(old) {
+        if let Some(new) = new {
+            cfg.uses.insert(new.to_string(), n);
+        }
+    }
+    for g in cfg.groups.values_mut() {
+        if let Some(i) = g.items.iter().position(|k| k == old) {
+            match new {
+                Some(new) => g.items[i] = new.to_string(),
+                None => {
+                    g.items.remove(i);
+                }
+            }
+        }
+    }
+    let _ = save_cfg(root, &cfg);
+}
+
 fn is_hidden(p: &Path) -> bool {
     fs::metadata(p)
         .map(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)

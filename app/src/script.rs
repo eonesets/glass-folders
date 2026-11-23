@@ -13,6 +13,8 @@
 //   shown T | hidden T                fail unless window T (panel/hint/tile NAME) is visible / hidden
 //   exists REL | missing REL          fail unless path REL (relative to desktop dir) exists / not
 //   log TEXT
+//   menu N                            next shortcut menu (right click) picks item N: 1 open, 2 rename,
+//                                     3 icon, 4 delete, 5 uninstall (0 = dismiss). Target ask = rename box.
 //   fits T                            fail unless window T's real OS size == its drawn size
 // OUT = env GF_OUT, else <script dir>/out. Log: OUT/log.txt. Any failed command stops the run, exit 1.
 // Env GF_TIMEOUT (s, default 60): whole run limit.
@@ -53,6 +55,7 @@ enum Cmd {
     Exists(String, bool),
     Log(String),
     Fits(String),
+    Menu(u32),
 }
 
 impl std::fmt::Debug for Ptr {
@@ -135,6 +138,7 @@ fn parse(text: &str) -> Result<Vec<(usize, String, Cmd)>, String> {
             "exists" | "missing" => push(Cmd::Exists(rest.into(), word == "exists")),
             "log" => push(Cmd::Log(rest.into())),
             "fits" => push(Cmd::Fits(rest.into())),
+            "menu" => push(Cmd::Menu(num(Some(rest)).map_err(err)? as u32)),
             _ => return Err(err("unknown command".into())),
         }
     }
@@ -147,6 +151,7 @@ fn with_window<R>(t: &str, f: impl FnOnce(&slint::Window) -> R) -> Result<R, Str
     match t.split_once(' ').map_or((t, ""), |(a, b)| (a, b.trim())) {
         ("panel", _) => crate::main_panel().map(|(p, _)| f(p.window())).ok_or_else(|| "no panel".into()),
         ("hint", _) => g.hint.borrow().as_ref().map(|h| f(h.window())).ok_or_else(|| "no hint".into()),
+        ("ask", _) => g.ask.borrow().as_ref().map(|h| f(h.window())).ok_or_else(|| "no rename box".into()),
         ("tile", name) => {
             let tiles = g.tiles.borrow();
             let t = tiles.iter().find(|(d, _)| d.file_name().is_some_and(|n| n.to_string_lossy() == name));
@@ -241,6 +246,7 @@ fn exec(r: &mut Run, c: &Cmd) -> Result<u64, String> {
             }
         }
         Cmd::Log(t) => r.note(&format!("  {t}")),
+        Cmd::Menu(id) => plat::set_menu_pick(*id),
         Cmd::Fits(t) => {
             // real OS window size == what Slint draws (a framed window kept >= ~39px tall: empty strip)
             let (real, drawn) = with_window(t, |w| (plat::rect_of(w), w.size()))?;

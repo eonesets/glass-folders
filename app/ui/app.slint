@@ -1259,7 +1259,16 @@ export component Tile inherits Window {
             property <bool> hovered: it.has-hover && !it.pressed;
             changed hovered => { root.hover(hovered ? i : -1, self.absolute-position.x, self.absolute-position.y, self.width, self.height); }
         }
-        // "+N": part of the tile itself (no own plate): hover lights the whole tile, drag moves it
+        // "+N": part of the tile itself (no hover of its own): hover lights the whole tile, drag moves it.
+        // Soft squircle behind it = reads as a cell, like the panel's "+N" slot.
+        if over: Rectangle {
+            x: grid-x + mod(cap - 1, cols) * 48px + 2px;
+            y: pad-top + floor((cap - 1) / cols) * cell-h + 2px;
+            width: 32px;
+            height: 32px;
+            border-radius: 9px;
+            background: dark ? #ffffff14 : #0000000d;
+        }
         if over: Text {
             x: grid-x + mod(cap - 1, cols) * 48px - 4px;
             y: pad-top + floor((cap - 1) / cols) * cell-h - 3px;

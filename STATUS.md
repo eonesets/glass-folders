@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. v0.8: кнопка «закрепить» (папка висит открытой на столе, плитка прячется), подсказка с названием ярлыка при наведении, размер иконок в настройках, «+N» на плитке без своей подсветки.
-Ждём: проверка пользователем.
+Кратко: приложение «стеклянные папки» для рабочего стола. Готовим 1.0: большие папки открываются мгновенно, все анимации плавные (120 Гц), окно «вылетает» из плитки, ярлык долетает на место. Ветка claude/animations-performance-v1-3ed962, не слита.
+Ждём: проверка пользователем на своём столе.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v0.9.0 release: English UI + language switch, EN/RU README GIFs)
-Progress: 76%
+Updated: 2026-11-23 (1.0 polish: perf + motion, branch claude/animations-performance-v1-3ed962)
+Progress: 82%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -76,8 +76,23 @@ Progress: 76%
   Settings labels reworded, one-line rows; Settings title aligned with header buttons.
   README GIFs re-recorded per language: docs/media/en, docs/media/ru (old Russian-only GIFs removed).
 - Public on GitHub (2026-11-23): README EN/RU with demo GIFs, MIT, release v0.8.0 (zip). Goal: stars.
+- 1.0 polish (2026-11-23 night, branch claude/animations-performance-v1-3ed962):
+  - Big folder open: 3.9 s -> 24 ms (icons.rs: 4 loader threads + cache + background prefetch; icons fade in).
+  - Big folder fits the screen: auto group height max 3 rows, up to 12 cols (was 2280 px tall).
+  - Name hint: no empty glass strip under it (WM_GETMINMAXINFO min 1x1).
+  - Frame pacing: loop paced by DwmFlush while animating -> even 120 fps (was 50-60 uneven).
+  - Open / close: panel zooms out of the tile (whole content scaled, fades), lands back softly; no grey flash
+    (panel always NC-active, DWM transitions off).
+  - Window size glides (drag room, unfold, settings); settings page swap without double exposure.
+  - Dropped shortcut glides from cursor into its slot; hover / press fades; dragged tile goes over neighbours;
+    tile "+N" on a soft squircle.
+  - Verified: screen recordings 120 fps (ffmpeg ddagrab) of 11 scenarios on a demo desktop, frame analysis.
+  - Gemini (Antigravity, Neon) motion/UI review: docs/review-2026-11-23-gemini.md. RAM private ~12.6 MB (icon cache).
 
 ## Next
+- 1.0: user check on the real desktop, then merge branch + bump version + release.
+- From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
+  header, tooltip fade, unfolded rows fade-in, row hysteresis on tile resize.
 - User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
 - Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them).
 - New folder on Desktop while running: no tile until restart. "Show hidden files" on -> tiled folders show dimmed.

@@ -510,6 +510,19 @@ impl GfWindow {
         if !d.moved && dx.abs() <= DRAG_START && dy.abs() <= DRAG_START {
             return false;
         }
+        if !d.moved && self.kind.get() == Kind::Tile {
+            // dragged tile goes over its neighbours (was: slid under them): the others step to the bottom
+            let me = self.hwnd.get();
+            ALL.with(|v| {
+                for o in v.borrow().iter().filter_map(|w| w.upgrade()) {
+                    if o.kind.get() == Kind::Tile && o.hwnd.get() != me {
+                        unsafe {
+                            let _ = SetWindowPos(o.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+            });
+        }
         d.moved = true;
         self.drag.set(Some(d));
         if d.resize {

@@ -17,6 +17,50 @@
 //   menu N                            next shortcut menu (right click) picks item N: 1 open, 2 rename,
 //                                     3 icon, 4 delete, 5 uninstall (0 = dismiss). Target ask = rename box.
 //   fits T                            fail unless window T's real OS size == its drawn size
+//
+// v1.1 scenario command contracts (to be implemented alongside v1.1 features; exact pass/fail semantics):
+//   page N                            switches Panel page via the SAME Rust handler as clicking gear/back
+//                                     (sets Panel.page = N AND runs fit_panel when opening settings, N == 1).
+//   inwork T                          fails unless window T's OS rect (plat::rect_of) lies completely inside
+//                                     win::work_area() (left >= wa.left, top >= wa.top, right <= wa.right,
+//                                     bottom <= wa.bottom).
+//   zoomend tile NAME                 fails unless the last recorded zoom-view rect of the target panel
+//                                     (plat::last_zoom_rect(window)) exists and equals tile NAME's OS rect
+//                                     within +-1 px on all 4 edges (left, top, right, bottom).
+//   renders reset                     zeroes the real zview SoftwareRenderer::render() counter in plat.rs
+//                                     (incremented inside GfWindow::draw whenever Slint renders during zview).
+//   renders panel max N               fails if that real zview render counter for the panel exceeds N.
+//   item panel <group> <name> [absent]
+//                                     checks live panel model (App.folder / Panel groups) that an item with
+//                                     file stem or file name <name> is present (or absent) in group <group>.
+//   tileitem <folder> <name> [absent] checks live tile state (g().tile_items for <folder>) that an item with
+//                                     file name or stem <name> is present (or absent).
+//   extdrop tile NAME REL             simulates external drop (copy = false, move) of desktop-relative REL onto
+//                                     tile NAME through the real drop handler (with tile/panel UI refresh);
+//                                     fails if rejected (returns empty).
+//   extdrop panel X Y REL             same onto open panel at logical coords (X, Y) (group under cursor or root).
+//   extdrop_copy tile NAME REL | extdrop_copy panel X Y REL
+//                                     same as extdrop with copy = true (Ctrl held); fails if rejected.
+//   extdrop_deny tile NAME REL | extdrop_deny panel X Y REL
+//                                     simulates external drop; fails unless drop is rejected (returns empty)
+//                                     AND the filesystem is unchanged.
+//   mkdir REL                         creates directory REL (and parents) under test desktop.
+//   rmdir REL                         recursively removes directory REL under test desktop.
+//   ren REL NEWNAME                   renames REL to sibling NEWNAME under test desktop.
+//   touch REL                         creates dummy .bat file REL ("rem test") under test desktop.
+//   rm REL                            deletes file REL under test desktop.
+//   gone T                            fails unless window T is removed from g().tiles (for `tile NAME`) or
+//                                     absent/hidden (distinct from `hidden`, which requires the window to exist).
+//   autostart on|off                  verifies BOTH: (1) HKCU\<shell::autostart_key()> value "GlassFolders"
+//                                     equals the quoted current exe path ("\"<exe>\"") for `on` or is absent
+//                                     for `off`, AND (2) Panel's `autostart` property equals true / false.
+//
+// Settings UI layout contract for deterministic SwitchRow click (settings-autostart.gfs):
+//   In app.slint Settings page (width >= 372px, pad = 16px, top = 48px), the "Start with Windows" /
+//   "Запуск с Windows" SwitchRow is the 4th row (y = 132px, height = 44px) of the first "Folder"/"Папка" Card
+//   (at x = pad = 16px, y = top + 24px = 72px, width = cw = width - 32px, height = 4 * 44px = 176px).
+//   At panel width = 372px, the 40x20 Switch sits at window x = 302..342 (center 322), y = 216..236 (center 226).
+//
 // OUT = env GF_OUT, else <script dir>/out. Log: OUT/log.txt. Any failed command stops the run, exit 1.
 // Env GF_TIMEOUT (s, default 60): whole run limit.
 
@@ -58,6 +102,37 @@ enum Cmd {
     Fits(String),
     Menu(u32),
     DragTo(f32, f32, String),
+    Page(i32),
+    InWork(String),
+    ZoomEnd(String),
+    RendersReset,
+    RendersMax(String, usize),
+    /// external drop: target, desktop-relative source, copy, expect refusal
+    ExtDrop(DropTo, String, bool, bool),
+    /// item panel GROUP NAME [absent]
+    Item(String, String, bool),
+    /// tileitem FOLDER NAME [absent]
+    TileItem(String, String, bool),
+    Fs(FsOp),
+    Gone(String),
+    Opt(String, i32),
+    Autostart(bool),
+}
+
+#[derive(Clone, Debug)]
+enum DropTo {
+    Tile(String),
+    Panel(f32, f32),
+}
+
+/// Desktop file system changes made while the app runs (watcher tests). Paths relative to the desktop.
+#[derive(Clone, Debug)]
+enum FsOp {
+    Mkdir(String),
+    Rmdir(String),
+    Ren(String, String),
+    Touch(String),
+    Rm(String),
 }
 
 impl std::fmt::Debug for Ptr {
@@ -88,6 +163,7 @@ fn num(s: Option<&str>) -> Result<f32, String> {
 }
 
 fn parse(text: &str) -> Result<Vec<(usize, String, Cmd)>, String> {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let mut v = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -148,6 +224,76 @@ fn parse(text: &str) -> Result<Vec<(usize, String, Cmd)>, String> {
                 push(Cmd::DragTo(x, y, a.next().unwrap_or("").trim().to_string()));
             }
             "menu" => push(Cmd::Menu(num(Some(rest)).map_err(err)? as u32)),
+            "page" => push(Cmd::Page(num(Some(rest)).map_err(err)? as i32)),
+            "inwork" => push(Cmd::InWork(rest.into())),
+            "zoomend" => push(Cmd::ZoomEnd(rest.into())),
+            "renders" => {
+                let sub = a.next().ok_or_else(|| err("missing renders subcommand".into()))?;
+                if sub == "reset" {
+                    push(Cmd::RendersReset);
+                } else {
+                    let kw = a.next().ok_or_else(|| err("expected 'max'".into()))?;
+                    if kw != "max" {
+                        return Err(err(format!("expected 'max', got '{kw}'")));
+                    }
+                    let max = num(a.next()).map_err(err)? as usize;
+                    push(Cmd::RendersMax(sub.into(), max));
+                }
+            }
+            "extdrop" | "extdrop_copy" | "extdrop_deny" => {
+                // extdrop tile NAME REL | extdrop panel X Y REL (REL may hold spaces: rest of the line)
+                let to = match a.next() {
+                    Some("tile") => DropTo::Tile(a.next().ok_or_else(|| err("missing tile name".into()))?.to_string()),
+                    Some("panel") => {
+                        let x = num(a.next()).map_err(err)?;
+                        DropTo::Panel(x, num(a.next()).map_err(err)?)
+                    }
+                    _ => return Err(err("expected tile NAME or panel X Y".into())),
+                };
+                let rel = a.collect::<Vec<_>>().join(" ");
+                if rel.is_empty() {
+                    return Err(err("missing path".into()));
+                }
+                push(Cmd::ExtDrop(to, rel, word == "extdrop_copy", word == "extdrop_deny"));
+            }
+            "item" | "tileitem" => {
+                let w: Vec<&str> = a.collect();
+                let absent = w.last() == Some(&"absent");
+                let w = if absent { &w[..w.len() - 1] } else { &w[..] };
+                if word == "item" {
+                    if w.len() != 3 || w[0] != "panel" {
+                        return Err(err("expected: item panel GROUP NAME [absent]".into()));
+                    }
+                    push(Cmd::Item(w[1].into(), w[2].into(), !absent));
+                } else {
+                    if w.len() != 2 {
+                        return Err(err("expected: tileitem FOLDER NAME [absent]".into()));
+                    }
+                    push(Cmd::TileItem(w[0].into(), w[1].into(), !absent));
+                }
+            }
+            "mkdir" => push(Cmd::Fs(FsOp::Mkdir(rest.into()))),
+            "rmdir" => push(Cmd::Fs(FsOp::Rmdir(rest.into()))),
+            "touch" => push(Cmd::Fs(FsOp::Touch(rest.into()))),
+            "rm" => push(Cmd::Fs(FsOp::Rm(rest.into()))),
+            "ren" => {
+                let (from, to) = rest.split_once(char::is_whitespace).ok_or_else(|| err("expected: ren REL NEWNAME".into()))?;
+                push(Cmd::Fs(FsOp::Ren(from.into(), to.trim().into())));
+            }
+            "gone" => push(Cmd::Gone(rest.into())),
+            "opt" => {
+                let k = a.next().ok_or_else(|| err("expected: opt KEY V".into()))?.to_string();
+                let v = a.next().ok_or_else(|| err("expected: opt KEY V".into()))?.parse::<i32>().map_err(|e| err(e.to_string()))?;
+                push(Cmd::Opt(k, v));
+            }
+            "autostart" => {
+                let want = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(err("expected: autostart on|off".into())),
+                };
+                push(Cmd::Autostart(want));
+            }
             _ => return Err(err("unknown command".into())),
         }
     }
@@ -169,6 +315,29 @@ fn with_window<R>(t: &str, f: impl FnOnce(&slint::Window) -> R) -> Result<R, Str
         }
         _ => Err(format!("bad target '{t}'")),
     }
+}
+
+/// File `p` is called `name` (file name or name without extension).
+fn is_named(p: &Path, name: &str) -> bool {
+    p.file_name().is_some_and(|n| n.to_string_lossy() == name) || p.file_stem().is_some_and(|n| n.to_string_lossy() == name)
+}
+
+/// All paths under `dir` (relative, sorted): "did anything change on disk".
+fn tree(dir: &Path) -> Vec<PathBuf> {
+    fn walk(base: &Path, d: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            out.push(p.strip_prefix(base).unwrap_or(&p).to_path_buf());
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                walk(base, &p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 fn key_of(name: &str) -> Option<Key> {
@@ -284,6 +453,158 @@ fn exec(r: &mut Run, c: &Cmd) -> Result<u64, String> {
             r.note(&format!("  {t}: window {rw}x{rh}, drawn {}x{}", drawn.width, drawn.height));
             if (rw, rh) != (drawn.width, drawn.height) {
                 return Err(format!("{t} window {rw}x{rh} != drawn {}x{}", drawn.width, drawn.height));
+            }
+        }
+        Cmd::Page(n) => {
+            let (p, _) = crate::main_panel().ok_or("no panel")?;
+            crate::set_panel_page(&p, *n);
+        }
+        Cmd::InWork(t) => {
+            let rect = with_window(t, plat::rect_of)?.ok_or("no window")?;
+            let wa = crate::win::work_area();
+            r.note(&format!(
+                "  {t}: [{},{},{},{}] in wa [{},{},{},{}]",
+                rect.left, rect.top, rect.right, rect.bottom, wa.left, wa.top, wa.right, wa.bottom
+            ));
+            if rect.left < wa.left || rect.top < wa.top || rect.right > wa.right || rect.bottom > wa.bottom {
+                return Err(format!(
+                    "{t} [{},{},{},{}] outside work_area [{},{},{},{}]",
+                    rect.left, rect.top, rect.right, rect.bottom, wa.left, wa.top, wa.right, wa.bottom
+                ));
+            }
+        }
+        Cmd::ZoomEnd(t) => {
+            let got = with_window(&r.target, plat::last_zoom_rect)?
+                .ok_or_else(|| format!("no last_zoom_rect on {}", r.target))?;
+            let want = with_window(t, plat::rect_of)?.ok_or_else(|| format!("no window {t}"))?;
+            r.note(&format!(
+                "  zoomend: got [{},{},{},{}] vs {t} [{},{},{},{}]",
+                got.left, got.top, got.right, got.bottom, want.left, want.top, want.right, want.bottom
+            ));
+            if (got.left - want.left).abs() > 1
+                || (got.top - want.top).abs() > 1
+                || (got.right - want.right).abs() > 1
+                || (got.bottom - want.bottom).abs() > 1
+            {
+                return Err(format!(
+                    "zoomend [{},{},{},{}] != {t} [{},{},{},{}]",
+                    got.left, got.top, got.right, got.bottom, want.left, want.top, want.right, want.bottom
+                ));
+            }
+        }
+        Cmd::ExtDrop(to, rel, copy, deny) => {
+            let src = r.desktop.join(rel);
+            let before = tree(&r.desktop);
+            // real drop handler of that window (OLE path minus OLE); window cloned out: the drop may
+            // add / remove tiles (borrows of g().tiles must not be held)
+            let taken = match to {
+                DropTo::Tile(name) => {
+                    let t = crate::g()
+                        .tiles
+                        .borrow()
+                        .iter()
+                        .find(|(d, _)| d.file_name().is_some_and(|n| n.to_string_lossy() == name.as_str()))
+                        .map(|(_, t)| t.clone_strong());
+                    let t = t.ok_or_else(|| format!("no tile {name}"))?;
+                    plat::drop_at(t.window(), 0.0, 0.0, &[src], *copy)
+                }
+                DropTo::Panel(x, y) => {
+                    let (p, _) = crate::main_panel().ok_or("no panel")?;
+                    plat::drop_at(p.window(), *x, *y, &[src], *copy)
+                }
+            };
+            match (*deny, taken) {
+                (false, false) => return Err(format!("drop of {rel} refused")),
+                (true, true) => return Err(format!("drop of {rel} accepted, expected refusal")),
+                (true, false) if tree(&r.desktop) != before => return Err("refused drop changed files".into()),
+                _ => {}
+            }
+        }
+        Cmd::Item(group, name, want) => {
+            let (_, a) = crate::main_panel().ok_or("no panel")?;
+            let st = a.borrow();
+            let f = st.folder.as_ref().ok_or("no folder in panel")?;
+            let on = f.groups.iter().filter(|g| g.name == *group).any(|g| g.items.iter().any(|p| is_named(p, name)));
+            if !*want && on {
+                return Err(format!("{name} still in group {group}"));
+            }
+            if *want && !on {
+                let have: Vec<String> = f.groups.iter().map(|g| format!("{}: {:?}", g.name, g.items.iter().filter_map(|p| p.file_name()).collect::<Vec<_>>())).collect();
+                return Err(format!("{name} not in group {group} ({})", have.join("; ")));
+            }
+        }
+        Cmd::TileItem(folder, name, want) => {
+            let g = crate::g();
+            let items = g.tile_items.borrow();
+            let list = items
+                .iter()
+                .find(|(d, _)| d.file_name().is_some_and(|n| n.to_string_lossy() == folder.as_str()))
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| format!("no tile items for {folder}"))?;
+            let on = list.iter().any(|p| is_named(p, name));
+            if on != *want {
+                return Err(format!("tile {folder}: {name} {}", if on { "present" } else { "missing" }));
+            }
+        }
+        Cmd::Fs(op) => {
+            let d = &r.desktop;
+            let res = match op {
+                FsOp::Mkdir(rel) => std::fs::create_dir_all(d.join(rel)),
+                FsOp::Rmdir(rel) => std::fs::remove_dir_all(d.join(rel)),
+                FsOp::Ren(rel, new) => {
+                    let from = d.join(rel);
+                    let to = from.parent().unwrap_or(d).join(new);
+                    std::fs::rename(&from, &to)
+                }
+                FsOp::Touch(rel) => std::fs::write(d.join(rel), "rem test"),
+                FsOp::Rm(rel) => std::fs::remove_file(d.join(rel)),
+            };
+            res.map_err(|e| format!("{op:?}: {e}"))?;
+        }
+        Cmd::Gone(t) => {
+            let present = match t.split_once(' ') {
+                // tile: must be dropped from the app's tile list (not merely hidden)
+                Some(("tile", name)) => crate::g()
+                    .tiles
+                    .borrow()
+                    .iter()
+                    .any(|(d, _)| d.file_name().is_some_and(|n| n.to_string_lossy() == name.trim())),
+                _ => with_window(t, plat::is_shown).unwrap_or(false),
+            };
+            if present {
+                return Err(format!("{t} still there"));
+            }
+        }
+        Cmd::RendersReset => plat::reset_zview_renders(),
+        Cmd::RendersMax(t, max) => {
+            let _ = with_window(t, |_| ())?;
+            let n = plat::zview_renders();
+            r.note(&format!("  renders {t}: {n} (max {max})"));
+            if n > *max {
+                return Err(format!("renders {t}: {n} > max {max}"));
+            }
+        }
+        Cmd::Opt(k, v) => crate::set_opt(k, *v),
+        Cmd::Autostart(want) => {
+            let key = crate::shell::autostart_key();
+            let reg_on = crate::shell::autostart_enabled();
+            let reg_val = crate::shell::autostart_value_at(&key);
+            if reg_on != *want {
+                return Err(format!("autostart_enabled() = {reg_on}, expected {want} (key {key})"));
+            }
+            if *want {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let expected = format!("\"{}\"", exe.display());
+                if reg_val.as_deref() != Some(expected.as_str()) {
+                    return Err(format!("registry GlassFolders = {reg_val:?}, expected {expected:?}"));
+                }
+            } else if reg_val.is_some() {
+                return Err(format!("registry GlassFolders still present: {reg_val:?}"));
+            }
+            let (p, _) = crate::main_panel().ok_or("no panel")?;
+            let ui_on = p.get_autostart();
+            if ui_on != *want {
+                return Err(format!("panel autostart = {ui_on}, expected {want}"));
             }
         }
     }

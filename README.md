@@ -33,7 +33,15 @@ A plain folder icon tells you nothing until you open it. On a phone, four small 
 
 **Right-click a shortcut** (in a folder or on a tile) to rename it, change its icon, delete it, or uninstall the whole app. Uninstall finds the app's own uninstaller and asks first.
 
-**Drag shortcuts out.** Drop a shortcut on another folder's tile to move it there, or on the free desktop to put it back on the desktop.
+![Shortcut menu](docs/media/en/menu.gif)
+
+**Drag shortcuts in and out.** Drop files or shortcuts from the desktop or File Explorer onto a tile or straight into a group (hold Ctrl to copy). Drag a shortcut out onto another folder's tile to move it there, or onto the free desktop to put it back.
+
+![Drag out](docs/media/en/dragout.gif)
+
+**Stays in sync.** Create, rename, or delete folders and shortcuts on the desktop while the app is running — tiles and open panels update automatically.
+
+**Tray icon, autostart, and Win+D.** Toggle **Start with Windows** in settings or from the system tray menu. Tiles and pinned folders stay on your desktop even when you press **Win+D**.
 
 **Smooth and fast.** Folders open instantly, even with hundreds of shortcuts. Animations follow your screen's refresh rate.
 
@@ -46,7 +54,7 @@ Close the app and you have the same plain folders as before. This holds even if 
 
 1. Download `glass-folders.zip` from [Releases](../../releases/latest) and unzip it.
 2. Run `glass-folders.exe`.
-3. To quit, open any folder, click the gear, then **Quit app**.
+3. To quit, right-click the tray icon and choose **Quit**, or open any folder → gear → **Quit app**.
 
 Requirements: Windows 11 with Transparency effects on (Settings → Personalization → Colors).
 The interface is in English and Russian (picked from your Windows language; switch it in settings). The exe is not signed, so Windows SmartScreen may ask you to confirm the first launch.

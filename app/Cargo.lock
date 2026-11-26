@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "glass-folders"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "png",
  "serde",
@@ -1285,6 +1285,7 @@ dependencies = [
  "slint",
  "slint-build",
  "windows 0.61.3",
+ "windows-core 0.61.2",
 ]
 
 [[package]]

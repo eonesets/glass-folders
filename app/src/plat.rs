@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
@@ -55,10 +56,10 @@ pub fn perf(msg: impl FnOnce() -> String) {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Bgra {
-    b: u8,
-    g: u8,
-    r: u8,
-    a: u8,
+    pub(crate) b: u8,
+    pub(crate) g: u8,
+    pub(crate) r: u8,
+    pub(crate) a: u8,
 }
 
 impl TargetPixel for Bgra {
@@ -86,6 +87,78 @@ pub enum Kind {
     Tile,
     /// name hint near the cursor: topmost, no focus, clicks go through
     Hint,
+}
+
+/// Z-order policy for desktop-bound windows (tiles and pinned panels).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ZPlace {
+    /// Normal desktop mode: stay at the bottom of Z-order.
+    Bottom,
+    /// Show Desktop (Win+D) active: stay right above the raised desktop host.
+    AboveHost,
+}
+
+/// Z-order target for a window. Tiles and pinned panels are desktop-bound; unpinned panels and hints are unmanaged.
+pub fn z_place(kind: Kind, pinned: bool, show_desktop: bool) -> Option<ZPlace> {
+    if kind == Kind::Tile || (kind == Kind::Panel && pinned) {
+        Some(if show_desktop { ZPlace::AboveHost } else { ZPlace::Bottom })
+    } else {
+        None
+    }
+}
+
+/// Relative Z-order layer among desktop-bound windows: pinned panels stay above tiles.
+pub fn z_layer(kind: Kind, pinned: bool) -> Option<u8> {
+    match (kind, pinned) {
+        (Kind::Tile, _) => Some(1),
+        (Kind::Panel, true) => Some(2),
+        _ => None,
+    }
+}
+
+/// Z-order action to apply when the foreground window changes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LayerAction {
+    RaiseAboveHost,
+    RestoreBottom,
+}
+
+/// Decides whether desktop-bound windows should be raised above the desktop host or restored to bottom.
+pub fn on_foreground_change(was_show_desktop: bool, is_desktop_fg: bool) -> Option<LayerAction> {
+    match (was_show_desktop, is_desktop_fg) {
+        (_, true) => Some(LayerAction::RaiseAboveHost),
+        (true, false) => Some(LayerAction::RestoreBottom),
+        (false, false) => None,
+    }
+}
+
+/// Tracks whether the cached Slint snapshot during zview needs a fresh SoftwareRenderer::render() pass.
+#[derive(Default)]
+pub(crate) struct ZoomSnap {
+    rendered: bool,
+    dirty: bool,
+}
+
+impl ZoomSnap {
+    /// Returns true on the first frame after Default/clear() and after mark_dirty(), then false until dirty again.
+    pub(crate) fn frame(&mut self) -> bool {
+        if !self.rendered || self.dirty {
+            self.rendered = true;
+            self.dirty = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.rendered = false;
+        self.dirty = false;
+    }
 }
 
 struct Dib {
@@ -126,8 +199,27 @@ pub struct GfWindow {
     /// Open / close animation: whole content scaled into this screen rect, faded (0..1).
     /// Slint keeps its full size (no relayout per frame); paint + mouse are scaled.
     zview: Cell<Option<(RECT, f32)>>,
+    zoom_snap: RefCell<ZoomSnap>,
+    last_zoom_rect: Cell<Option<RECT>>,
     zdib: RefCell<Option<Dib>>, // scaled frame
     glide: RefCell<Option<slint::Timer>>,
+    /// files dragged in from Explorer: app callback (see enable_drop); drop_reg = RegisterDragDrop done
+    on_drop: RefCell<Option<DropFn>>,
+    drop_reg: Cell<bool>,
+}
+
+impl Drop for GfWindow {
+    fn drop(&mut self) {
+        // window gone for good (removed tile, closed pinned panel): native window + drop target too
+        let hwnd = self.hwnd.get();
+        WINDOWS.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize)));
+        unsafe {
+            if self.drop_reg.get() {
+                let _ = windows::Win32::System::Ole::RevokeDragDrop(hwnd);
+            }
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }
 
 /// Window drag in progress (tile, or panel header): move (anywhere) or resize (bottom-right grip). Screen coords.
@@ -196,6 +288,141 @@ thread_local! {
     static TILE_NAMED: Cell<bool> = const { Cell::new(true) };
     static WINDOWS: RefCell<HashMap<isize, Weak<GfWindow>>> = RefCell::new(HashMap::new());
     static ALL: RefCell<Vec<Weak<GfWindow>>> = const { RefCell::new(Vec::new()) };
+    static SCALE_XS: RefCell<Vec<(usize, usize, u32)>> = const { RefCell::new(Vec::new()) };
+    static ZVIEW_RENDERS: Cell<usize> = const { Cell::new(0) };
+    static SHOW_DESKTOP: Cell<bool> = const { Cell::new(false) };
+    static REORDERING: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn reset_zview_renders() {
+    ZVIEW_RENDERS.with(|c| c.set(0));
+}
+
+pub fn zview_renders() -> usize {
+    ZVIEW_RENDERS.with(|c| c.get())
+}
+
+pub fn last_zoom_rect(window: &slint::Window) -> Option<RECT> {
+    find(window).and_then(|g| g.last_zoom_rect.get())
+}
+
+fn attach_desktop_owner(hwnd: HWND, attach: bool) {
+    if offscreen() {
+        return;
+    }
+    let owner = if attach {
+        crate::desk::desktop_host().map(|h| h.0 as isize).unwrap_or(0)
+    } else {
+        0
+    };
+    unsafe {
+        let cur = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
+        if cur != owner {
+            SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner);
+        }
+    }
+}
+
+fn is_desktop_hwnd(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let target = if root.is_invalid() { hwnd } else { root };
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(target, &mut buf) as usize;
+        let class = String::from_utf16_lossy(&buf[..n]);
+        crate::desk::is_desktop_class(&class)
+    }
+}
+
+fn managed_windows() -> Vec<(u8, Rc<GfWindow>)> {
+    ALL.with(|v| {
+        v.borrow()
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .filter_map(|g| z_layer(g.kind.get(), g.pinned.get()).map(|layer| (layer, g)))
+            .collect()
+    })
+}
+
+/// Re-attach desktop owner (in case Explorer moved SHELLDLL_DefView between Progman and WorkerW)
+/// and keep visible tiles & pinned panels right above the desktop host (pinned above tiles).
+fn sync_desktop_layer() {
+    if offscreen() {
+        return;
+    }
+    let Some(host) = crate::desk::desktop_host() else { return };
+    let mut managed = managed_windows();
+    for (_, g) in &managed {
+        attach_desktop_owner(g.hwnd.get(), true);
+    }
+    managed.sort_by_key(|(layer, _)| *layer);
+    unsafe {
+        // Find the lowest non-managed window immediately above host so we stay above host
+        // without jumping over normal application windows when the user merely clicked the desktop.
+        let mut prev = GetWindow(host, GW_HWNDPREV).unwrap_or_default();
+        while !prev.is_invalid()
+            && lookup(prev).is_some_and(|g| z_layer(g.kind.get(), g.pinned.get()).is_some())
+        {
+            prev = GetWindow(prev, GW_HWNDPREV).unwrap_or_default();
+        }
+        let anchor = if prev.is_invalid() { HWND_TOP } else { prev };
+        REORDERING.with(|r| r.set(true));
+        for (_, g) in &managed {
+            let hwnd = g.hwnd.get();
+            if IsWindowVisible(hwnd).as_bool() {
+                let _ = SetWindowPos(hwnd, Some(anchor), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        REORDERING.with(|r| r.set(false));
+    }
+}
+
+/// Restore visible pinned panels to HWND_BOTTOM first, then visible tiles, so pinned panels stay above tiles
+/// and both sit behind normal/background app windows after leaving Show Desktop.
+fn restore_desktop_bottom() {
+    if offscreen() {
+        return;
+    }
+    let mut managed = managed_windows();
+    for (_, g) in &managed {
+        attach_desktop_owner(g.hwnd.get(), true);
+    }
+    // Pinned panels (layer 2) go to HWND_BOTTOM first, then tiles (layer 1) go beneath them.
+    managed.sort_by_key(|(layer, _)| std::cmp::Reverse(*layer));
+    unsafe {
+        REORDERING.with(|r| r.set(true));
+        for (_, g) in &managed {
+            let hwnd = g.hwnd.get();
+            if IsWindowVisible(hwnd).as_bool() {
+                let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        REORDERING.with(|r| r.set(false));
+    }
+}
+
+unsafe extern "system" fn fg_hook(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _time: u32,
+) {
+    if lookup(hwnd).is_some_and(|g| g.pinned.get()) {
+        return;
+    }
+    let sd = is_desktop_hwnd(hwnd);
+    let was = SHOW_DESKTOP.with(|v| v.replace(sd));
+    match on_foreground_change(was, sd) {
+        Some(LayerAction::RaiseAboveHost) => sync_desktop_layer(),
+        Some(LayerAction::RestoreBottom) => restore_desktop_bottom(),
+        None => {}
+    }
 }
 
 fn lookup(hwnd: HWND) -> Option<Rc<GfWindow>> {
@@ -216,6 +443,7 @@ pub fn set_kind(window: &slint::Window, kind: Kind) {
     if let Some(g) = find(window) {
         g.kind.set(kind);
         let hwnd = g.hwnd.get();
+        attach_desktop_owner(hwnd, kind == Kind::Tile || g.pinned.get());
         unsafe {
             let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
             let n = if kind != Kind::Panel || offscreen() { ex | WS_EX_NOACTIVATE.0 as isize } else { ex & !(WS_EX_NOACTIVATE.0 as isize) };
@@ -247,12 +475,17 @@ pub fn set_zoom(window: &slint::Window, zoom: f32) {
 pub fn set_pinned(window: &slint::Window, on: bool) {
     let Some(g) = find(window) else { return };
     g.pinned.set(on);
+    let hwnd = g.hwnd.get();
+    attach_desktop_owner(hwnd, on || g.kind.get() == Kind::Tile);
     if on {
-        let hwnd = g.hwnd.get();
         unsafe {
-            let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if SHOW_DESKTOP.with(|v| v.get()) {
+                sync_desktop_layer();
+            } else {
+                let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
+            }
             SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
-            let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -278,18 +511,27 @@ pub fn set_snap(on: bool) {
     SNAP.with(|s| s.set(on));
 }
 
-/// Animation frame: the whole content scaled into screen rect `r` (same aspect -> uniform scale),
-/// faded by `fade` 0..1. Content size is untouched (no relayout per frame).
+/// Animation frame: the whole content scaled into screen rect `r` (aspect preserved, centered),
+/// faded by `fade` 0..1. Content size is untouched (no relayout per frame); Slint renders once
+/// and only re-renders if the window is marked dirty (e.g. icons arrived).
 pub fn set_zoom_view(window: &slint::Window, r: RECT, fade: f32) {
     let Some(g) = find(window) else { return };
+    if g.zview.get().is_none() {
+        g.zoom_snap.borrow_mut().clear();
+    }
     g.zview.set(Some((r, fade.clamp(0.0, 1.0))));
+    g.last_zoom_rect.set(Some(r));
     let hwnd = g.hwnd.get();
     let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
+    let PhysicalSize { width: sw, height: sh } = g.size.get();
     unsafe {
         // frame ready before the window changes, then move + blit in one go (no WM_PAINT round trip,
         // no copy of old bits): DWM gets new geometry and new content together
         let sdc = GetDC(None);
-        let ok = g.draw(sdc) && g.zoom_into(sdc, w as u32, h as u32);
+        let need_draw = g.zoom_snap.borrow_mut().frame()
+            || g.dib.borrow().as_ref().map(|d| (d.w, d.h)) != Some((sw, sh));
+        let drew = if need_draw { g.draw(sdc) } else { true };
+        let ok = drew && g.zoom_into(sdc, w as u32, h as u32);
         let _ = ReleaseDC(None, sdc);
         // DWM may show one frame between move and blit: shrinking -> new (smaller) picture first, growing ->
         // bigger window first. Either way that frame has a bit of empty glass, never cut-off content.
@@ -317,6 +559,7 @@ pub fn end_zoom_view(window: &slint::Window, home: Option<POINT>) {
     if g.zview.take().is_none() {
         return;
     }
+    g.zoom_snap.borrow_mut().clear();
     g.zdib.borrow_mut().take();
     if let Some(p) = home {
         let PhysicalSize { width, height } = g.size.get();
@@ -334,34 +577,66 @@ pub fn zoom_view_on(window: &slint::Window) -> bool {
     find(window).is_some_and(|g| g.zview.get().is_some())
 }
 
-/// Bilinear scale of premultiplied pixels, times `fade` (premultiplied: all channels scale).
-fn scale_pixels(src: &[Bgra], sw: usize, sh: usize, dst: &mut [Bgra], dw: usize, dh: usize, fade: f32) {
+/// Aspect-preserving (contain, centered) bilinear scale of premultiplied pixels, times `fade` (0..1).
+/// Every pixel in `dst` is written (transparent outside content rect). Reuses thread-local scratch buffer.
+pub(crate) fn scale_pixels(src: &[Bgra], sw: usize, sh: usize, dst: &mut [Bgra], dw: usize, dh: usize, fade: f32) {
+    if dw == 0 || dh == 0 {
+        return;
+    }
+    let fade = fade.clamp(0.0, 1.0);
     let f = (fade * 256.0).round() as u32;
-    let xs: Vec<(usize, usize, u32)> = (0..dw)
-        .map(|x| {
-            let fx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+    if sw == 0 || sh == 0 || f == 0 {
+        dst[..dw * dh].fill(Bgra::default());
+        return;
+    }
+    let scale = (dw as f32 / sw as f32).min(dh as f32 / sh as f32);
+    let cw = ((sw as f32 * scale).round() as usize).clamp(1, dw);
+    let ch = ((sh as f32 * scale).round() as usize).clamp(1, dh);
+    let ox = (dw - cw) / 2;
+    let oy = (dh - ch) / 2;
+
+    if oy > 0 {
+        dst[..oy * dw].fill(Bgra::default());
+    }
+    if oy + ch < dh {
+        dst[(oy + ch) * dw..dw * dh].fill(Bgra::default());
+    }
+
+    SCALE_XS.with(|cell| {
+        let mut xs = cell.borrow_mut();
+        xs.clear();
+        xs.reserve(cw);
+        for x in 0..cw {
+            let fx = ((x as f32 + 0.5) * sw as f32 / cw as f32 - 0.5).max(0.0);
             let x0 = (fx as usize).min(sw - 1);
             let x1 = (x0 + 1).min(sw - 1);
-            (x0, x1, ((fx - x0 as f32) * 256.0) as u32)
-        })
-        .collect();
-    for y in 0..dh {
-        let fy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
-        let y0 = (fy as usize).min(sh - 1);
-        let y1 = (y0 + 1).min(sh - 1);
-        let ty = ((fy - y0 as f32) * 256.0) as u32;
-        let (r0, r1) = (&src[y0 * sw..y0 * sw + sw], &src[y1 * sw..y1 * sw + sw]);
-        for (o, &(x0, x1, tx)) in dst[y * dw..y * dw + dw].iter_mut().zip(&xs) {
-            let (a, b, c, d) = (r0[x0], r0[x1], r1[x0], r1[x1]);
-            let mix = |p: u8, q: u8, s: u8, t: u8| -> u8 {
-                let top = p as u32 * (256 - tx) + q as u32 * tx;
-                let bot = s as u32 * (256 - tx) + t as u32 * tx;
-                let v = (top * (256 - ty) + bot * ty) >> 16;
-                ((v * f) >> 8) as u8
-            };
-            *o = Bgra { b: mix(a.b, b.b, c.b, d.b), g: mix(a.g, b.g, c.g, d.g), r: mix(a.r, b.r, c.r, d.r), a: mix(a.a, b.a, c.a, d.a) };
+            xs.push((x0, x1, ((fx - x0 as f32) * 256.0) as u32));
         }
-    }
+        for y in 0..ch {
+            let fy = ((y as f32 + 0.5) * sh as f32 / ch as f32 - 0.5).max(0.0);
+            let y0 = (fy as usize).min(sh - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let ty = ((fy - y0 as f32) * 256.0) as u32;
+            let (r0, r1) = (&src[y0 * sw..y0 * sw + sw], &src[y1 * sw..y1 * sw + sw]);
+            let row = &mut dst[(oy + y) * dw..(oy + y) * dw + dw];
+            if ox > 0 {
+                row[..ox].fill(Bgra::default());
+            }
+            if ox + cw < dw {
+                row[ox + cw..].fill(Bgra::default());
+            }
+            for (o, &(x0, x1, tx)) in row[ox..ox + cw].iter_mut().zip(xs.iter()) {
+                let (a, b, c, d) = (r0[x0], r0[x1], r1[x0], r1[x1]);
+                let mix = |p: u8, q: u8, s: u8, t: u8| -> u8 {
+                    let top = p as u32 * (256 - tx) + q as u32 * tx;
+                    let bot = s as u32 * (256 - tx) + t as u32 * tx;
+                    let v = (top * (256 - ty) + bot * ty + 32768) >> 16;
+                    ((v * f + 128) >> 8) as u8
+                };
+                *o = Bgra { b: mix(a.b, b.b, c.b, d.b), g: mix(a.g, b.g, c.g, d.g), r: mix(a.r, b.r, c.r, d.r), a: mix(a.a, b.a, c.a, d.a) };
+            }
+        }
+    });
 }
 
 /// Screen rect of a window (physical px).
@@ -402,7 +677,7 @@ pub fn desktop_at(p: POINT) -> bool {
         let mut buf = [0u16; 32];
         let n = GetClassNameW(root, &mut buf) as usize;
         let class = String::from_utf16_lossy(&buf[..n]);
-        class == "Progman" || class == "WorkerW"
+        crate::desk::is_desktop_class(&class)
     }
 }
 
@@ -436,6 +711,244 @@ pub fn set_on_deactivate(window: &slint::Window, f: impl Fn() + 'static) {
     }
 }
 
+// ---------- files dragged in from Explorer / the desktop (OLE drop target) ----------
+
+/// Drop effect for an external drag: files (CF_HDROP) only; Ctrl = copy, else move; refused = none.
+pub fn drop_effect(has_hdrop: bool, ctrl: bool, allowed: bool) -> u32 {
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE};
+    if !has_hdrop || !allowed {
+        DROPEFFECT_NONE.0
+    } else if ctrl {
+        DROPEFFECT_COPY.0
+    } else {
+        DROPEFFECT_MOVE.0
+    }
+}
+
+/// External drag over a window. Coords = window content, logical px.
+pub enum DropEv<'a> {
+    /// files over (x, y): return true if they may be dropped here (highlight on)
+    Over(f32, f32, &'a [PathBuf]),
+    /// drag left / cancelled / done: highlight off
+    Leave,
+    /// released at (x, y); bool = copy (else move). Return true if anything was taken.
+    Drop(f32, f32, &'a [PathBuf], bool),
+}
+
+type DropFn = Rc<dyn Fn(DropEv) -> bool>;
+
+/// Accept files dragged in from other apps on this window. Headless test: callback only (scripts call
+/// drop_at), no OLE registration (invisible click-through windows are no real drop targets).
+pub fn enable_drop(window: &slint::Window, f: impl Fn(DropEv) -> bool + 'static) {
+    let Some(g) = find(window) else { return };
+    *g.on_drop.borrow_mut() = Some(Rc::new(f));
+    if offscreen() || g.drop_reg.get() {
+        return;
+    }
+    let t: windows::Win32::System::Ole::IDropTarget = DropTarget::new(g.hwnd.get()).into();
+    if unsafe { windows::Win32::System::Ole::RegisterDragDrop(g.hwnd.get(), &t) }.is_ok() {
+        g.drop_reg.set(true);
+    }
+}
+
+/// Same path as a real drop, without OLE (script `extdrop`). False = window unknown / nothing taken.
+pub fn drop_at(window: &slint::Window, x: f32, y: f32, files: &[PathBuf], copy: bool) -> bool {
+    let Some(f) = find(window).and_then(|g| g.on_drop.borrow().clone()) else { return false };
+    let done = f(DropEv::Drop(x, y, files, copy));
+    f(DropEv::Leave);
+    done
+}
+
+fn drop_fn(hwnd: HWND) -> Option<(Rc<GfWindow>, DropFn)> {
+    let g = lookup(hwnd)?;
+    let f = g.on_drop.borrow().clone()?;
+    Some((g, f))
+}
+
+/// Files of a CF_HDROP data object (empty = no files: text, links, ...).
+fn hdrop_files(data: &windows::Win32::System::Com::IDataObject) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+    use windows::Win32::System::Ole::{ReleaseStgMedium, CF_HDROP};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    let fmt = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(mut m) = data.GetData(&fmt) else { return out };
+        if m.tymed == TYMED_HGLOBAL.0 as u32 {
+            let h = HDROP(m.u.hGlobal.0);
+            let n = DragQueryFileW(h, u32::MAX, None);
+            for i in 0..n {
+                let len = DragQueryFileW(h, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                let got = DragQueryFileW(h, i, Some(&mut buf)) as usize;
+                if got > 0 {
+                    out.push(PathBuf::from(std::ffi::OsString::from_wide(&buf[..got])));
+                }
+            }
+        }
+        ReleaseStgMedium(&mut m);
+    }
+    out
+}
+
+/// OLE drop target of one window. Files are read on enter; the app callback decides (see DropEv).
+#[windows::core::implement(windows::Win32::System::Ole::IDropTarget)]
+struct DropTarget {
+    hwnd: isize,
+    files: RefCell<Vec<PathBuf>>,
+    /// shell drag image keeps showing over our window
+    helper: Option<windows::Win32::UI::Shell::IDropTargetHelper>,
+}
+
+impl DropTarget {
+    fn new(hwnd: HWND) -> Self {
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        let helper = unsafe { CoCreateInstance(&windows::Win32::UI::Shell::CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.ok();
+        DropTarget { hwnd: hwnd.0 as isize, files: RefCell::default(), helper }
+    }
+
+    fn hwnd(&self) -> HWND {
+        HWND(self.hwnd as *mut _)
+    }
+
+    /// Screen point -> window content coords (logical px; open / close animation scaling undone).
+    fn at(&self, g: &GfWindow, pt: &windows::Win32::Foundation::POINTL) -> (f32, f32) {
+        let mut p = POINT { x: pt.x, y: pt.y };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd(), &mut p);
+        }
+        let (x, y) = g.unzoom(p.x as f32, p.y as f32);
+        let s = g.scale.get();
+        (x / s, y / s)
+    }
+
+    /// Effect for the current spot. `effect` in = what the source allows, out = what we do.
+    unsafe fn over(
+        &self,
+        keys: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+        pt: &windows::Win32::Foundation::POINTL,
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+    ) {
+        use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE};
+        let files = self.files.borrow();
+        let allowed = !files.is_empty()
+            && drop_fn(self.hwnd()).is_some_and(|(g, f)| {
+                let (x, y) = self.at(&g, pt);
+                f(DropEv::Over(x, y, &files))
+            });
+        let ctrl = keys.0 & windows::Win32::System::SystemServices::MK_CONTROL.0 != 0;
+        let want = drop_effect(!files.is_empty(), ctrl, allowed);
+        if effect.is_null() {
+            return;
+        }
+        let ok = unsafe { (*effect).0 };
+        // the source may not allow a move (read-only place) or a copy: take what it offers
+        let e = if want & ok != 0 {
+            want
+        } else if want != 0 && ok & DROPEFFECT_COPY.0 != 0 {
+            DROPEFFECT_COPY.0
+        } else if want != 0 && ok & DROPEFFECT_MOVE.0 != 0 {
+            DROPEFFECT_MOVE.0
+        } else {
+            0
+        };
+        unsafe { *effect = DROPEFFECT(e) };
+    }
+
+    fn leave(&self) {
+        self.files.borrow_mut().clear();
+        if let Some((_, f)) = drop_fn(self.hwnd()) {
+            f(DropEv::Leave);
+        }
+    }
+}
+
+impl windows::Win32::System::Ole::IDropTarget_Impl for DropTarget_Impl {
+    fn DragEnter(
+        &self,
+        data: windows::core::Ref<'_, windows::Win32::System::Com::IDataObject>,
+        keys: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+        pt: &windows::Win32::Foundation::POINTL,
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        *self.files.borrow_mut() = data.ok().map(hdrop_files).unwrap_or_default();
+        unsafe {
+            self.over(keys, pt, effect);
+            if let (Some(h), Ok(d), false) = (&self.helper, data.ok(), effect.is_null()) {
+                let _ = h.DragEnter(self.hwnd(), d, &POINT { x: pt.x, y: pt.y }, *effect);
+            }
+        }
+        Ok(())
+    }
+
+    fn DragOver(
+        &self,
+        keys: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+        pt: &windows::Win32::Foundation::POINTL,
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            self.over(keys, pt, effect);
+            if let (Some(h), false) = (&self.helper, effect.is_null()) {
+                let _ = h.DragOver(&POINT { x: pt.x, y: pt.y }, *effect);
+            }
+        }
+        Ok(())
+    }
+
+    fn DragLeave(&self) -> windows::core::Result<()> {
+        if let Some(h) = &self.helper {
+            unsafe {
+                let _ = h.DragLeave();
+            }
+        }
+        self.leave();
+        Ok(())
+    }
+
+    fn Drop(
+        &self,
+        data: windows::core::Ref<'_, windows::Win32::System::Com::IDataObject>,
+        keys: windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS,
+        pt: &windows::Win32::Foundation::POINTL,
+        effect: *mut windows::Win32::System::Ole::DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE};
+        if let Ok(d) = data.ok() {
+            *self.files.borrow_mut() = hdrop_files(d);
+        }
+        unsafe {
+            self.over(keys, pt, effect);
+            if let (Some(h), Ok(d), false) = (&self.helper, data.ok(), effect.is_null()) {
+                let _ = h.Drop(d, &POINT { x: pt.x, y: pt.y }, *effect);
+            }
+        }
+        let e = if effect.is_null() { 0 } else { unsafe { (*effect).0 } };
+        let files = std::mem::take(&mut *self.files.borrow_mut());
+        let done = e != 0
+            && drop_fn(self.hwnd()).is_some_and(|(g, f)| {
+                let (x, y) = self.at(&g, pt);
+                f(DropEv::Drop(x, y, &files, e == DROPEFFECT_COPY.0))
+            });
+        if let Some((_, f)) = drop_fn(self.hwnd()) {
+            f(DropEv::Leave);
+        }
+        // a move done by us (optimized move): the source must not delete anything -> NONE
+        if !effect.is_null() {
+            let out = if done && e == DROPEFFECT_COPY.0 { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+            unsafe { *effect = DROPEFFECT(out.0) };
+        }
+        Ok(())
+    }
+}
+
 impl GfWindow {
     fn new() -> Result<Rc<Self>, PlatformError> {
         let hwnd = create_hwnd()?;
@@ -458,8 +971,12 @@ impl GfWindow {
             on_moved: RefCell::new(None),
             surrogate: Cell::new(0),
             zview: Cell::new(None),
+            zoom_snap: RefCell::new(ZoomSnap::default()),
+            last_zoom_rect: Cell::new(None),
             zdib: RefCell::new(None),
             glide: RefCell::new(None),
+            on_drop: RefCell::new(None),
+            drop_reg: Cell::new(false),
         });
         WINDOWS.with(|m| m.borrow_mut().insert(hwnd.0 as isize, Rc::downgrade(&me)));
         ALL.with(|v| v.borrow_mut().push(Rc::downgrade(&me)));
@@ -483,8 +1000,16 @@ impl GfWindow {
     fn unzoom(&self, x: f32, y: f32) -> (f32, f32) {
         match self.zview.get() {
             Some((r, _)) => {
-                let k = (r.right - r.left).max(1) as f32 / self.size.get().width.max(1) as f32;
-                (x / k, y / k)
+                let dw = (r.right - r.left).max(1) as f32;
+                let dh = (r.bottom - r.top).max(1) as f32;
+                let sw = self.size.get().width.max(1) as f32;
+                let sh = self.size.get().height.max(1) as f32;
+                let k = (dw / sw).min(dh / sh);
+                let cw = (sw * k).round().clamp(1.0, dw);
+                let ch = (sh * k).round().clamp(1.0, dh);
+                let ox = ((dw - cw) / 2.0).floor();
+                let oy = ((dh - ch) / 2.0).floor();
+                ((x - ox) / k, (y - oy) / k)
             }
             None => (x, y),
         }
@@ -667,6 +1192,9 @@ impl GfWindow {
         let buf = std::slice::from_raw_parts_mut(d.bits, (w * h) as usize);
         buf.fill(Bgra::default());
         self.renderer.render(buf, w as usize);
+        if self.zview.get().is_some() {
+            ZVIEW_RENDERS.with(|c| c.set(c.get() + 1));
+        }
         REC.with(|r| {
             let mut r = r.borrow_mut();
             let Some(rec) = r.as_mut().filter(|r| r.hwnd == self.hwnd.get().0 as isize && Instant::now() < r.until) else { return };
@@ -705,14 +1233,24 @@ impl GfWindow {
         let mut ps = PAINTSTRUCT::default();
         unsafe {
             let hdc = BeginPaint(hwnd, &mut ps);
-            let t = Instant::now();
-            if self.draw(hdc) {
-                let k = self.kind.get() as u8;
-                perf(|| format!("paint k{k} {w}x{h} {:.2}ms", t.elapsed().as_secs_f64() * 1000.0));
-                if let Some((r, _)) = self.zview.get() {
-                    self.zoom_into(hdc, (r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
+            if let Some((r, _)) = self.zview.get() {
+                let (zw, zh) = ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32);
+                let need_draw = self.zoom_snap.borrow_mut().frame()
+                    || self.dib.borrow().as_ref().map(|d| (d.w, d.h)) != Some((w, h));
+                let drew = if need_draw { self.draw(hdc) } else { true };
+                if drew {
+                    if need_draw || self.zdib.borrow().as_ref().map(|d| (d.w, d.h)) != Some((zw, zh)) {
+                        self.zoom_into(hdc, zw, zh);
+                    }
+                    self.blit_to(hdc);
                 }
-                self.blit_to(hdc);
+            } else {
+                let t = Instant::now();
+                if self.draw(hdc) {
+                    let k = self.kind.get() as u8;
+                    perf(|| format!("paint k{k} {w}x{h} {:.2}ms", t.elapsed().as_secs_f64() * 1000.0));
+                    self.blit_to(hdc);
+                }
             }
             let _ = EndPaint(hwnd, &ps);
         }
@@ -773,7 +1311,11 @@ impl WindowAdapter for GfWindow {
                 }
                 let _ = ShowWindow(hwnd, if tile { SW_SHOWNOACTIVATE } else { SW_SHOW });
                 if tile {
-                    let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if SHOW_DESKTOP.with(|v| v.get()) {
+                        sync_desktop_layer();
+                    } else {
+                        let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
                     SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(0))); // never activated -> set NC-active once
                 } else {
                     let _ = SetForegroundWindow(hwnd);
@@ -805,6 +1347,9 @@ impl WindowAdapter for GfWindow {
         self.resize_physical(s.width, s.height);
     }
     fn request_redraw(&self) {
+        if self.zview.get().is_some() {
+            self.zoom_snap.borrow_mut().mark_dirty();
+        }
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd.get()), None, false);
         }
@@ -989,21 +1534,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
         }
-        WM_WINDOWPOSCHANGING if g.kind.get() == Kind::Tile || g.pinned.get() => {
-            // keep tiles + pinned panels at the bottom whenever z-order changes; plain moves (drag) stay cheap
-            let pos = &mut *(lp.0 as *mut WINDOWPOS);
-            if (pos.flags & SWP_NOZORDER).0 == 0 {
-                pos.hwndInsertAfter = HWND_BOTTOM;
-                if g.pinned.get() {
-                    // pinned panel went to the bottom: tiles go under it again (after this change lands)
-                    let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
+        WM_SYSCOMMAND if z_layer(g.kind.get(), g.pinned.get()).is_some() && (wp.0 & 0xFFF0) == SC_MINIMIZE as usize => {
+            return LRESULT(0);
+        }
+        WM_WINDOWPOSCHANGING if z_layer(g.kind.get(), g.pinned.get()).is_some() => {
+            // keep tiles + pinned panels at the bottom in normal mode, or above desktop host during Win+D
+            if !REORDERING.with(|r| r.get()) {
+                let pos = &mut *(lp.0 as *mut WINDOWPOS);
+                if (pos.flags & SWP_NOZORDER).0 == 0 {
+                    let sd = SHOW_DESKTOP.with(|v| v.get());
+                    match z_place(g.kind.get(), g.pinned.get(), sd) {
+                        Some(ZPlace::Bottom) => {
+                            pos.hwndInsertAfter = HWND_BOTTOM;
+                            if g.pinned.get() {
+                                // pinned panel went to the bottom: tiles go under it again (after this change lands)
+                                let _ = PostMessageW(Some(hwnd), WM_TILES_DOWN, WPARAM(0), LPARAM(0));
+                            }
+                        }
+                        Some(ZPlace::AboveHost) => {
+                            if pos.hwndInsertAfter == HWND_BOTTOM {
+                                pos.flags |= SWP_NOZORDER;
+                            }
+                        }
+                        None => {}
+                    }
                 }
             }
         }
         WM_TILES_DOWN => {
-            for t in ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()) {
-                if t.kind.get() == Kind::Tile && IsWindowVisible(t.hwnd.get()).as_bool() {
-                    let _ = SetWindowPos(t.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if SHOW_DESKTOP.with(|v| v.get()) {
+                sync_desktop_layer();
+            } else {
+                for t in ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()) {
+                    if t.kind.get() == Kind::Tile && IsWindowVisible(t.hwnd.get()).as_bool() {
+                        let _ = SetWindowPos(t.hwnd.get(), Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    }
                 }
             }
             return LRESULT(0);
@@ -1104,6 +1669,32 @@ impl Platform for GfPlatform {
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {
+        struct HookGuard(HWINEVENTHOOK);
+        impl Drop for HookGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    unsafe {
+                        let _ = UnhookWinEvent(self.0);
+                    }
+                }
+            }
+        }
+        let _fg_hook = if offscreen() {
+            HookGuard(HWINEVENTHOOK(std::ptr::null_mut()))
+        } else {
+            unsafe {
+                HookGuard(SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    None,
+                    Some(fg_hook),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                ))
+            }
+        };
+
         let mut msg = MSG::default();
         loop {
             slint::platform::update_timers_and_animations();
@@ -1118,10 +1709,15 @@ impl Platform for GfPlatform {
             // paced by DwmFlush (waits for the next composition). Was: a 16 ms wait / 8 ms timers on the
             // ~15.6 ms system tick -> 50-60 fps on a 120 Hz screen with uneven steps (judder).
             // Else sleep until the next timer or input (idle = 0 CPU).
-            let animating = ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).any(|g| g.window.has_active_animations()));
-            if animating {
-                ALL.with(|v| v.borrow().iter().filter_map(|w| w.upgrade()).for_each(|g| g.request_redraw()));
-            }
+            let mut animating = false;
+            ALL.with(|v| {
+                for g in v.borrow().iter().filter_map(|w| w.upgrade()) {
+                    if g.window.has_active_animations() {
+                        animating = true;
+                        g.request_redraw();
+                    }
+                }
+            });
             let next = slint::platform::duration_until_next_timer_update();
             let paced = animating || next.is_some_and(|d| d <= Duration::from_millis(12));
             let timeout = if paced {
@@ -1184,7 +1780,7 @@ pub fn set_offscreen(on: bool) {
     OFFSCREEN.with(|v| v.set(on));
 }
 
-fn offscreen() -> bool {
+pub fn offscreen() -> bool {
     OFFSCREEN.with(|v| v.get())
 }
 

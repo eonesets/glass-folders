@@ -13,7 +13,7 @@ use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{w, Interface, HSTRING, PWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_ALL};
 use windows::Win32::System::Variant::{VARIANT, VT_I4};
@@ -24,25 +24,53 @@ use windows::core::BOOL;
 
 const HIDDEN: u32 = 0x2; // FILE_ATTRIBUTE_HIDDEN
 
-/// Desktop icon list view: Progman or a WorkerW -> SHELLDLL_DefView -> SysListView32.
-fn icon_view() -> Option<HWND> {
+/// Whether a Win32 window class name belongs to the Windows desktop shell host.
+pub fn is_desktop_class(class: &str) -> bool {
+    matches!(class, "Progman" | "WorkerW")
+}
+
+/// Top-level desktop host window (Progman or WorkerW) and its direct SHELLDLL_DefView child.
+fn desktop_host_and_view() -> Option<(HWND, HWND)> {
     unsafe {
-        let mut def = FindWindowW(w!("Progman"), None).ok().and_then(|p| FindWindowExW(Some(p), None, w!("SHELLDLL_DefView"), None).ok());
-        if def.is_none() {
-            // DefView moved into a WorkerW (wallpaper slideshow, Win+Tab once used, ...)
-            unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
-                unsafe {
-                    if let Ok(d) = FindWindowExW(Some(h), None, w!("SHELLDLL_DefView"), None) {
-                        *(lp.0 as *mut Option<HWND>) = Some(d);
-                        return false.into();
+        if let Ok(p) = FindWindowW(w!("Progman"), None) {
+            if let Ok(d) = FindWindowExW(Some(p), None, w!("SHELLDLL_DefView"), None) {
+                if !d.is_invalid() {
+                    return Some((p, d));
+                }
+            }
+        }
+        // DefView moved into a WorkerW (wallpaper slideshow, Win+Tab once used, ...)
+        let mut found: Option<(HWND, HWND)> = None;
+        unsafe extern "system" fn each(h: HWND, lp: LPARAM) -> BOOL {
+            unsafe {
+                if let Ok(d) = FindWindowExW(Some(h), None, w!("SHELLDLL_DefView"), None) {
+                    if !d.is_invalid() {
+                        let mut buf = [0u16; 32];
+                        let n = GetClassNameW(h, &mut buf) as usize;
+                        let class = String::from_utf16_lossy(&buf[..n]);
+                        if is_desktop_class(&class) {
+                            *(lp.0 as *mut Option<(HWND, HWND)>) = Some((h, d));
+                            return false.into();
+                        }
                     }
                 }
-                true.into()
             }
-            let _ = EnumWindows(Some(each), LPARAM(&mut def as *mut _ as isize));
+            true.into()
         }
-        FindWindowExW(Some(def?), None, w!("SysListView32"), None).ok()
+        let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
+        found
     }
+}
+
+/// Desktop host window (Progman or WorkerW) directly containing SHELLDLL_DefView.
+pub fn desktop_host() -> Option<HWND> {
+    desktop_host_and_view().map(|(host, _)| host)
+}
+
+/// Desktop icon list view: Progman or a WorkerW -> SHELLDLL_DefView -> SysListView32.
+fn icon_view() -> Option<HWND> {
+    let (_, def) = desktop_host_and_view()?;
+    unsafe { FindWindowExW(Some(def), None, w!("SysListView32"), None).ok() }
 }
 
 /// User setting "Show desktop icons" (Explorer\Advanced\HideIcons = 1 means off).
@@ -179,6 +207,31 @@ pub fn hide_folders(home: HashMap<PathBuf, POINT>) {
         set_hidden(d, true);
     }
     HOME.with(|h| *h.borrow_mut() = home);
+}
+
+/// One more folder icon off the desktop (tile made while running). `home` = where its icon stood.
+pub fn hide_folder(dir: &Path, home: POINT) {
+    set_hidden(dir, true);
+    HOME.with(|h| h.borrow_mut().insert(dir.to_path_buf(), home));
+}
+
+/// Folder no longer ours (tile gone, folder deleted / moved away): visible again if it still exists.
+pub fn forget_folder(dir: &Path) {
+    let was = HOME.with(|h| h.borrow_mut().remove(dir));
+    if was.is_some() && dir.exists() {
+        set_hidden(dir, false);
+    }
+}
+
+/// User is typing a name on the desktop (Explorer's in-place rename box is open), e.g. "New folder".
+pub fn renaming() -> bool {
+    const LVM_GETEDITCONTROL: u32 = 0x1000 + 24;
+    let Some(lv) = icon_view() else { return false };
+    let mut r = 0usize;
+    unsafe {
+        let ok = SendMessageTimeoutW(lv, LVM_GETEDITCONTROL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 200, Some(&mut r));
+        ok.0 != 0 && r != 0
+    }
 }
 
 /// Folders visible again, icons back on their spots. Safe to call many times.

@@ -1,0 +1,19 @@
+# Кратко: маленькая папка Games (плитка 2x2 у нижнего края экрана) -> клик по шестерёнке настроек -> fit_panel держит окно целиком в work_area -> закрыть: окно плавно складывается ровно в плитку и прячется.
+#fixture bottom-tile
+open Games
+wait 500
+shown panel
+# Games panel on page 0 is 168px wide -> settings gear button is at x = 168 - 138 = 30..76, y = 0..36 (center 53, 18)
+click 53 18
+wait 450
+shown panel
+fits panel
+inwork panel
+shot settings
+frames close 500
+close
+wait 700
+hidden panel
+# last close frame = exactly the tile (no stop at 233 px, no jump)
+zoomend tile Games
+shown tile Games

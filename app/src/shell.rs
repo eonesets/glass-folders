@@ -4,13 +4,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, HWND};
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HWND};
 use windows::Win32::System::Com::{
     CoCreateInstance, IPersistFile, CLSCTX_ALL, CLSCTX_INPROC_SERVER, STGM_READ,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
-    HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_SAM_FLAGS,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE,
+    KEY_WOW64_32KEY, KEY_WOW64_64KEY, REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ,
     RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 use windows::Win32::System::WindowsProgramming::{
@@ -360,6 +361,120 @@ pub fn confirm(owner: HWND, title: &str, text: &str) -> bool {
         let m = HSTRING::from(text);
         MessageBoxW(hwnd, &m, &t, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES
     }
+}
+
+// ---------- autostart with Windows ----------
+
+const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const AUTOSTART_VAL_NAME: PCWSTR = w!("GlassFolders");
+
+/// Registry subkey under HKCU used for autostart. Defaults to Windows' Run key; overridden by `GF_AUTOSTART_KEY` in tests.
+pub fn autostart_key() -> String {
+    match std::env::var("GF_AUTOSTART_KEY") {
+        Ok(k) if !k.trim().is_empty() => k,
+        _ => AUTOSTART_RUN_KEY.to_string(),
+    }
+}
+
+/// Raw `GlassFolders` REG_SZ value under `HKCU\<key>`, if present.
+pub fn autostart_value_at(key: &str) -> Option<String> {
+    let subkey = HSTRING::from(key);
+    let mut stack_buf = [0u16; 512];
+    let mut sz = (stack_buf.len() * 2) as u32;
+    let st = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            AUTOSTART_VAL_NAME,
+            RRF_RT_REG_SZ,
+            None,
+            Some(stack_buf.as_mut_ptr() as _),
+            Some(&mut sz),
+        )
+    };
+    if st == ERROR_SUCCESS {
+        return Some(wide_to_string(&stack_buf[..(sz as usize / 2).min(stack_buf.len())]));
+    }
+    if st != ERROR_MORE_DATA || sz == 0 {
+        return None;
+    }
+    let mut heap_buf = vec![0u16; (sz as usize + 1) / 2];
+    let st = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &subkey,
+            AUTOSTART_VAL_NAME,
+            RRF_RT_REG_SZ,
+            None,
+            Some(heap_buf.as_mut_ptr() as _),
+            Some(&mut sz),
+        )
+    };
+    (st == ERROR_SUCCESS).then(|| wide_to_string(&heap_buf))
+}
+
+/// True iff `HKCU\<key>` has a non-empty `GlassFolders` REG_SZ value.
+pub fn autostart_enabled_at(key: &str) -> bool {
+    autostart_value_at(key).is_some_and(|s| !s.is_empty())
+}
+
+/// Enable (`on == true`) or disable (`on == false`) autostart under `HKCU\<key>`. Idempotent.
+pub fn set_autostart_at(key: &str, on: bool) -> bool {
+    let subkey = HSTRING::from(key);
+    if on {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let val = format!("\"{}\"", exe.display());
+        let wide: Vec<u16> = val.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut hkey = HKEY::default();
+        let st = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                &subkey,
+                Some(0),
+                None,
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                None,
+                &mut hkey,
+                None,
+            )
+        };
+        if st != ERROR_SUCCESS {
+            return false;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
+        let res = unsafe { RegSetValueExW(hkey, AUTOSTART_VAL_NAME, Some(0), REG_SZ, Some(bytes)) };
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        res == ERROR_SUCCESS
+    } else {
+        let mut hkey = HKEY::default();
+        let st = unsafe {
+            RegOpenKeyExW(HKEY_CURRENT_USER, &subkey, Some(0), KEY_SET_VALUE, &mut hkey)
+        };
+        if st == ERROR_FILE_NOT_FOUND || st == ERROR_PATH_NOT_FOUND {
+            return true;
+        }
+        if st != ERROR_SUCCESS {
+            return false;
+        }
+        let res = unsafe { RegDeleteValueW(hkey, AUTOSTART_VAL_NAME) };
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+        res == ERROR_SUCCESS || res == ERROR_FILE_NOT_FOUND
+    }
+}
+
+pub fn autostart_enabled() -> bool {
+    autostart_enabled_at(&autostart_key())
+}
+
+pub fn set_autostart(on: bool) -> bool {
+    set_autostart_at(&autostart_key(), on)
 }
 
 // ---------- internal helpers ----------

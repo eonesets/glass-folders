@@ -1,0 +1,39 @@
+# Кратко: пока программа работает, на столе создают/переименовывают/удаляют папки -> плитки обновляются; добавление/удаление файла внутри открытой папки Work обновляет панель и плитку; удаление открытой папки закрывает её окно.
+shown tile Work
+mkdir Fresh
+wait 1200
+shown tile Fresh
+fits tile Fresh
+ren Fresh Renamed
+wait 1200
+gone tile Fresh
+shown tile Renamed
+rmdir Renamed
+wait 1200
+gone tile Renamed
+shown tile Work
+shown tile Games
+# C1: live file change inside an open folder updates both panel and tile
+open Work
+wait 500
+shown panel
+touch Work/live_added.bat
+wait 900
+item panel Разное live_added
+tileitem Work live_added
+rm Work/live_added.bat
+wait 900
+item panel Разное live_added absent
+tileitem Work live_added absent
+close
+wait 500
+hidden panel
+# folder open in the panel is deleted -> panel closes, tile gone
+open Games
+wait 500
+shown panel
+rmdir Games
+wait 1500
+hidden panel
+gone tile Games
+shown tile Work

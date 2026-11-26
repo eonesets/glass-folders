@@ -1,0 +1,29 @@
+# Кратко: в настройках кликом по SwitchRow включить «Запуск с Windows» -> запись в реестре (тестовый ключ) есть и тумблер включён; закрыть и снова открыть -> настройка сохранилась; кликнуть ещё раз -> выключено.
+# Layout contract (app.slint): "Start with Windows" / "Запуск с Windows" SwitchRow is row 4 (y=132, h=44)
+# of the first "Folder"/"Папка" Card (x=16, y=72, cw=340 at width=372) -> 40x20 Switch at x=302..342, y=216..236 (center 322, 226).
+open Work
+wait 500
+page 1
+wait 450
+fits panel
+inwork panel
+autostart off
+shot autostart_off
+# real click on autostart SwitchRow
+click 322 226
+wait 250
+autostart on
+shot autostart_on
+# persistence check: close panel, reopen Work + Settings -> still on from registry
+close
+wait 600
+hidden panel
+open Work
+wait 500
+page 1
+wait 450
+autostart on
+# toggle back off via real click
+click 322 226
+wait 250
+autostart off

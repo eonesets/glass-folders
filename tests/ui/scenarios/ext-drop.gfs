@@ -1,0 +1,43 @@
+# Кратко: внешний дроп на плитку Games (перемещение + Ctrl-копия + обновление плитки), в открытую папку Work на группу Tools (с обновлением исходной плитки Games) и на пустую область панели (-> Разное), отказ при самодропе.
+#fixture extdrop
+# move onto a tile -> folder root + tile refreshed
+extdrop tile Games loose.bat
+wait 300
+missing loose.bat
+exists Games/loose.bat
+tileitem Games loose.bat
+shown tile Games
+# Ctrl = copy, never overwrite
+extdrop_copy tile Games copyme.bat
+wait 200
+exists copyme.bat
+exists Games/copyme.bat
+tileitem Games copyme.bat
+extdrop_copy tile Games copyme.bat
+wait 200
+exists Games/copyme (2).bat
+# folder onto its own tile: refused, nothing moves
+extdrop_deny tile Work Work
+exists Work/Docs/alpha.bat
+# open panel: drop over group Tools (x=184..260, y=48..166) -> into Tools, source tile Games refreshed
+open Work
+wait 500
+extdrop panel 240 108 Games/loose.bat
+wait 300
+missing Games/loose.bat
+exists Work/Tools/loose.bat
+item panel Tools loose
+tileitem Games loose.bat absent
+shown panel
+# now Tools has 2 items -> Docs(0,0,2x3), Tools(2,0,2x3), Разное(0,3,1x3); panel is 360x308.
+# bottom-right quadrant (x=100..344, y=174..292) is empty -> drop lands in folder root (Разное).
+extdrop panel 260 230 copyme.bat
+wait 300
+missing copyme.bat
+exists Work/copyme.bat
+item panel Разное copyme
+shot after_panel_drop
+# folder into its own subfolder: refused
+extdrop_deny panel 240 108 Work
+exists Work/Tools/loose.bat
+exists Work/Docs/alpha.bat

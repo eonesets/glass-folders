@@ -12,7 +12,9 @@ mod plat;
 mod guard;
 mod script;
 mod shell;
+mod watch;
 mod win;
+#[cfg(test)] mod v11_tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -89,6 +91,12 @@ struct Global {
     fly_anim: RefCell<Option<slint::Timer>>,
     /// shortcut menu / rename box / system dialog open: folder window stays open while it is inactive
     modal: Cell<bool>,
+    /// guard process started (folders hidden at least once)
+    guard_on: Cell<bool>,
+    /// desktop watcher: changed desktop entries waiting for the debounce (None inside = everything)
+    watch_touched: RefCell<Option<Option<Vec<PathBuf>>>>,
+    watch_timer: RefCell<Option<slint::Timer>>,
+    tray: RefCell<Option<win::Tray>>,
 }
 
 thread_local! {
@@ -227,12 +235,15 @@ fn main() -> Result<(), slint::PlatformError> {
         desk::hide_folders(homes);
         // killed (Task Manager, crash): a separate small process puts the folders back at once
         guard::start();
+        g().guard_on.set(true);
     }
+    // folders made / deleted / renamed / changed on the desktop while running: tiles follow
+    start_watcher(desktop.clone());
     // taskkill / Task Manager "End task" (WM_CLOSE to our windows), log off / shut down: folders back, then quit
-    plat::set_on_quit(|| {
-        give_back_icons();
-        let _ = slint::quit_event_loop();
-    });
+    plat::set_on_quit(quit_app);
+    if script.is_none() && !plat::offscreen() {
+        *g().tray.borrow_mut() = win::Tray::new(tray_menu);
+    }
 
     // pinned folders: open on the desktop again, where they were left
     let pins: Vec<(PathBuf, [i32; 2])> =
@@ -260,6 +271,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let r = slint::run_event_loop();
     give_back_icons();
+    *g().tray.borrow_mut() = None;
     if let Some(code) = script::exit_code() {
         std::process::exit(code);
     }
@@ -388,6 +400,14 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
     }
     panel.on_set_opt(move |key, v| set_opt(key.as_str(), v));
     {
+        let p = panel.as_weak();
+        panel.on_page_changed(move |pg| {
+            if let Some(p) = p.upgrade() {
+                on_page_changed(&p, pg);
+            }
+        });
+    }
+    {
         let (a, p) = (app.clone(), panel.as_weak());
         panel.on_close_panel(move || {
             if let Some(p) = p.upgrade() {
@@ -510,10 +530,8 @@ fn make_panel() -> Result<(Panel, Shared), slint::PlatformError> {
             });
         });
     }
-    panel.on_quit(move || {
-        give_back_icons();
-        let _ = slint::quit_event_loop();
-    });
+    panel.on_quit(quit_app);
+    enable_panel_drop(&panel, &app);
     Ok((panel, app))
 }
 
@@ -582,8 +600,25 @@ fn icon_scale(win: &slint::Window) -> f32 {
 fn panel_size(panel: &Panel) -> (i32, i32) {
     let s = panel.window().scale_factor();
     let w = ((panel.get_grid_w() + 32.0).max(panel.get_min_w()) * s).round() as i32;
-    let h = ((panel.get_grid_h() + 64.0) * s).round() as i32;
+    let h_log = if panel.get_page() == 1 {
+        (panel.get_grid_h() + 64.0).max(panel.get_settings_h())
+    } else {
+        panel.get_grid_h() + 64.0
+    };
+    let h = (h_log * s).round() as i32;
     (w, h)
+}
+
+fn on_page_changed(panel: &Panel, page: i32) {
+    if page == 1 {
+        panel.set_autostart(shell::autostart_enabled());
+        fit_panel(panel);
+    }
+}
+
+pub(crate) fn set_panel_page(panel: &Panel, page: i32) {
+    panel.set_page(page);
+    on_page_changed(panel, page);
 }
 
 // ---------- name hint ----------
@@ -966,6 +1001,26 @@ fn give_back_icons() {
     }
 }
 
+fn quit_app() {
+    give_back_icons();
+    if let Some(tray) = g().tray.borrow().as_ref() {
+        tray.remove_icon();
+    }
+    let _ = slint::quit_event_loop();
+}
+
+fn tray_menu(hwnd: windows::Win32::Foundation::HWND) {
+    let en = g().set.borrow().en();
+    let auto = shell::autostart_enabled();
+    let items = win::tray_menu_items(en, auto);
+    match win::popup_menu_checked(hwnd, &items, g().dark.get()) {
+        1 => set_opt("autostart", if auto { 0 } else { 1 }),
+        2 => sync_desktop(&win::desktop_dir()),
+        3 => quit_app(),
+        _ => {}
+    }
+}
+
 fn push_settings(panel: &Panel, set: &model::Settings) {
     panel.set_labels(set.labels);
     panel.set_names(set.names);
@@ -975,12 +1030,21 @@ fn push_settings(panel: &Panel, set: &model::Settings) {
     panel.set_snap(set.snap);
     panel.set_ptitle(set.ptitle);
     panel.set_tnames(set.tnames);
+    panel.set_autostart(shell::autostart_enabled());
     panel.set_isize(set.isize);
     panel.set_en(set.en());
 }
 
 /// One setting changed in the settings page (any folder window): applies to all windows + tiles.
-fn set_opt(key: &str, v: i32) {
+pub(crate) fn set_opt(key: &str, v: i32) {
+    if key == "autostart" {
+        let _ = shell::set_autostart(v != 0);
+        let on = shell::autostart_enabled();
+        for (p, _) in all_panels() {
+            p.set_autostart(on);
+        }
+        return;
+    }
     let gl = g();
     let (relayout, snap_now, retile, rezoom) = {
         let mut s = gl.set.borrow_mut();
@@ -1092,11 +1156,6 @@ fn set_opt(key: &str, v: i32) {
 /// on the desktop (first run); else a column at the right edge. Never on top of another tile.
 /// Returns home spots of the folder icons (to park them away while tiles stand in).
 fn make_tiles(desktop: &Path, killed: &HashMap<PathBuf, POINT>) -> Result<HashMap<PathBuf, POINT>, slint::PlatformError> {
-    let dark = g().dark.get();
-    let (glass, named, zoom) = {
-        let s = g().set.borrow();
-        (s.glass, s.tnames, s.zoom())
-    };
     let mut native = desk::icon_positions();
     // killed run: its saved spots win (icon may not be back on the desktop yet)
     for (k, p) in killed {
@@ -1109,7 +1168,6 @@ fn make_tiles(desktop: &Path, killed: &HashMap<PathBuf, POINT>) -> Result<HashMa
         let _ = std::fs::write(out, txt);
     }
     let folders: Vec<model::Folder> = model::list_folders(desktop).iter().map(|d| model::scan(d)).collect();
-    let wa = win::work_area();
     let mut taken: Vec<RECT> = folders
         .iter()
         .filter_map(|f| f.cfg.tile)
@@ -1121,113 +1179,138 @@ fn make_tiles(desktop: &Path, killed: &HashMap<PathBuf, POINT>) -> Result<HashMa
 
     for (i, f) in folders.into_iter().enumerate() {
         let dir = f.dir.clone();
-        let t = Tile::new()?;
-        plat::set_kind(t.window(), plat::Kind::Tile);
-        plat::set_zoom(t.window(), zoom);
-        t.set_dark(dark);
-        t.set_name(f.name.clone().into());
-        t.set_named(named);
-        let (c, on) = model::tint(&f.tint());
-        t.set_tint(c);
-        t.set_colored(on);
-        let items = tile_icons(&t, &f);
-        g().tile_items.borrow_mut().insert(dir.clone(), items);
-        {
-            let d = dir.clone();
-            t.on_open(move || {
-                hide_hint();
-                if let Some((p, a)) = main_panel() {
-                    open_folder(&p, &a, &d);
-                }
-            });
+        let dev = dev_row.map(|(ax, ay)| (ax, ay, i));
+        if let Some(h) = add_tile(f, &native, &mut taken, dev)? {
+            homes.insert(dir, h);
         }
-        {
-            // click on a tile icon: run it right from the desktop, no panel
-            let d = dir.clone();
-            t.on_launch(move |i| {
-                hide_hint();
-                let path = g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize).cloned());
-                let Some(path) = path else { return };
-                win::open(&path);
-                model::bump_use(&d, &path);
-                // deferred: icons model is rebuilt, the clicked icon belongs to it
-                let d = d.clone();
-                slint::Timer::single_shot(Duration::ZERO, move || refresh_tile(&d));
-            });
-        }
-        {
-            // pointer rests on a tile icon: its name
-            let (d, tw) = (dir.clone(), t.as_weak());
-            {
-                let d = dir.clone();
-                t.on_item_menu(move |i| {
-                    let path = g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize).cloned());
-                    let Some(path) = path else { return };
-                    let (o, d) = (Owner::Tile(d.clone(), i), d.clone());
-                    slint::Timer::single_shot(Duration::ZERO, move || item_menu(o, path, d));
-                });
-            }
-            t.on_hover(move |i, x, y, w, h| {
-                let name = if i < 0 { None } else { g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize)).map(|f| model::name_of(f)) };
-                if let Some(t) = tw.upgrade() {
-                    hint_at(t.window(), name, x, y, w, h);
-                }
-            });
-        }
-        if let Some(h) = plat::hwnd_of(t.window()) {
-            win::glass(h, dark);
-        }
-        let s = t.window().scale_factor();
-        let (side_w, side_h) = plat::snap_size(0, 0, s); // min tile = 2x2 cells
-        let (x, y, w, h) = if let Some((ax, ay)) = dev_row {
-            // dev: GF_TILE_AT=x,y puts tiles in a row from that point (free, not snapped)
-            (ax + i as i32 * (side_w + 16), ay, side_w, side_h)
-        } else if let Some([sx, sy, sw, sh]) = f.cfg.tile {
-            let (w, h) = plat::snap_size(sw, sh, s);
-            // grid off: stays exactly where the user left it
-            let (x, y) = if g().set.borrow().snap { plat::snap_pos(sx, sy, s) } else { (sx, sy) };
-            (x, y, w, h)
-        } else {
-            let start = match native.get(&dir) {
-                Some(p) => (p.x, p.y),
-                None => (wa.right - ((24.0 + 112.0) * s) as i32, wa.top + (24.0 * s) as i32),
-            };
-            let (x, y) = free_spot(start, side_w, side_h, &taken, s);
-            // remember right away: next start puts it in the same place
-            let mut cfg = f.cfg.clone();
-            cfg.tile = Some([x, y, side_w, side_h]);
-            let _ = model::save_cfg(&dir, &cfg);
-            (x, y, side_w, side_h)
-        };
-        taken.push(RECT { left: x, top: y, right: x + w, bottom: y + h });
-        if let Some(p) = native.get(&dir) {
-            homes.insert(dir.clone(), *p);
-        } else if std::env::var("GF_DESKTOP").is_ok() {
-            // dev demo desktop: Explorer does not show it, still hide/restore it (tests/ui/guard.ps1)
-            homes.insert(dir.clone(), POINT::default());
-        }
-        t.window().set_size(PhysicalSize::new(w as u32, h as u32));
-        t.window().set_position(PhysicalPosition::new(x, y));
-        reblur(&t, dark, glass);
-        {
-            // user moved/resized the tile: remember it, re-blur what is under it now
-            let (tw, d) = (t.as_weak(), dir.clone());
-            plat::set_on_moved(t.window(), move |r| {
-                let mut cfg = model::load_cfg(&d);
-                cfg.tile = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
-                let _ = model::save_cfg(&d, &cfg);
-                if let Some(t) = tw.upgrade() {
-                    reblur(&t, g().dark.get(), g().set.borrow().glass);
-                }
-            });
-        }
-        // pinned folder: its open window stands in for the tile (shown by pin_open, not here)
-        if f.cfg.pin.is_none() {
-            t.show()?;
-        }
-        g().tiles.borrow_mut().push((dir, t));
     }
     Ok(homes)
+}
+
+/// One desktop tile for folder `f` (wired, placed, shown unless pinned), pushed to g().tiles.
+/// Place: dev row; saved rect; else near the folder icon (`native`) / right column, never over `taken`.
+/// Returns the home spot of its folder icon (to hide it while the tile stands in), if known.
+fn add_tile(
+    f: model::Folder,
+    native: &HashMap<PathBuf, POINT>,
+    taken: &mut Vec<RECT>,
+    dev_row: Option<(i32, i32, usize)>,
+) -> Result<Option<POINT>, slint::PlatformError> {
+    let dark = g().dark.get();
+    let (glass, named, zoom) = {
+        let s = g().set.borrow();
+        (s.glass, s.tnames, s.zoom())
+    };
+    let wa = win::work_area();
+    let mut home = None;
+    let dir = f.dir.clone();
+    let t = Tile::new()?;
+    plat::set_kind(t.window(), plat::Kind::Tile);
+    plat::set_zoom(t.window(), zoom);
+    t.set_dark(dark);
+    t.set_name(f.name.clone().into());
+    t.set_named(named);
+    let (c, on) = model::tint(&f.tint());
+    t.set_tint(c);
+    t.set_colored(on);
+    let items = tile_icons(&t, &f);
+    g().tile_items.borrow_mut().insert(dir.clone(), items);
+    {
+        let d = dir.clone();
+        t.on_open(move || {
+            hide_hint();
+            if let Some((p, a)) = main_panel() {
+                open_folder(&p, &a, &d);
+            }
+        });
+    }
+    {
+        // click on a tile icon: run it right from the desktop, no panel
+        let d = dir.clone();
+        t.on_launch(move |i| {
+            hide_hint();
+            let path = g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize).cloned());
+            let Some(path) = path else { return };
+            win::open(&path);
+            model::bump_use(&d, &path);
+            // deferred: icons model is rebuilt, the clicked icon belongs to it
+            let d = d.clone();
+            slint::Timer::single_shot(Duration::ZERO, move || refresh_tile(&d));
+        });
+    }
+    {
+        // pointer rests on a tile icon: its name
+        let (d, tw) = (dir.clone(), t.as_weak());
+        {
+            let d = dir.clone();
+            t.on_item_menu(move |i| {
+                let path = g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize).cloned());
+                let Some(path) = path else { return };
+                let (o, d) = (Owner::Tile(d.clone(), i), d.clone());
+                slint::Timer::single_shot(Duration::ZERO, move || item_menu(o, path, d));
+            });
+        }
+        t.on_hover(move |i, x, y, w, h| {
+            let name = if i < 0 { None } else { g().tile_items.borrow().get(&d).and_then(|v| v.get(i as usize)).map(|f| model::name_of(f)) };
+            if let Some(t) = tw.upgrade() {
+                hint_at(t.window(), name, x, y, w, h);
+            }
+        });
+    }
+    if let Some(h) = plat::hwnd_of(t.window()) {
+        win::glass(h, dark);
+    }
+    let s = t.window().scale_factor();
+    let (side_w, side_h) = plat::snap_size(0, 0, s); // min tile = 2x2 cells
+    let (x, y, w, h) = if let Some((ax, ay, i)) = dev_row {
+        // dev: GF_TILE_AT=x,y puts tiles in a row from that point (free, not snapped)
+        (ax + i as i32 * (side_w + 16), ay, side_w, side_h)
+    } else if let Some([sx, sy, sw, sh]) = f.cfg.tile {
+        let (w, h) = plat::snap_size(sw, sh, s);
+        // grid off: stays exactly where the user left it
+        let (x, y) = if g().set.borrow().snap { plat::snap_pos(sx, sy, s) } else { (sx, sy) };
+        (x, y, w, h)
+    } else {
+        let start = match native.get(&dir) {
+            Some(p) => (p.x, p.y),
+            None => (wa.right - ((24.0 + 112.0) * s) as i32, wa.top + (24.0 * s) as i32),
+        };
+        let (x, y) = free_spot(start, side_w, side_h, &taken, s);
+        // remember right away: next start puts it in the same place
+        let mut cfg = f.cfg.clone();
+        cfg.tile = Some([x, y, side_w, side_h]);
+        let _ = model::save_cfg(&dir, &cfg);
+        (x, y, side_w, side_h)
+    };
+    taken.push(RECT { left: x, top: y, right: x + w, bottom: y + h });
+    if let Some(p) = native.get(&dir) {
+        home = Some(*p);
+    } else if std::env::var("GF_DESKTOP").is_ok() {
+        // dev demo desktop: Explorer does not show it, still hide/restore it (tests/ui/guard.ps1)
+        home = Some(POINT::default());
+    }
+    t.window().set_size(PhysicalSize::new(w as u32, h as u32));
+    t.window().set_position(PhysicalPosition::new(x, y));
+    reblur(&t, dark, glass);
+    {
+        // user moved/resized the tile: remember it, re-blur what is under it now
+        let (tw, d) = (t.as_weak(), dir.clone());
+        plat::set_on_moved(t.window(), move |r| {
+            let mut cfg = model::load_cfg(&d);
+            cfg.tile = Some([r.left, r.top, r.right - r.left, r.bottom - r.top]);
+            let _ = model::save_cfg(&d, &cfg);
+            if let Some(t) = tw.upgrade() {
+                reblur(&t, g().dark.get(), g().set.borrow().glass);
+            }
+        });
+    }
+    // pinned folder: its open window stands in for the tile (shown by pin_open, not here)
+    if f.cfg.pin.is_none() {
+        t.show()?;
+    }
+    enable_tile_drop(&t, &dir);
+    g().tiles.borrow_mut().push((dir, t));
+    Ok(home)
 }
 
 /// Snapped spot near `start` (physical px) where a w x h tile hits no taken rect.
@@ -1339,6 +1422,320 @@ fn refresh_tile(dir: &Path) {
     if let Some(items) = items {
         g().tile_items.borrow_mut().insert(dir.to_path_buf(), items);
     }
+}
+
+// ---------- files dragged in from Explorer / the desktop ----------
+
+/// Some of `files` may go into `dst` (exists, not the folder itself / its parent).
+fn drop_allowed(files: &[PathBuf], dst: &Path) -> bool {
+    files.iter().any(|f| f.exists() && model::can_drop_into(f, dst))
+}
+
+/// Tile accepts dropped files: lights up while they are over it, takes them into the folder root.
+fn enable_tile_drop(t: &Tile, dir: &Path) {
+    let (tw, d) = (t.as_weak(), dir.to_path_buf());
+    plat::enable_drop(t.window(), move |ev| {
+        let Some(t) = tw.upgrade() else { return false };
+        match ev {
+            plat::DropEv::Over(_, _, files) => {
+                let ok = drop_allowed(files, &d);
+                t.set_drop_hot(ok);
+                ok
+            }
+            plat::DropEv::Leave => {
+                t.set_drop_hot(false);
+                true
+            }
+            plat::DropEv::Drop(_, _, files, copy) => {
+                t.set_drop_hot(false);
+                !handle_external_drop(&d, files, copy).is_empty()
+            }
+        }
+    });
+}
+
+/// Folder window accepts dropped files: group under the cursor lights up and takes them;
+/// empty space = folder root (Misc). Folder page only.
+fn enable_panel_drop(panel: &Panel, app: &Shared) {
+    let (a, p) = (app.clone(), panel.as_weak());
+    plat::enable_drop(panel.window(), move |ev| {
+        let Some(p) = p.upgrade() else { return false };
+        let own_drag = a.borrow().target != Target::None; // our own shortcut drag owns the highlight
+        match ev {
+            plat::DropEv::Over(x, y, files) => {
+                let Some((dir, idx, n)) = panel_drop_dir(&p, &a, x, y) else { return false };
+                let ok = drop_allowed(files, &dir);
+                if !own_drag {
+                    p.set_drop_target(if ok { idx } else { -2 });
+                    p.set_drop_index(n);
+                }
+                ok
+            }
+            plat::DropEv::Leave => {
+                if !own_drag {
+                    p.set_drop_target(-2);
+                }
+                true
+            }
+            plat::DropEv::Drop(x, y, files, copy) => {
+                let Some((dir, _, _)) = panel_drop_dir(&p, &a, x, y) else { return false };
+                !handle_external_drop(&dir, files, copy).is_empty()
+            }
+        }
+    });
+}
+
+/// Where files dropped at window point (x, y) go: (dir, group index or -2 = root, items in that group).
+/// None = no folder shown / settings page / closing.
+fn panel_drop_dir(panel: &Panel, app: &Shared, x: f32, y: f32) -> Option<(PathBuf, i32, i32)> {
+    if panel.get_page() != 0 {
+        return None;
+    }
+    let st = app.borrow();
+    if st.closing {
+        return None;
+    }
+    let f = st.folder.as_ref()?;
+    // grid coords: pad 16, header 48 (as in app.slint)
+    let (gx, gy) = (x - 16.0, y - 48.0);
+    match st.base.iter().position(|r| hit(r, gx, gy, 0.0)) {
+        Some(i) => {
+            let g = f.groups.get(i)?;
+            Some((g.dir.clone(), i as i32, g.items.len() as i32))
+        }
+        None => Some((f.dir.clone(), -2, 0)),
+    }
+}
+
+/// Desktop folder (tile) that holds path `p` (or is `p`).
+fn tile_root(p: &Path) -> Option<PathBuf> {
+    g().tiles.borrow().iter().map(|(d, _)| d).find(|d| !model::can_drop_into(d, p)).cloned()
+}
+
+/// Files dropped from outside into folder `dst` (move, or copy with Ctrl). Refreshes the target and
+/// source folders (tiles + open windows); a tiled folder moved away loses its tile. Returns new paths.
+pub(crate) fn handle_external_drop(dst: &Path, srcs: &[PathBuf], copy: bool) -> Vec<PathBuf> {
+    let desktop = win::desktop_dir();
+    // a tiled folder moved into another one: its icon was hidden by us -> visible again where it lands
+    let released: Vec<PathBuf> = if copy {
+        Vec::new()
+    } else {
+        let tiles = g().tiles.borrow();
+        srcs.iter()
+            .filter(|s| tiles.iter().any(|(d, _)| model::same_path(d, s)) && model::can_drop_into(s, dst))
+            .cloned()
+            .collect()
+    };
+    for r in &released {
+        desk::forget_folder(r);
+    }
+    let out = model::external_drop(srcs, dst, &desktop, copy);
+    for r in &released {
+        if r.exists() {
+            // move failed: still ours, hide again
+            let home = g().set.borrow().homes.get(&*r.to_string_lossy()).map(|[x, y]| POINT { x: *x, y: *y });
+            if let Some(h) = home {
+                desk::hide_folder(r, h);
+            }
+        }
+    }
+    if out.is_empty() {
+        return out;
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for p in srcs.iter().map(PathBuf::as_path).chain([dst]) {
+        if let Some(r) = tile_root(p).filter(|r| !roots.contains(r)) {
+            roots.push(r);
+        }
+    }
+    for r in &roots {
+        refresh_folder(r);
+    }
+    if !released.is_empty() {
+        sync_desktop(&desktop); // its tile goes away now, not on the watcher's next tick
+    }
+    out
+}
+
+// ---------- desktop folders made / deleted / renamed / changed while running ----------
+
+/// Same groups and items (what the window shows).
+fn same_content(a: &model::Folder, b: &model::Folder) -> bool {
+    a.groups.len() == b.groups.len()
+        && a.groups.iter().zip(&b.groups).all(|(x, y)| x.name == y.name && x.dir == y.dir && x.items == y.items)
+}
+
+/// Window busy: open / close animation, a drag, a group name being typed. Re-read it later.
+fn panel_busy(panel: &Panel, app: &Shared) -> bool {
+    let st = app.borrow();
+    st.anim.is_some()
+        || st.closing
+        || st.target != Target::None
+        || st.out.is_some()
+        || st.grab.is_some()
+        || st.ghost.is_some()
+        || panel.get_drag_id() >= 0
+        || panel.get_gdrag() >= 0
+        || panel.get_rename_idx() >= 0
+}
+
+/// Folder contents changed on disk: its tile and every window showing it re-read it.
+fn refresh_folder(dir: &Path) {
+    refresh_tile(dir);
+    for (p, a) in all_panels() {
+        if !a.borrow().folder.as_ref().is_some_and(|f| f.dir == dir) {
+            continue;
+        }
+        if panel_busy(&p, &a) {
+            let d = dir.to_path_buf();
+            slint::Timer::single_shot(Duration::from_millis(300), move || refresh_folder(&d));
+            continue;
+        }
+        let fresh = model::scan(dir);
+        if a.borrow().folder.as_ref().is_some_and(|f| same_content(f, &fresh)) {
+            continue;
+        }
+        a.borrow_mut().folder = Some(fresh);
+        render(&p, &a);
+    }
+}
+
+/// Real run (not a test, icons not kept on purpose): tiled folders' own desktop icons are hidden.
+fn hides_icons() -> bool {
+    std::env::var("GF_SCRIPT").is_err() && std::env::var("GF_KEEP_ICONS").is_err()
+}
+
+/// Tiles follow the desktop: new folders get a tile, deleted / renamed-away ones lose it,
+/// changed ones are re-read. Watcher and "refresh" call it.
+pub(crate) fn sync_desktop(desktop: &Path) {
+    sync_with(desktop, None);
+}
+
+/// `touched` = desktop entries that changed (None = re-read every tile).
+fn sync_with(desktop: &Path, touched: Option<&[PathBuf]>) {
+    let current: Vec<PathBuf> = g().tiles.borrow().iter().map(|(d, _)| d.clone()).collect();
+    let plan = model::sync_plan(desktop, &current);
+    for d in &plan.removed {
+        remove_tile(d);
+    }
+    if !plan.added.is_empty() {
+        if hides_icons() && desk::renaming() {
+            // the user is typing the new folder's name on the desktop: a tile would cover the box
+            schedule_sync(None, 500);
+        } else {
+            add_tiles(&plan.added);
+        }
+    }
+    for d in &plan.kept {
+        if touched.is_none_or(|t| t.iter().any(|x| model::same_path(x, d))) {
+            refresh_folder(d);
+        }
+    }
+}
+
+/// Tile of a folder that is gone: its windows fold away, the tile and everything about it is dropped.
+fn remove_tile(dir: &Path) {
+    for (p, a) in all_panels() {
+        if !a.borrow().folder.as_ref().is_some_and(|f| f.dir == dir) {
+            continue;
+        }
+        if a.borrow().pinned {
+            a.borrow_mut().pinned = false; // nothing to save: the folder is gone
+            p.set_pinned(false);
+            plat::set_pinned(p.window(), false);
+        }
+        close(&p, &a); // folds into the tile spot (rect taken now, tile still there)
+    }
+    let t = {
+        let mut ts = g().tiles.borrow_mut();
+        ts.iter().position(|(d, _)| d == dir).map(|i| ts.remove(i))
+    };
+    if let Some((_, t)) = t {
+        let _ = t.hide();
+        slint::Timer::single_shot(Duration::ZERO, move || drop(t)); // window destroyed outside any handler
+    }
+    g().tile_items.borrow_mut().remove(dir);
+    g().tile_wait.borrow_mut().remove(dir);
+    desk::forget_folder(dir);
+    let mut s = g().set.borrow_mut();
+    if s.homes.remove(&*dir.to_string_lossy()).is_some() {
+        model::save_settings(&s);
+    }
+}
+
+/// New desktop folders: tiles (near their icon, else a free spot), icons prefetched, folder icons hidden.
+fn add_tiles(dirs: &[PathBuf]) {
+    let hide = hides_icons();
+    let native = if std::env::var("GF_SCRIPT").is_ok() { HashMap::new() } else { desk::icon_positions() };
+    let mut taken: Vec<RECT> = g().tiles.borrow().iter().filter_map(|(_, t)| plat::rect_of(t.window())).collect();
+    let ipx = main_panel().map(|(p, _)| px(48.0, icon_scale(p.window()))).unwrap_or(48);
+    for d in dirs {
+        let f = model::scan(d);
+        let items: Vec<PathBuf> = f.groups.iter().flat_map(|g| g.items.iter().cloned()).collect();
+        let pin = f.cfg.pin;
+        if let Err(e) = add_tile(f, &native, &mut taken, None) {
+            eprintln!("glass-folders: tile for {}: {e}", d.display());
+            continue;
+        }
+        icons::want(items, ipx, false);
+        if let Some([x, y]) = pin {
+            // came back with "pinned" in its settings: opens on the desktop like at start
+            match make_panel() {
+                Ok((p, a)) => {
+                    pin_open(&p, &a, d, x, y);
+                    g().panels.borrow_mut().push((p, a));
+                }
+                Err(e) => eprintln!("glass-folders: new panel: {e}"),
+            }
+        }
+        if hide {
+            // icon spot = where Explorer has it, else where the tile stands (restored there on quit)
+            let r = g().tiles.borrow().iter().find(|(x, _)| x == d).and_then(|(_, t)| plat::rect_of(t.window()));
+            let Some(home) = native.get(d).copied().or(r.map(|r| POINT { x: r.left, y: r.top })) else { continue };
+            {
+                let mut s = g().set.borrow_mut();
+                s.homes.insert(d.to_string_lossy().into_owned(), [home.x, home.y]);
+                model::save_settings(&s);
+            }
+            desk::hide_folder(d, home);
+            if !g().guard_on.replace(true) {
+                guard::start();
+            }
+        }
+    }
+}
+
+/// Resync after `ms` (debounce): changes arriving meanwhile are merged. None = re-read all tiles.
+fn schedule_sync(touched: Option<Vec<PathBuf>>, ms: u64) {
+    {
+        let mut w = g().watch_touched.borrow_mut();
+        *w = Some(match (w.take(), touched) {
+            (None, t) => t,
+            (Some(None), _) | (_, None) => None,
+            (Some(Some(mut a)), Some(b)) => {
+                a.extend(b);
+                a.sort();
+                a.dedup();
+                Some(a)
+            }
+        });
+    }
+    let mut tm = g().watch_timer.borrow_mut();
+    let t = tm.get_or_insert_with(slint::Timer::default);
+    t.start(slint::TimerMode::SingleShot, Duration::from_millis(ms), || {
+        // run outside the timer's own callback: sync may restart this timer
+        slint::Timer::single_shot(Duration::ZERO, || {
+            let Some(touched) = g().watch_touched.borrow_mut().take() else { return };
+            sync_with(&win::desktop_dir(), touched.as_deref());
+        });
+    });
+}
+
+/// Background watcher on the desktop folder -> debounced sync on the UI thread.
+fn start_watcher(desktop: PathBuf) {
+    watch::start(desktop, |touched| {
+        let _ = slint::invoke_from_event_loop(move || schedule_sync(touched, 250));
+    });
 }
 
 // ---------- panel drag: preview ----------
@@ -1717,6 +2114,7 @@ fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
     panel.set_grow_anim(false); // new folder: window takes its size at once
     panel.set_page(0);
     panel.set_pinned(false);
+    panel.set_autostart(shell::autostart_enabled());
     render(panel, app);
     plat::perf(|| format!("open: +render {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0));
     let s = panel.window().scale_factor();
@@ -1730,8 +2128,10 @@ fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
         RECT { left: cx - 40, top: cy - 40, right: cx + 40, bottom: cy + 40 }
     });
     let (cx, cy) = ((from.left + from.right) / 2, (from.top + from.bottom) / 2);
-    let x = (cx - w / 2).clamp(wa.left + m, (wa.right - w - m).max(wa.left + m));
-    let y = (cy - h / 2).clamp(wa.top + m, (wa.bottom - h - m).max(wa.top + m));
+    let mx = m.min(((wa.right - wa.left - w) / 2).max(0));
+    let my = m.min(((wa.bottom - wa.top - h) / 2).max(0));
+    let x = (cx - w / 2).clamp(wa.left + mx, (wa.right - w - mx).max(wa.left + mx));
+    let y = (cy - h / 2).clamp(wa.top + my, (wa.bottom - h - my).max(wa.top + my));
     let to = RECT { left: x, top: y, right: x + w, bottom: y + h };
     {
         let mut st = app.borrow_mut();
@@ -1745,19 +2145,16 @@ fn open_folder(panel: &Panel, app: &Shared, dir: &Path) {
     animate(panel, app, true);
 }
 
-/// Window rect at openness p: the panel's own shape, scaled down onto the tile (p = 0) .. full size
-/// in its place (p = 1). Same aspect all the way -> content scales evenly, nothing is cut off.
-fn zoom_rect(tile: RECT, panel: RECT, p: f32) -> RECT {
-    let (pw, ph) = ((panel.right - panel.left) as f32, (panel.bottom - panel.top) as f32);
-    let (tw, th) = ((tile.right - tile.left) as f32, (tile.bottom - tile.top) as f32);
-    let s0 = (tw / pw).max(th / ph).clamp(0.15, 1.0);
-    let s = s0 + (1.0 - s0) * p;
-    let mid = |a: i32, b: i32| (a + b) as f32 / 2.0;
-    let cx = mid(tile.left, tile.right) + (mid(panel.left, panel.right) - mid(tile.left, tile.right)) * p;
-    let cy = mid(tile.top, tile.bottom) + (mid(panel.top, panel.bottom) - mid(tile.top, tile.bottom)) * p;
-    let (w, h) = ((pw * s).round() as i32, (ph * s).round() as i32);
-    let (l, t) = ((cx - w as f32 / 2.0).round() as i32, (cy - h as f32 / 2.0).round() as i32);
-    RECT { left: l, top: t, right: l + w, bottom: t + h }
+/// Window rect at openness p: per-edge linear interpolation from `tile` (p = 0) to `panel` (p = 1).
+/// Strictly monotonic on every edge and size, zero 1px rounding oscillation.
+pub(crate) fn zoom_rect(tile: RECT, panel: RECT, p: f32) -> RECT {
+    let p = p.clamp(0.0, 1.0) as f64;
+    let lerp = |a: i32, b: i32| (a as f64 + (b - a) as f64 * p).round() as i32;
+    let left = lerp(tile.left, panel.left);
+    let top = lerp(tile.top, panel.top);
+    let right = lerp(tile.right, panel.right).max(left + 1);
+    let bottom = lerp(tile.bottom, panel.bottom).max(top + 1);
+    RECT { left, top, right, bottom }
 }
 
 /// Panel zooms out of its tile (opening) or back into it: openness glides to 1 / 0 from where it is
@@ -1847,6 +2244,7 @@ fn finish_close(panel: &Panel, app: &Shared) {
     }
     let _ = panel.hide();
     plat::end_zoom_view(panel.window(), None);
+    panel.set_page(0);
     panel.set_groups(ModelRc::default());
     panel.set_rename_idx(-1);
     panel.set_drop_target(-2);
@@ -1951,16 +2349,17 @@ fn render(panel: &Panel, app: &Shared) {
     }
 }
 
-/// Panel grew (unfolded group): keep it inside the work area.
+/// Panel grew (unfolded group or settings page): keep it inside the work area.
 fn fit_panel(panel: &Panel) {
     let s = panel.window().scale_factor();
-    let w = ((panel.get_grid_w() + 32.0).max(panel.get_min_w()) * s).round() as i32;
-    let h = ((panel.get_grid_h() + 64.0) * s).round() as i32;
+    let (w, h) = panel_size(panel);
     let p = panel.window().position();
     let wa = win::work_area();
     let m = (8.0 * s) as i32;
-    let x = p.x.min(wa.right - w - m).max(wa.left + m);
-    let y = p.y.min(wa.bottom - h - m).max(wa.top + m);
+    let mx = m.min(((wa.right - wa.left - w) / 2).max(0));
+    let my = m.min(((wa.bottom - wa.top - h) / 2).max(0));
+    let x = p.x.clamp(wa.left + mx, (wa.right - w - mx).max(wa.left + mx));
+    let y = p.y.clamp(wa.top + my, (wa.bottom - h - my).max(wa.top + my));
     if (x, y) != (p.x, p.y) {
         panel.window().set_position(PhysicalPosition::new(x, y));
     }

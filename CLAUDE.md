@@ -16,10 +16,10 @@ Rule: when files / key functions / props change, update this map in the same com
   - `Slot` — one shortcut cell 76px (also "+N" when more>0, "свернуть" when more<0).
   - `Grip` — edge strip of a group plate = move handle.
   - `Panel` — folder window. page 0 = groups, page 1 = settings. Props from Rust: groups, grid-w/h, settings
-    (labels names dots ptitle tnames gravity glass snap), drop-target/index, ghost-*, lift-* (dragged group, free px).
+    (labels names dots ptitle tnames autostart gravity glass snap), drop-target/index, ghost-*, lift-* (dragged group, free px).
     grow-anim = window size glides (off while opening). land-* = released shortcut glides cursor -> slot (Rust main.rs land()).
     Callbacks -> Rust: launch, open-group (unfold/fold "+N"), item-drag/drop, group-drag/drop, set-opt(key,int), rename-group, quit.
-    Header: gear, pin (toggle-pin, `pinned`), X. `hover(id, rect)` -> name hint. `isize` = icon size seg.
+    Header: gear, pin (toggle-pin, `pinned`), X. `hover(id, rect)` -> name hint. `isize` = icon size seg. `settings-h: 846px`.
     `en` = UI language (all strings inline `en ? "EN" : "RU"`; Slot gets it too). Settings page "lang" seg. Loose group shown as Misc/Разное via `g.fixed`.
   - `Hint` — name hint window (text, pw = width for Rust). Frameless popup (plat set_kind Hint strips thick frame: framed
     windows stay >= ~39px tall -> empty strip under the label), no backdrop (win::clear).
@@ -32,45 +32,64 @@ Rule: when files / key functions / props change, update this map in the same com
   `App` = state of ONE folder window (folder, base/prev rects, ghost, target, lift, unfolded, anim, pinned).
   - panels: make_panel wires a window; panels[0] = the one tiles open; set_pin / pin_open (cfg "pin"); finish_close drops
     non-[0] windows. hint_at / hide_hint. set_opt applies to all panels (isize -> plat::set_zoom, icon_scale).
-  - startup: make_tiles -> desk::hide_folders. quit/panic -> give_back_icons.
-  - set_opt (settings page), push_settings.
+  - startup: make_tiles (add_tile per folder: wire, place, enable_tile_drop) -> desk::hide_folders. quit/panic -> give_back_icons.
+  - external drop (files from Explorer / desktop): enable_tile_drop / enable_panel_drop (plat::enable_drop callbacks:
+    drop-hot / drop-target highlight; panel_drop_dir = group under cursor or root) -> handle_external_drop
+    (model::external_drop, refresh_folder of target + source tiles/panels; tiled folder moved away -> sync_desktop).
+  - live desktop sync: start_watcher (watch.rs) -> schedule_sync (250 ms debounce) -> sync_with / sync_desktop:
+    model::sync_plan -> remove_tile (closes its panels) / add_tiles (tile + prefetch + desk::hide_folder + settings.homes,
+    waits while desk::renaming) / refresh_folder (skips busy panels: anim, drag, rename -> retry 300 ms).
+  - set_opt (settings page, incl. autostart), push_settings. tray_menu / quit_app (removes tray icon, gives back icons).
   - drag: item_drag / group_drag (preview, uses plat::cursor_logical for groups) -> show_preview; drop_item / drop_group (fs moves, cfg save) -> rescan -> render.
     Out of the window: outside_target (other tile / other pinned panel / plat::desktop_at) -> App.out, set_hot, fly_at;
     release -> drop_out (move_into, uses follow, Desktop: desk::place_icon at drop point, retried until Explorer lists it).
-  - shortcut menu: item_menu(Owner Panel|Tile) -> win::popup_menu (native, themed) -> open / ask_rename / shell::pick_icon /
+  - shortcut menu: item_menu(Owner Panel|Tile) -> win::popup_menu -> open / ask_rename / shell::pick_icon /
     shell::recycle / shell::uninstaller+confirm+run_uninstall (none found -> Windows apps settings). g().modal keeps the panel
     open while a menu / dialog is up. model::rekey_item moves launch count + group order to the new name.
   - tiles: tile_icons (top_items -> icons, returns paths) -> App.tile_items; refresh_tile after launch / rescan.
     Launch (panel or tile) -> model::bump_use.
   - render: model::layout + unfold, updates existing VecModel rows in place (plates animate).
-  - open_folder / animate / close / finish_close: panel grows out of tile and folds back (plat::set_view).
+  - open_folder / animate / close / finish_close: panel grows out of tile and folds back (plat::set_view, zoom_rect).
 - `src/icons.rs` — shell icons on 4 worker threads + cache (path, px) -> Image. get() = cache only, want() queues
   (urgent first), on_ready -> main.rs icons_ready patches panel slots / waiting tiles in place. prefetch_icons at start.
 - `src/model.rs` — data, no UI. Folder scan, per-folder cfg `.glassfolder.json` (tile rect, group x/y/w/h/color/items order),
   launch counts `uses` (top_items, bump_use), app Settings (lang 0 ru / 1 en, default = Windows UI lang) (%APPDATA%/glass-folders/settings.json), panel grid: GRect (cols 84px PITCH, half-rows 42px ROW,
   h = 2*rows + header), resolve (push overlaps down), settle (gravity), layout, grid_px. Unit tests at bottom.
+  External drop: can_drop_into (not into itself / own subfolder, path components, case-insensitive), copy_into
+  (" (2)" numbering, never overwrites), move_into, external_drop (uses + group order follow between desktop folders).
+  Sync: sync_plan -> FolderDiff {added, removed, kept} (our hidden tile folders stay kept), ignored_change (.glassfolder.json).
 - `src/plat.rs` — Slint platform on raw Win32: window per Slint window, DIB paint, mouse/keys, tile drag/resize
   (free follow, glide to cells on release), tile cell math (tile_cells/tile_size/snap_pos, TILE_NAMED, SNAP),
-  set_view (show part of panel = open animation), cursor_logical. Kind Panel/Tile/Hint; set_zoom (scale = dpi*zoom);
+  set_view (show part of panel = open animation, ZoomSnap cache + aspect-preserving scale_pixels), cursor_logical. Kind Panel/Tile/Hint; set_zoom (scale = dpi*zoom);
   set_pinned (pinned panel: bottom z, live glass; WM_TILES_DOWN keeps tiles under it).
+  Win+D protection: desktop_host() owner (GWLP_HWNDPARENT), SC_MINIMIZE blocked, fg_hook (EVENT_SYSTEM_FOREGROUND) +
+  z_place/z_layer keep tiles and pinned panels above desktop host (pinned above tiles) on Show Desktop.
   Event loop: while animating, one pass per screen refresh (DwmFlush); animation timers use plat::FRAME.
   WM_GETMINMAXINFO min 1x1 (else Windows clamps small windows: hint strip, open anim start size). GF_PERF=file = timing log.
   Mouse path: wndproc -> GfWindow::mouse_move/down/up (shared with scripts). cursor_pos() = real cursor, or virtual in script mode.
-  Test hooks (bottom): set_offscreen (layered alpha 0 + click-through + no activate), inject (Ptr event -> dispatch_event),
+  Test hooks (bottom): set_offscreen / offscreen (layered alpha 0 + click-through + no activate), inject (Ptr event -> dispatch_event),
   shot (render DIB -> PNG), record/take_frames (every drawn frame, shown part only), save_png.
-- `src/script.rs` — headless scenario runner (env GF_SCRIPT). Command list in its header. Calls main.rs open_folder/close,
+  OLE drop target (DropTarget, #[implement(IDropTarget)], CF_HDROP files, IDropTargetHelper image): enable_drop(window, Fn(DropEv))
+  registers (not offscreen); drop_effect (Ctrl = copy); drop_at = same callback for scripts. Move done by us -> returns NONE
+  (source deletes nothing). GfWindow Drop: RevokeDragDrop + DestroyWindow (removed tiles, closed pinned panels).
+- `src/script.rs` — headless scenario runner (env GF_SCRIPT). Command list in its header. Calls main.rs open_folder/close/set_opt,
   plat::inject/shot/record. Ends app with exit code 0/1, writes OUT/log.txt.
-- `src/desk.rs` — Explorer desktop: icon positions (IShellWindows/IFolderView), hide tiled folders via
-  FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots.
-- `src/win.rs` — misc Win32: acrylic glass, clear (frameless alpha popup), popup_menu, dark mode, work area, shell icons,
+- `src/desk.rs` — Explorer desktop: desktop_host (Progman/WorkerW holding SHELLDLL_DefView), is_desktop_class, icon positions (IShellWindows/IFolderView), hide tiled folders via
+  FILE_ATTRIBUTE_HIDDEN, restore + put icons back to exact spots. hide_folder / forget_folder (one folder, while running),
+  renaming (Explorer rename box open on the desktop: LVM_GETEDITCONTROL).
+- `src/watch.rs` — thread: ReadDirectoryChangesW on the desktop dir (subtree, DIR_NAME | FILE_NAME, never ATTRIBUTES:
+  our hide attribute would loop) -> changed top-level entries (None = overflow) to main.rs.
+- `src/win.rs` — misc Win32: com_init (OleInitialize, STA), acrylic glass, clear (frameless alpha popup), popup_menu / popup_menu_checked,
+  Tray (Shell_NotifyIconW, 32x32 tray_icon_rgba, tray_menu_items, TaskbarCreated recovery, hidden top-level window), dark mode, work area, shell icons,
   ShellExecute open, wallpaper blur fallback.
 - `src/guard.rs` — folders back when the app is killed: after hide_folders, `--guard-start PID` -> `--guard PID` (launcher exits,
   so the guard is outside the process tree) waits for PID, restores settings.homes unless a newer instance holds the
   mutex Local\GlassFolders.Main. Clean quit clears homes -> guard does nothing. plat WM_CLOSE (non-panel) / WM_ENDSESSION
   -> set_on_quit (give_back_icons). Test: `powershell -File tests/ui/guard.ps1` (hard kill, tree kill, close request).
-- `src/shell.rs` — shortcut actions: recycle (IFileOperation, undo-able), rename (keeps ext), pick_icon (PickIconDlg, .lnk/.url),
+- `src/shell.rs` — shortcut actions + autostart: recycle (IFileOperation, undo-able), rename (keeps ext), pick_icon (PickIconDlg, .lnk/.url),
   uninstaller (registry Uninstall keys: DisplayIcon == target, else longest InstallLocation; never Windows dir / nameless keys),
-  run_uninstall, confirm. Dev: `glass-folders.exe --uninstall-info OUT FILE...` writes matches, runs nothing.
+  run_uninstall, confirm; autostart_key (GF_AUTOSTART_KEY or Run), autostart_enabled / autostart_enabled_at, set_autostart / set_autostart_at.
+  Dev: `glass-folders.exe --uninstall-info OUT FILE...` writes matches, runs nothing.
 
 ## Build / run / check
 - Build: `cd app; cargo build --release`. Running exe locks the file: stop THAT exe first (killed run is safe:

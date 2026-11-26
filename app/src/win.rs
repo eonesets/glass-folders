@@ -1,22 +1,27 @@
 ﻿// Кратко: всё, что про Windows — стекло окна, иконки ярлыков, запуск, путь к рабочему столу.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GENERIC_READ, HWND, RECT, SIZE};
+use windows::Win32::Foundation::{GENERIC_READ, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+/// COM + OLE on the UI thread (STA). OLE = RegisterDragDrop works (files dragged in from Explorer).
 pub fn com_init() {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if windows::Win32::System::Ole::OleInitialize(None).is_err() {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
     }
 }
 
@@ -101,7 +106,14 @@ pub fn clear(hwnd: HWND) {
 /// Native popup menu at the cursor, owned by `owner`. Items: (id, text, enabled); id 0 = separator.
 /// Returns the picked id, 0 = dismissed. Menu colors follow the app theme (uxtheme SetPreferredAppMode).
 pub fn popup_menu(owner: HWND, items: &[(u32, String, bool)], dark: bool) -> u32 {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    let checked_items: Vec<(u32, String, bool, bool)> =
+        items.iter().map(|(id, t, on)| (*id, t.clone(), *on, false)).collect();
+    popup_menu_checked(owner, &checked_items, dark)
+}
+
+/// Native popup menu at the cursor, owned by `owner`. Items: (id, text, enabled, checked); id 0 = separator.
+/// Returns the picked id, 0 = dismissed. Menu colors follow the app theme (uxtheme SetPreferredAppMode).
+pub fn popup_menu_checked(owner: HWND, items: &[(u32, String, bool, bool)], dark: bool) -> u32 {
     unsafe {
         // undocumented but stable since 1903: ordinal 135 SetPreferredAppMode(2 dark / 3 light), 136 FlushMenuThemes
         if let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) {
@@ -115,24 +127,263 @@ pub fn popup_menu(owner: HWND, items: &[(u32, String, bool)], dark: bool) -> u32
             }
         }
         let Ok(m) = CreatePopupMenu() else { return 0 };
-        for (id, text, on) in items {
+        for (id, text, on, checked) in items {
             if *id == 0 {
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
             } else {
                 let t = HSTRING::from(text.as_str());
-                let f = if *on { MF_STRING } else { MF_STRING | MF_GRAYED };
+                let mut f = if *on { MF_STRING } else { MF_STRING | MF_GRAYED };
+                if *checked {
+                    f |= MF_CHECKED;
+                }
                 let _ = AppendMenuW(m, f, *id as usize, &t);
             }
         }
-        let mut p = windows::Win32::Foundation::POINT::default();
+        let mut p = POINT::default();
         let _ = GetCursorPos(&mut p);
         // owner must be foreground, else the menu does not close on a click elsewhere
         let _ = SetForegroundWindow(owner);
         let r = TrackPopupMenuEx(m, (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY).0, p.x, p.y, owner, None);
-        let _ = PostMessageW(Some(owner), WM_NULL, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+        let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
         let _ = DestroyMenu(m);
         r.0 as u32
     }
+}
+
+// ---------- system tray icon ----------
+
+/// Generate a crisp 32x32 RGBA glass-folder icon (translucent cyan-blue folder + bright frosted border + 2x2 mini-tiles).
+pub fn tray_icon_rgba() -> (u32, u32, Vec<u8>) {
+    const W: usize = 32;
+    const H: usize = 32;
+    let mut px = vec![0u8; W * H * 4];
+
+    let round_box_sdf = |x: f32, y: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32| -> f32 {
+        let dx = (x - cx).abs() - (hw - r);
+        let dy = (y - cy).abs() - (hh - r);
+        let ox = dx.max(0.0);
+        let oy = dy.max(0.0);
+        (ox * ox + oy * oy).sqrt() + dx.max(dy).min(0.0) - r
+    };
+
+    let blend = |dst: &mut [u8], r: f32, g: f32, b: f32, a: f32| {
+        let sa = a.clamp(0.0, 1.0);
+        if sa <= 0.001 {
+            return;
+        }
+        let da = dst[3] as f32 / 255.0;
+        let out_a = sa + da * (1.0 - sa);
+        if out_a <= 0.001 {
+            return;
+        }
+        let mix = |sc: f32, dc: u8| -> u8 {
+            ((sc * sa + (dc as f32 / 255.0) * da * (1.0 - sa)) / out_a * 255.0)
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        dst[0] = mix(r, dst[0]);
+        dst[1] = mix(g, dst[1]);
+        dst[2] = mix(b, dst[2]);
+        dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+    };
+
+    for py in 0..H {
+        for px_x in 0..W {
+            let x = px_x as f32 + 0.5;
+            let y = py as f32 + 0.5;
+            // Folder silhouette = union of top-left tab and rounded body
+            let d_body = round_box_sdf(x, y, 16.0, 18.0, 13.0, 9.5, 3.2);
+            let d_tab = round_box_sdf(x, y, 9.5, 9.0, 6.2, 4.0, 2.2);
+            let d_folder = d_body.min(d_tab);
+
+            let idx = (py * W + px_x) * 4;
+            let cell = &mut px[idx..idx + 4];
+
+            // Outer translucent glass fill
+            let fill_cov = (0.75 - d_folder).clamp(0.0, 1.0);
+            if fill_cov > 0.0 {
+                let t = ((y - 6.0) / 22.0).clamp(0.0, 1.0);
+                let fr = 0.44 - 0.16 * t;
+                let fg = 0.80 - 0.18 * t;
+                let fb = 1.00 - 0.06 * t;
+                blend(cell, fr, fg, fb, fill_cov * 0.86);
+            }
+
+            // Bright frosted border (visible on both dark and light taskbars)
+            let border_dist = (d_folder + 0.55).abs();
+            let border_cov = (1.0 - border_dist / 1.15).clamp(0.0, 1.0);
+            if border_cov > 0.0 {
+                blend(cell, 0.94, 0.98, 1.0, border_cov * 0.95);
+            }
+
+            // 2x2 mini-tile grid inside the glass folder body
+            for &(tx, ty) in &[(11.5, 15.0), (20.5, 15.0), (11.5, 21.5), (20.5, 21.5)] {
+                let dt = round_box_sdf(x, y, tx, ty, 3.0, 2.2, 0.9);
+                let tc = (0.6 - dt).clamp(0.0, 1.0);
+                if tc > 0.0 {
+                    blend(cell, 0.96, 0.99, 1.0, tc * 0.90);
+                }
+            }
+        }
+    }
+    (W as u32, H as u32, px)
+}
+
+/// Localized tray menu items: (id, label, enabled, checked). `id == 0` is a separator.
+pub fn tray_menu_items(en: bool, autostart: bool) -> Vec<(u32, String, bool, bool)> {
+    vec![
+        (1, if en { "Start with Windows" } else { "Запуск с Windows" }.into(), true, autostart),
+        (2, if en { "Refresh folders" } else { "Обновить папки" }.into(), true, false),
+        (0, String::new(), true, false),
+        (3, if en { "Quit" } else { "Выход" }.into(), true, false),
+    ]
+}
+
+const WM_TRAY: u32 = WM_APP + 20;
+const TRAY_ID: u32 = 1;
+const TRAY_CLASS: PCWSTR = w!("GlassFoldersTray");
+
+struct TrayState {
+    taskbar_msg: u32,
+    in_menu: Cell<bool>,
+    on_open: Box<dyn Fn(HWND)>,
+    nid: NOTIFYICONDATAW,
+    active: Cell<bool>,
+}
+
+/// Native Win32 system tray icon with TaskbarCreated recovery and clean teardown.
+pub struct Tray {
+    hwnd: HWND,
+    hicon: HICON,
+    state: *mut TrayState,
+}
+
+impl Tray {
+    pub fn new(on_open: impl Fn(HWND) + 'static) -> Option<Self> {
+        if crate::plat::offscreen() {
+            return None;
+        }
+        let (w, h, rgba) = tray_icon_rgba();
+        let hicon = create_rgba_icon(w, h, &rgba)?;
+        let inst = unsafe { GetModuleHandleW(None) }.ok()?;
+        unsafe {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(tray_wndproc),
+                hInstance: inst.into(),
+                lpszClassName: TRAY_CLASS,
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+        }
+        // Top-level hidden window (NOT HWND_MESSAGE) so RegisterWindowMessageW("TaskbarCreated") reaches it.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                TRAY_CLASS,
+                w!("Glass Folders Tray"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(inst.into()),
+                None,
+            )
+        }
+        .ok()?;
+        let taskbar_msg = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
+            uCallbackMessage: WM_TRAY,
+            hIcon: hicon,
+            ..Default::default()
+        };
+        for (dst, ch) in nid.szTip.iter_mut().zip("Glass Folders".encode_utf16()) {
+            *dst = ch;
+        }
+        let state = Box::into_raw(Box::new(TrayState {
+            taskbar_msg,
+            in_menu: Cell::new(false),
+            on_open: Box::new(on_open),
+            nid,
+            active: Cell::new(true),
+        }));
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            let _ = Shell_NotifyIconW(NIM_ADD, &(*state).nid);
+        }
+        Some(Tray { hwnd, hicon, state })
+    }
+
+    pub fn remove_icon(&self) {
+        unsafe {
+            let st = &*self.state;
+            if st.active.replace(false) {
+                let _ = Shell_NotifyIconW(NIM_DELETE, &st.nid);
+            }
+        }
+    }
+}
+
+impl Drop for Tray {
+    fn drop(&mut self) {
+        self.remove_icon();
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(self.hwnd);
+            drop(Box::from_raw(self.state));
+            let _ = DestroyIcon(self.hicon);
+        }
+    }
+}
+
+fn create_rgba_icon(w: u32, h: u32, rgba: &[u8]) -> Option<HICON> {
+    let mut bgra = Vec::with_capacity(rgba.len());
+    for c in rgba.chunks_exact(4) {
+        bgra.extend_from_slice(&[c[2], c[1], c[0], c[3]]);
+    }
+    let mask_bytes = vec![0u8; ((w as usize + 31) / 32 * 4) * h as usize];
+    unsafe {
+        let hbm_color = CreateBitmap(w as i32, h as i32, 1, 32, Some(bgra.as_ptr() as _));
+        let hbm_mask = CreateBitmap(w as i32, h as i32, 1, 1, Some(mask_bytes.as_ptr() as _));
+        let ii = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: hbm_mask,
+            hbmColor: hbm_color,
+        };
+        let icon = CreateIconIndirect(&ii).ok();
+        let _ = DeleteObject(hbm_color.into());
+        let _ = DeleteObject(hbm_mask.into());
+        icon
+    }
+}
+
+unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayState;
+    if !ptr.is_null() {
+        let st = &*ptr;
+        if msg == WM_TRAY {
+            let ev = (lp.0 as u32) & 0xFFFF;
+            if matches!(ev, WM_RBUTTONUP | WM_LBUTTONUP | WM_CONTEXTMENU) && !st.in_menu.replace(true) {
+                (st.on_open)(hwnd);
+                st.in_menu.set(false);
+            }
+            return LRESULT(0);
+        }
+        if st.taskbar_msg != 0 && msg == st.taskbar_msg && st.active.get() {
+            let _ = Shell_NotifyIconW(NIM_ADD, &st.nid);
+            return LRESULT(0);
+        }
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
 }
 
 /// Frosted copy of the desktop wallpaper under screen rect `r` (primary monitor), acrylic-like tint.

@@ -1,0 +1,20 @@
+# Кратко: большая папка Big (60 ярлыков) открывается и закрывается плавно: кэш снимка при zview (не >3 рендеров при открытии, не >2 при закрытии), окно на месте, в конце складывается в плитку.
+#fixture big
+hidden panel
+wait 2000
+renders reset
+frames open 500
+open Big
+wait 700
+renders panel max 3
+shown panel
+fits panel
+inwork panel
+shot big_open
+renders reset
+frames close 500
+close
+wait 700
+renders panel max 2
+hidden panel
+zoomend tile Big

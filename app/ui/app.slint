@@ -365,6 +365,7 @@ export component Panel inherits Window {
     in property <bool> snap: true;
     in property <bool> ptitle: true; // folder name + dot in the header
     in property <bool> tnames: true; // folder name under desktop tiles
+    in property <bool> autostart; // start with Windows (registry)
     in property <float> reveal: 1; // open / close animation: content fade (Rust drives it)
     in-out property <int> page: 0; // 0 = folder, 1 = settings
 
@@ -379,6 +380,7 @@ export component Panel inherits Window {
     callback pick-color(int, color);
     callback clear-color(int);
     callback close-panel();
+    callback page-changed(int);
     callback set-opt(string, int); // settings page: key, value (bool = 0/1)
     callback drag-start();
     callback quit();
@@ -399,10 +401,10 @@ export component Panel inherits Window {
     in property <length> ghost-y;
     in property <length> ghost-w;
     in property <length> ghost-h;
-    property <int> drag-id: -1;
+    out property <int> drag-id: -1;
     property <int> drag-group: -1; // group the dragged item comes from
     property <int> drag-k: -1; // its index there
-    property <int> gdrag: -1; // group being moved / resized
+    out property <int> gdrag: -1; // group being moved / resized
     property <image> drag-icon;
     property <length> drag-x; // cursor, panel coords
     property <length> drag-y;
@@ -433,7 +435,7 @@ export component Panel inherits Window {
     // settings page needs room: panel grows while it is shown
     // folder page: hugs its groups, but the header keeps 3 buttons + a drag strip (buttons slide left with the edge)
     out property <length> min-w: page == 1 ? 372px : 168px;
-    property <length> settings-h: 802px;
+    out property <length> settings-h: 846px;
 
     in property <bool> grow-anim; // window size glides (groups make room, unfold, settings); off while opening
     width: max(grid-w + 2 * pad, min-w);
@@ -480,6 +482,7 @@ export component Panel inherits Window {
             if (e.text == Key.Escape) {
                 if (page == 1) {
                     page = 0;
+                    root.page-changed(0);
                 } else if (!pinned) {
                     root.close-panel();
                 }
@@ -528,7 +531,10 @@ export component Panel inherits Window {
             glyph-size: 12px;
             dark: root.dark;
             border-top-left-radius: 8px;
-            clicked => { page = 0; }
+            clicked => {
+                page = 0;
+                root.page-changed(0);
+            }
         }
         Text {
             visible: page == 1 || ptitle;
@@ -550,7 +556,10 @@ export component Panel inherits Window {
             glyph: "\u{E713}"; // settings gear
             glyph-size: 14px;
             dark: root.dark;
-            clicked => { page = page == 1 ? 0 : 1; }
+            clicked => {
+                page = page == 1 ? 0 : 1;
+                root.page-changed(page);
+            }
         }
         // pin: folder stays open on the desktop, its tile hides; again = unpin
         CapButton {
@@ -935,7 +944,7 @@ export component Panel inherits Window {
                 x: pad;
                 y: top + 24px;
                 width: cw;
-                height: 3 * 44px;
+                height: 4 * 44px;
                 dark: root.dark;
                 SwitchRow {
                     y: 0;
@@ -966,17 +975,27 @@ export component Panel inherits Window {
                     accent: root.accent;
                     toggled => { root.set-opt("snap", root.snap ? 0 : 1); }
                 }
+                SwitchRow {
+                    y: 132px;
+                    height: 44px;
+                    line: true;
+                    label: (root.en ? "Start with Windows" : "Запуск с Windows");
+                    on: root.autostart;
+                    dark: root.dark;
+                    accent: root.accent;
+                    toggled => { root.set-opt("autostart", root.autostart ? 0 : 1); }
+                }
             }
 
             SectionTitle {
                 x: pad + 2px;
-                y: top + 172px;
+                y: top + 216px;
                 text: (root.en ? "Folder subgroups" : "Подгруппы папки");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 196px;
+                y: top + 240px;
                 width: cw;
                 height: 3 * 44px + 84px;
                 dark: root.dark;
@@ -1035,13 +1054,13 @@ export component Panel inherits Window {
 
             SectionTitle {
                 x: pad + 2px;
-                y: top + 428px;
+                y: top + 472px;
                 text: (root.en ? "Glass" : "Стекло");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 452px;
+                y: top + 496px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -1059,13 +1078,13 @@ export component Panel inherits Window {
             // icon size = zoom of folder windows and desktop tiles (model::ZOOM)
             SectionTitle {
                 x: pad + 2px;
-                y: top + 520px;
+                y: top + 564px;
                 text: (root.en ? "Icon size" : "Размер иконок");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 544px;
+                y: top + 588px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -1083,13 +1102,13 @@ export component Panel inherits Window {
             // UI language (labels stay bilingual-neutral: each in its own language)
             SectionTitle {
                 x: pad + 2px;
-                y: top + 612px;
+                y: top + 656px;
                 text: (root.en ? "Language" : "Язык");
                 dark: root.dark;
             }
             Card {
                 x: pad;
-                y: top + 636px;
+                y: top + 680px;
                 width: cw;
                 height: 52px;
                 dark: root.dark;
@@ -1107,7 +1126,7 @@ export component Panel inherits Window {
             // quit: quiet text button, red only on hover
             qb := Rectangle {
                 x: pad;
-                y: top + 704px;
+                y: top + 748px;
                 width: 180px;
                 height: 34px;
                 border-radius: 6px;

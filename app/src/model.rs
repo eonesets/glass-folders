@@ -305,6 +305,213 @@ pub fn remove_if_empty(dir: &Path) -> bool {
     empty && fs::remove_dir(dir).is_ok()
 }
 
+// ---------- external drop (files dragged in from Explorer / the desktop) ----------
+
+/// Absolute path as lowercase components (Windows paths are case-insensitive). "." / ".." resolved.
+fn norm(p: &Path) -> Vec<String> {
+    use std::path::Component;
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut v: Vec<String> = Vec::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                v.pop();
+            }
+            c => v.push(c.as_os_str().to_string_lossy().to_lowercase()),
+        }
+    }
+    v
+}
+
+/// Same file system path (case-insensitive).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    norm(a) == norm(b)
+}
+
+/// `src` may go into `dst_dir`: not the folder itself, not one of its own subfolders.
+/// Compares whole path components ("Work" is not an ancestor of "Work2").
+pub fn can_drop_into(src: &Path, dst_dir: &Path) -> bool {
+    let (s, d) = (norm(src), norm(dst_dir));
+    !(d.len() >= s.len() && d[..s.len()] == s[..])
+}
+
+/// (stem, extension) used for " (2)" numbering: folders keep their whole name.
+fn split_name(src: &Path) -> (String, Option<String>) {
+    let s = |o: Option<&std::ffi::OsStr>| o.map(|s| s.to_string_lossy().into_owned());
+    if src.is_dir() {
+        (s(src.file_name()).unwrap_or_default(), None)
+    } else {
+        (s(src.file_stem()).unwrap_or_default(), s(src.extension()))
+    }
+}
+
+/// Copy `src` (file or whole folder) into `dst_dir`. Name taken -> " (2)", " (3)"...; never overwrites,
+/// also when copying into its own folder. Source untouched. Returns the new path.
+pub fn copy_into(src: &Path, dst_dir: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+    if !can_drop_into(src, dst_dir) {
+        return Err(Error::new(ErrorKind::InvalidInput, "folder into itself"));
+    }
+    let is_dir = src.is_dir();
+    let (stem, ext) = split_name(src);
+    for n in 1..1000 {
+        let dst = dst_dir.join(numbered(&stem, ext.as_deref(), n));
+        // claim the name first (create_new / create_dir fail if it exists): no race, no overwrite
+        let claimed = if is_dir {
+            fs::create_dir(&dst)
+        } else {
+            fs::OpenOptions::new().write(true).create_new(true).open(&dst).map(|_| ())
+        };
+        match claimed {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+        let done = if is_dir { copy_tree(src, &dst) } else { fs::copy(src, &dst).map(|_| ()) };
+        return match done {
+            Ok(()) => Ok(dst),
+            Err(e) => {
+                // half copy: take it back (only what we just made)
+                let _ = if is_dir { fs::remove_dir_all(&dst) } else { fs::remove_file(&dst) };
+                Err(e)
+            }
+        };
+    }
+    Err(Error::new(ErrorKind::AlreadyExists, "no free name"))
+}
+
+/// Copy the contents of folder `src` into existing folder `dst`. Linked folders (junctions) skipped.
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        let t = e.file_type()?;
+        if t.is_symlink() {
+            if from.is_file() {
+                fs::copy(&from, &to)?;
+            }
+        } else if t.is_dir() {
+            fs::create_dir(&to)?;
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Desktop folder (tile) that holds folder `dir`: `dir` itself or its ancestor right under `desktop`.
+fn desk_root(dir: &Path, desktop: &Path) -> Option<PathBuf> {
+    let (d, k) = (norm(dir), norm(desktop));
+    if d.len() <= k.len() || d[..k.len()] != k[..] {
+        return None;
+    }
+    // original spelling of that component (absolute() also resolves "..", like norm)
+    let abs = std::path::absolute(dir).ok()?;
+    Some(desktop.join(abs.components().nth(k.len())?))
+}
+
+/// Files / folders dragged in from outside (Explorer, the desktop) dropped into `dst_dir`.
+/// Move (copy = false) or copy each source; skips missing ones and a folder into itself / its subfolder.
+/// Move within its own folder = no-op. A shortcut moved out of a desktop folder takes its launch count
+/// along (under its final name); the source folder forgets it (order, emptied group).
+/// Returns where each accepted item is now.
+pub fn external_drop(srcs: &[PathBuf], dst_dir: &Path, desktop: &Path, copy: bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for src in srcs {
+        if fs::symlink_metadata(src).is_err() || !can_drop_into(src, dst_dir) {
+            continue;
+        }
+        if copy {
+            match copy_into(src, dst_dir) {
+                Ok(p) => out.push(p),
+                Err(e) => eprintln!("glass-folders: copy {} -> {}: {e}", src.display(), dst_dir.display()),
+            }
+            continue;
+        }
+        let parent = src.parent().map(Path::to_path_buf).unwrap_or_default();
+        if same_path(&parent, dst_dir) {
+            out.push(src.clone()); // already there
+            continue;
+        }
+        let moved = match move_into(src, dst_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("glass-folders: move {} -> {}: {e}", src.display(), dst_dir.display());
+                continue;
+            }
+        };
+        carry_uses(&parent, src, &moved, dst_dir, desktop);
+        out.push(moved);
+    }
+    out
+}
+
+/// After `src` (in folder `parent`) moved to `moved` (in `dst_dir`): launch count + group order follow.
+fn carry_uses(parent: &Path, src: &Path, moved: &Path, dst_dir: &Path, desktop: &Path) {
+    let Some(src_root) = desk_root(parent, desktop) else { return }; // loose desktop file: no count
+    let old = file_name(src).unwrap_or_default();
+    let new = file_name(moved).unwrap_or_default();
+    let dst_root = desk_root(dst_dir, desktop);
+    let same_root = dst_root.as_deref().is_some_and(|d| same_path(d, &src_root));
+    let mut cfg = load_cfg(&src_root);
+    let n = if same_root { cfg.uses.get(&old).copied() } else { cfg.uses.remove(&old) };
+    if same_root {
+        if let (Some(n), true) = (n, old != new) {
+            cfg.uses.remove(&old);
+            cfg.uses.insert(new.clone(), n);
+        }
+    }
+    // source group (a direct subfolder of the folder, or its loose items) forgets the item
+    let in_group = parent.parent().is_some_and(|pp| same_path(pp, &src_root));
+    let gname = if in_group { name_of(parent) } else { LOOSE.to_string() };
+    if let Some(gc) = cfg.groups.get_mut(&gname) {
+        gc.items.retain(|k| *k != old);
+    }
+    if in_group && remove_if_empty(parent) {
+        cfg.forget_group(&gname);
+    }
+    let _ = save_cfg(&src_root, &cfg);
+    if let (false, Some(dr), Some(n)) = (same_root, dst_root, n) {
+        let mut c = load_cfg(&dr);
+        *c.uses.entry(new).or_insert(0) += n;
+        let _ = save_cfg(&dr, &c);
+    }
+}
+
+// ---------- desktop folder sync (watcher) ----------
+
+/// Desktop folders vs tiles. added = new visible folders, removed = tiles whose folder is gone,
+/// kept = tiles still there (hidden ones too: the app hides tiled folders itself).
+#[derive(Debug, Default, Clone)]
+pub struct FolderDiff {
+    pub added: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub kept: Vec<PathBuf>,
+}
+
+/// What changed on the desktop since tiles `current` were made. User-hidden folders never become tiles.
+pub fn sync_plan(desktop: &Path, current: &[PathBuf]) -> FolderDiff {
+    let cur: Vec<Vec<String>> = current.iter().map(|p| norm(p)).collect();
+    let mut d = FolderDiff::default();
+    for p in current {
+        if p.is_dir() {
+            d.kept.push(p.clone());
+        } else {
+            d.removed.push(p.clone());
+        }
+    }
+    // list_folders: visible folders only, sorted like the start-up tiles
+    d.added = list_folders(desktop).into_iter().filter(|p| !cur.contains(&norm(p))).collect();
+    d
+}
+
+/// Watcher: change of `rel` (relative to the desktop) is our own config file -> no resync.
+pub fn ignored_change(rel: &Path) -> bool {
+    rel.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(CFG))
+}
+
 /// User-typed folder name -> valid Windows name. Empty = invalid.
 pub fn clean_name(s: &str) -> String {
     let s: String = s.chars().filter(|c| !c.is_control() && !"<>:\"/\\|?*".contains(*c)).collect();

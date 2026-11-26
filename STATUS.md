@@ -1,9 +1,9 @@
-Кратко: приложение «стеклянные папки» для рабочего стола. Вышла версия 1.0 (релиз v1.0.0 на GitHub): мгновенные большие папки, плавные анимации, меню по ПКМ на ярлыке, ярлык можно вытащить на стол или в другую папку, папки возвращаются даже после вылета.
-Ждём: отзывы пользователя после 1.0.
+Кратко: приложение «стеклянные папки» для рабочего стола. Готова версия 1.1: перетаскивание файлов из Проводника/со стола в плитки и группы, автоподхват новых/удалённых папок, иконка в трее + автозапуск с Windows, защита плиток при Win+D, кэш снимка для мгновенного открытия больших папок.
+Ждём: пересъёмку GIF на цветном фоне и релиз v1.1.0 на GitHub.
 
 # glass-folders — STATUS
-Updated: 2026-11-23 (v1.0.0 released: github.com/eonesets/glass-folders/releases/tag/v1.0.0)
-Progress: 92%
+Updated: 2026-11-26 (v1.1.0 ready for release)
+Progress: 96%
 
 ## Done
 - Desktop shortcuts audited and cleaned (see docs/SPEC.md).
@@ -94,28 +94,30 @@ Progress: 92%
   tests/ui/run.ps1 (demo desktop + own APPDATA in %TEMP%), scenarios open-close, drag-item, hover-hint: all PASS.
   tests/ui/idle.ps1 = guard for rare real-input checks (abort if user idle < 120 s).
 
+- v1.1.0 (2026-11-26):
+  - Zoom animation & perf: exact per-edge zoom_rect, aspect-preserving scale_pixels, ZoomSnap cache during open/close (big folders <=3 renders), Settings always clamped inside work area.
+  - External drag-and-drop (OLE IDropTarget): drop files/shortcuts from Desktop or Explorer onto tiles or folder groups (Ctrl = copy, launch counts follow, self-drop refused).
+  - Live desktop sync (watch.rs): ReadDirectoryChangesW watches desktop folders & files; tiles and open panels update live without restarting.
+  - System tray icon + Autostart: tray menu (Start with Windows, Quit), Start with Windows toggle in Settings (HKCU Run).
+  - Win+D protection: tiles and pinned panels stay visible above desktop host on Show Desktop (EVENT_SYSTEM_FOREGROUND hook + desktop_host owner).
+  - README GIFs (EN + RU, 7 each): re-shot on bright Win11 colorful wallpaper (open, tiles, groups, settings, pin, menu, dragout).
+  - Tests: 66 unit tests (v11_tests.rs + model), 10 headless UI scenarios, 3 guard process tests — all PASS.
+
 ## Next
-- 1.0 released 2026-11-23 (merged to main, v1.0.0). Next: feedback, fixes.
-  Not checked on the real screen yet (headless tests only): native menu look (dark), rename box focus, PickIconDlg,
-  uninstaller run, drop onto the real desktop (icon placed at drop point), Fly icon + tile highlight while dragging.
+- v1.1.0 ready for GitHub release. Next: feedback, fixes.
 - Guard: killing app AND guard together (taskkill /IM glass-folders.exe /F) still leaves folders hidden until next start.
   Task Manager shows 2 glass-folders.exe while folders are hidden (app + guard, guard ~1 MB, 0 CPU).
 - Shortcut rename: renamed item re-sorts by name (keeps place only if the group has a saved order).
 - From Gemini review (not done): 2-line labels, stronger dark tint on bright wallpaper, collapse button in group
   header, tooltip fade, unfolded rows fade-in, row hysteresis on tile resize.
-- User click test: tile opens panel, icon launches, click outside closes (not verified by Claude).
-- Desktop layer: parent tiles to WorkerW (now: bottom-most windows; Win+D hides them).
-- New folder on Desktop while running: no tile until restart. "Show hidden files" on -> tiled folders show dimmed.
-- Big tiles: launch icons directly (now any click opens panel). Snap tiles to grid.
 - Panel: remember moved position (now re-centers each open).
-- Watch Desktop for changes (now: rescan on open).
-- Tray icon + autostart; sort shortcuts into real subfolders.
+- "Show hidden files" on -> tiled folders show dimmed on desktop.
 
 ## Blockers
 - none
 
 ## Repo
-GitHub (private): https://github.com/eonesets/glass-folders, branch main.
+GitHub (public): https://github.com/eonesets/glass-folders, branch main.
 
 ## Run
 `app\target\release\glass-folders.exe`. Dev flags: `--open GAMES`; env `GF_KEEP_ICONS=1` (don't hide folder icons), `GF_DUMP_ICONS=file`, `GF_STAY=1` (panel stays open), `GF_TILE_AT=x,y` (tiles row at point), `GF_FAKE_GLASS=1` (old tile blur).
